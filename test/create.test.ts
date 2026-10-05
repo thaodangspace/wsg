@@ -784,7 +784,7 @@ test('--code-root -> stderr note (PD6)', async () => {
     ]);
 
     assert.equal(result.exitCode, 0);
-    assert.match(result.stderr, /wsg: note: --code-root is accepted but autonomous discovery is not available/);
+    assert.match(result.stderr, /wsg: note: --code-root is ignored because explicit --repo/);
 
     const wsDir = path.join(tmpRoot, 'coderoot-ws');
     assert.ok(fs.existsSync(path.join(wsDir, 'workspace.yaml')));

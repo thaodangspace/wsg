@@ -12,19 +12,52 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Milestones 1–2 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, and `wsg explain` are implemented. `add` and `refresh` are planned for Milestone 4. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Milestones 1–3 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, and the Milestone 3 local scout harness are implemented. `add` and `refresh` are planned for Milestone 4. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
-wsg create "port EMR mono to modular for new system" --name port-emr
+# Explicit inputs (no model or credentials required):
+wsg create "port EMR mono to modular for new system" --name port-emr \
+  --repo ~/code/legacy-platform --repo ~/code/new-platform --code-root ~/code
 cd ~/wsg/port-emr
 wsg explain      # read-only: saved repos, docs, exclusions, gaps, commands
 codex # or claude / pi
+
+# Autonomous discovery (no --repo): one read-only Pi Durable scout conversation
+# enumerates code roots, gathers evidence, and selects the smallest useful set.
+wsg create "port EMR mono to modular for new system" --name port-emr --code-root ~/code
 
 # Planned (Milestone 4):
 # wsg add ~/code/emr-importer
 # wsg add ~/docs/emr-migration.md
 # wsg refresh
 ```
+
+## Local Scouting (Milestone 3)
+
+When `create` is called without `--repo`, WSG runs one bounded, read-only scout
+conversation. It enumerates Git repositories under `--code-root` (default
+`~/code`), reads READMEs/manifests/agent instructions, runs bounded `rg`
+searches, and resolves local document mentions. The scout has no write, Git
+mutation, install, or arbitrary shell tool, and repository instructions are
+treated as data rather than authority.
+
+Selection is evidence-based: every automatically discovered repository must
+cite a real repository-relative file and a quoted snippet that is verified
+against the file, otherwise the run stops with an actionable error. The scout
+selects at most `max_discovered_repos` (default 5) automatically discovered
+repositories; explicit `--repo` inputs are always included and are not counted.
+Selections that name more than one target are reported as ambiguous (exit 2)
+and never materialize an arbitrary target.
+
+Scout state is checkpointed under `<workspace-root>/.wsg-scout/<name>/` using
+real SQLite persistence, and copied to `.wsg/runtime.sqlite` after a successful
+assembly. An interrupted scout resumes with the same command plus `--resume`.
+
+`--dry-run` shows the plan without creating the target workspace. Discovery
+caches runtime state outside the target. If the pinned Pi Durable packages are
+not installed, autonomous scouting reports the blocker and explicit `--repo`
+creation still works.
+
 
 Each feature gets an independent directory. There are no nested workspace groups or workspace orchestration in the MVP.
 

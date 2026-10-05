@@ -33,6 +33,9 @@ import {
   type ManifestAdapter,
   type AddedBy,
   type DocMode,
+  type Intent,
+  type Evidence,
+  type ExcludedRepo,
 } from './manifest.ts';
 import {
   initWsgDir,
@@ -54,20 +57,28 @@ import { writeFileAtomic, ensureDir, sha256 } from './fsx.ts';
 import { faultPoint } from './faults.ts';
 import { ExplicitScout, type Scout, type ScoutResult } from './scout.ts';
 import type { CliIO } from './cli.ts';
+import { enumerateRepos, type DiscoveredRepo } from './discovery.ts';
+import { retrieveEvidence } from './retrieve.ts';
+import {
+  validateScoutSelection,
+  findTargetAmbiguity,
+  type ValidatedSelection,
+} from './evidence.ts';
+import { PiScout } from './pi-scout.ts';
 
 export const CREATE_HELP_TEXT = `Usage: wsg create <request> [options]
 
 Options:
   --name <name>                  Workspace directory name
   --root <dir>                   Output root directory (default: ~/wsg)
-  --repo <path>                  Add a repository (repeatable)
+  --repo <path>                  Add a repository (repeatable; skips discovery)
   --doc <path-or-url>            Add a document or URL (repeatable)
   --context <text>               Add task context line (repeatable)
-  --code-root <dir>              Code discovery root (repeatable, reserved)
+  --code-root <dir>              Code discovery root (repeatable)
   --for <adapters>               Adapters: agents, claude, none (default: agents)
   --dry-run                      Print plan without creating files
-  --resume                       Resume an interrupted create operation
-  --allow-dirty-evidence         Allow dirty source evidence (reserved)
+  --resume                       Resume an interrupted create or scout operation
+  --allow-dirty-evidence         Allow selections whose evidence relies on uncommitted files
   -h, --help                     Show help
 `;
 
@@ -84,6 +95,12 @@ export interface CreateOptions {
   resume?: boolean;
   allowDirtyEvidence?: boolean;
   scout?: Scout;
+  /** Override the durable scout state directory (tests). */
+  scoutStateDir?: string;
+  /** Override the ripgrep binary (tests). */
+  rgPath?: string;
+  /** Cap scout tool calls (tests / bounded runs). */
+  maxScoutToolCalls?: number;
   _afterLockAcquired?: (wsDir: string) => void;
   _beforeWorktreeStep?: (repo: RepoPlan) => void;
   _beforeSnapshotWrite?: (doc: PlannedDoc) => void;
@@ -111,6 +128,24 @@ export interface CreatePlan {
   gaps: string[];
   manifest: Manifest;
   warnings: string[];
+}
+
+export interface AssemblyRepo extends RepoPlan {
+  intent: Intent;
+  added_by: AddedBy;
+  evidence: Evidence[];
+}
+
+export interface CreateAssembly {
+  wsName: string;
+  wsDir: string;
+  request: string;
+  context: string[];
+  adapters: ManifestAdapter[];
+  repos: AssemblyRepo[];
+  docs: PlannedDoc[];
+  gaps: string[];
+  excluded: ExcludedRepo[];
 }
 
 function getCwd(io?: CliIO): string {
@@ -312,9 +347,10 @@ export interface RecordedPlan {
   request: string;
   context: string[];
   adapters: ManifestAdapter[];
-  repos: RepoPlan[];
+  repos: AssemblyRepo[];
   docs: RecordedPlanDoc[];
   gaps: string[];
+  excluded?: ExcludedRepo[];
 }
 
 function normalizeSource(source: string): string {
@@ -514,6 +550,9 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
         dirty: r.dirty === true,
         dirtyFiles: Array.isArray(r.dirtyFiles) ? (r.dirtyFiles as string[]) : [],
         reason: r.reason ?? 'Explicit repository supplied by the user.',
+        intent: (r.intent as Intent) ?? 'unspecified',
+        added_by: (r.added_by as AddedBy) ?? 'user',
+        evidence: Array.isArray(r.evidence) ? (r.evidence as Evidence[]) : [],
       })),
       docs: (rawDocs ?? []).map((d) => ({
         source: d.source,
@@ -526,11 +565,12 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
         ...(typeof d.text === 'boolean' ? { text: d.text as boolean } : {}),
       })),
       gaps: Array.isArray(rawPlan.gaps) ? (rawPlan.gaps as string[]) : [],
+      excluded: Array.isArray(rawPlan.excluded) ? (rawPlan.excluded as ExcludedRepo[]) : [],
     };
   }
 
   const args = op.args ?? {};
-  const repos: RepoPlan[] = [];
+  const repos: AssemblyRepo[] = [];
   for (const s of op.steps.filter((x) => x.type === 'worktree')) {
     const detail = (s.detail ?? {}) as Record<string, unknown>;
     repos.push({
@@ -542,6 +582,9 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
       dirty: detail.dirty === true,
       dirtyFiles: Array.isArray(detail.dirtyFiles) ? (detail.dirtyFiles as string[]) : [],
       reason: (detail.reason as string) ?? 'Explicit repository supplied by the user.',
+      intent: (detail.intent as Intent) ?? 'unspecified',
+      added_by: (detail.added_by as AddedBy) ?? 'user',
+      evidence: Array.isArray(detail.evidence) ? (detail.evidence as Evidence[]) : [],
     });
   }
 
@@ -681,6 +724,27 @@ async function executeResume(
   }
 
   if (!wsDirExists) {
+    // Resume an interrupted autonomous scout before the workspace directory
+    // exists. Only do this when a durable scout state directory was recorded.
+    const stateDir = scoutStateDirFor(resolvedRoot, wsName);
+    const hasScoutState =
+      fs.existsSync(path.join(stateDir, 'runtime.sqlite')) ||
+      fs.existsSync(path.join(stateDir, 'selection.json'));
+    if ((options.repos?.length ?? 0) === 0 && hasScoutState) {
+      return await executeAutonomousCreate(
+        {
+          request: options.request ?? '',
+          wsName,
+          wsDir,
+          resolvedRoot,
+          adapters: settings.adapters as ManifestAdapter[],
+          cwd,
+        },
+        options,
+        io
+      );
+    }
+
     throw new UsageError(
       `Workspace directory '${path.resolve(resolvedRoot, wsName)}' does not exist. Cannot resume.`
     );
@@ -847,9 +911,9 @@ async function executeResume(
       path: r.name,
       base_commit: r.base_commit,
       branch: r.branch,
-      added_by: 'user',
-      intent: 'unspecified',
-      evidence: [],
+      added_by: r.added_by ?? 'user',
+      intent: r.intent ?? 'unspecified',
+      evidence: r.evidence ?? [],
       reason: r.reason ?? 'Explicit repository supplied by the user.',
     })),
     docs: plan.docs.map((d) => ({
@@ -864,7 +928,7 @@ async function executeResume(
     scripts: [],
     commands: [],
     discovery: {
-      excluded: [],
+      excluded: plan.excluded ?? [],
       gaps: plan.gaps,
     },
   };
@@ -1141,11 +1205,23 @@ async function executeResume(
   }
 }
 
+interface AutonomousContext {
+  request: string;
+  wsName: string;
+  wsDir: string;
+  resolvedRoot: string;
+  adapters: ManifestAdapter[];
+  cwd: string;
+}
 
 /**
- * Executes workspace creation end-to-end.
+ * The deterministic materialization phase shared by explicit and autonomous
+ * create. It builds and validates the manifest, prints the plan, then (unless
+ * --dry-run) reserves the workspace, runs worktree/snapshot/generation steps
+ * under the writer lock and journal, and publishes workspace.yaml last.
  */
-async function executeCreate(
+async function runAssembly(
+  assembly: CreateAssembly,
   options: CreateOptions,
   io: CliIO = {}
 ): Promise<number> {
@@ -1153,155 +1229,25 @@ async function executeCreate(
   const stderr = io.stderr ?? process.stderr;
   const writeStdout = (chunk: string) => stdout.write(chunk);
   const writeStderr = (chunk: string) => stderr.write(chunk);
-  const cwd = getCwd(io);
 
-  // (a) Preflight validations before any mutation
-
-  // 1. Git version
-  assertGitVersion('2.38.0');
-
-  // 2. Note on --code-root (PD6)
-  if (options.codeRoots && options.codeRoots.length > 0) {
-    writeStderr(
-      'wsg: note: --code-root is accepted but autonomous discovery is not available in this version; repositories must be specified explicitly with --repo\n'
-    );
-  }
-
-  // 3. Request validation
-  if (!options.request || typeof options.request !== 'string' || options.request.trim().length === 0) {
-    throw new UsageError('Workspace request must not be empty');
-  }
-  const request = options.request.trim();
-
-  // 4. Slug / Name derivation and validation
-  let wsName: string;
-  if (options.name !== undefined) {
-    assertValidSlug(options.name, 'Workspace name');
-    wsName = options.name;
-  } else {
-    wsName = deriveSlug(request);
-    assertValidSlug(wsName, 'Workspace name');
-  }
-
-  // 5. Settings / Config / Adapters resolution
-  // loadConfig enforces adapter validation (e.g. --for bogus or --for none,agents -> UsageError exit 1)
-  const settings = loadConfig(io.env, {
-    root: options.root,
-    for: options.for,
-    code_root: options.codeRoots,
-  });
-  const expandedRoot = expandHome(settings.workspace_root);
-  const resolvedRoot = path.isAbsolute(expandedRoot)
-    ? expandedRoot
-    : path.resolve(cwd, expandedRoot);
-  const wsDir = path.resolve(resolvedRoot, wsName);
-  const adapters = settings.adapters as ManifestAdapter[];
-
-  // 6. Scout seam invocation (defaults to ExplicitScout)
-  const scout = options.scout ?? new ExplicitScout();
-  const scoutResult = await scout.scout({
+  const {
+    wsName,
+    wsDir,
     request,
-    repos: options.repos,
-    docs: options.docs,
-    context: options.context,
-  });
+    context,
+    adapters,
+    repos,
+    docs: plannedDocs,
+    gaps: allGaps,
+    excluded,
+  } = assembly;
 
-  if (scoutResult.kind === 'none') {
-    throw new UsageError(scoutResult.reason);
-  }
-  if (scoutResult.kind === 'ambiguous') {
-    throw new ConflictError(
-      scoutResult.reason,
-      scoutResult.guidance ? [scoutResult.guidance] : []
-    );
-  }
-
-  // 7. Repositories inspection and preflight
-  const uniqueRepoMap = new Map<
-    string,
-    { rawPath: string; source: string; info: RepoInfo; reason?: string }
-  >();
-
-  for (const r of scoutResult.repos) {
-    const rawPath = r.source;
-    const expanded = expandHome(rawPath);
-    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
-
-    // repoInfo throws UsageError for non-repo, bare repo, unborn HEAD, or nonexistent dir
-    const info = repoInfo(resolved);
-
-    // PD1 check: --repo must be a repo toplevel
-    const canonicalInput = canonicalize(resolved);
-    if (canonicalInput !== info.toplevel) {
-      throw new UsageError(
-        `Path '${rawPath}' is a subdirectory of git repository at '${info.toplevel}'. Please specify the repository root: --repo ${info.toplevel}`
-      );
-    }
-
-    // Deduplicate duplicate spellings of same source canonical toplevel
-    if (!uniqueRepoMap.has(info.toplevel)) {
-      uniqueRepoMap.set(info.toplevel, {
-        rawPath,
-        source: info.toplevel,
-        info,
-        reason: r.reason,
-      });
-    }
-  }
-
-  const uniqueRepos = Array.from(uniqueRepoMap.values());
-  const entryNames = assignEntryNames(uniqueRepos.map((r) => r.source));
-
-  const repos: RepoPlan[] = uniqueRepos.map((r) => {
-    const entryName = entryNames.get(r.source)!;
-    const branch = `wsg/${wsName}/${entryName}`;
-    if (!checkBranchName(branch)) {
-      throw new UsageError(`Invalid branch name '${branch}'`);
-    }
-    return {
-      name: entryName,
-      source: r.source,
-      dest: path.join(wsDir, entryName),
-      branch,
-      base_commit: r.info.headCommit,
-      dirty: r.info.dirty,
-      dirtyFiles: r.info.dirtyFiles,
-      reason: r.reason ?? 'Explicit repository supplied by the user.',
-    };
-  });
-
-  // Collect gaps (submodules / LFS)
-  const allGaps: string[] = [];
-  if (scoutResult.gaps) {
-    allGaps.push(...scoutResult.gaps);
-  }
-  for (const r of repos) {
-    const gaps = detectGaps(r.source);
-    allGaps.push(...gaps);
-  }
-
-  // 8. Documents inspection and planning
-  const inspectedDocs: InspectedDoc[] = [];
-  if (scoutResult.docs) {
-    for (const d of scoutResult.docs) {
-      const kind = classifyDocInput(d.input);
-      if (kind === 'url') {
-        inspectedDocs.push(inspectDoc(d.input));
-      } else {
-        const expanded = expandHome(d.input);
-        const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
-        inspectedDocs.push(inspectDoc(resolved));
-      }
-    }
-  }
-  const plannedDocs = planDocs(inspectedDocs, { addedBy: 'user' });
-
-  // (b) CreatePlan + Draft Manifest + validateManifest
+  // (b) Draft Manifest + validateManifest
   const draftManifest: Manifest = {
     version: 1,
     name: wsName,
     request,
-    context: options.context ?? [],
+    context,
     adapters,
     repos: repos.map((r) => ({
       name: r.name,
@@ -1309,9 +1255,9 @@ async function executeCreate(
       path: r.name,
       base_commit: r.base_commit,
       branch: r.branch,
-      added_by: 'user',
-      intent: 'unspecified',
-      evidence: [],
+      added_by: r.added_by,
+      intent: r.intent,
+      evidence: r.evidence,
       reason: r.reason,
     })),
     docs: plannedDocs.map((d) => ({
@@ -1326,7 +1272,7 @@ async function executeCreate(
     scripts: [],
     commands: [],
     discovery: {
-      excluded: [],
+      excluded,
       gaps: allGaps,
     },
   };
@@ -1431,8 +1377,9 @@ async function executeCreate(
   }
   writeStdout(`Repositories (${repos.length}):\n`);
   for (const r of repos) {
+    const role = r.added_by === 'scout' ? `, intent: ${r.intent}` : '';
     writeStdout(
-      `  - ${r.name}: ${r.source} -> ${r.name} (branch: ${r.branch}, base: ${r.base_commit.slice(0, 8)})\n`
+      `  - ${r.name}: ${r.source} -> ${r.name} (branch: ${r.branch}, base: ${r.base_commit.slice(0, 8)}${role})\n`
     );
   }
   if (plannedDocs.length > 0) {
@@ -1451,6 +1398,12 @@ async function executeCreate(
     writeStdout(`Gaps:\n`);
     for (const g of allGaps) {
       writeStdout(`  - ${g}\n`);
+    }
+  }
+  if (excluded.length > 0) {
+    writeStdout(`Excluded repositories (${excluded.length}):\n`);
+    for (const e of excluded) {
+      writeStdout(`  - ${e.source}: ${e.reason}\n`);
     }
   }
 
@@ -1538,12 +1491,12 @@ async function executeCreate(
     });
 
     // Persist the full deterministic plan (including base commits, document
-    // hashes, unread metadata and context) so --resume never rebuilds the
-    // plan from source state that may have changed after a crash.
+    // hashes, unread metadata, intent, evidence and context) so --resume never
+    // rebuilds the plan from source state that may have changed after a crash.
     const recordedPlan: RecordedPlan = {
       name: wsName,
       request,
-      context: options.context ?? [],
+      context,
       adapters,
       repos: repos.map((r) => ({ ...r })),
       docs: plannedDocs.map((d) => ({
@@ -1557,6 +1510,7 @@ async function executeCreate(
         ...(typeof d.text === 'boolean' ? { text: d.text } : {}),
       })),
       gaps: allGaps,
+      excluded,
     };
 
     const op: Operation = {
@@ -1721,6 +1675,457 @@ async function executeCreate(
 }
 
 /**
+ * Executes workspace creation end-to-end.
+ */
+async function executeCreate(
+  options: CreateOptions,
+  io: CliIO = {}
+): Promise<number> {
+  const stderr = io.stderr ?? process.stderr;
+  const cwd = getCwd(io);
+
+  // (a) Preflight validations before any mutation
+
+  // 1. Git version
+  assertGitVersion('2.38.0');
+
+  // 3. Request validation
+  if (!options.request || typeof options.request !== 'string' || options.request.trim().length === 0) {
+    throw new UsageError('Workspace request must not be empty');
+  }
+  const request = options.request.trim();
+
+  // 4. Slug / Name derivation and validation
+  let wsName: string;
+  if (options.name !== undefined) {
+    assertValidSlug(options.name, 'Workspace name');
+    wsName = options.name;
+  } else {
+    wsName = deriveSlug(request);
+    assertValidSlug(wsName, 'Workspace name');
+  }
+
+  // 5. Settings / Config / Adapters resolution
+  // loadConfig enforces adapter validation (e.g. --for bogus or --for none,agents -> UsageError exit 1)
+  const settings = loadConfig(io.env, {
+    root: options.root,
+    for: options.for,
+    code_root: options.codeRoots,
+  });
+  const expandedRoot = expandHome(settings.workspace_root);
+  const resolvedRoot = path.isAbsolute(expandedRoot)
+    ? expandedRoot
+    : path.resolve(cwd, expandedRoot);
+  const wsDir = path.resolve(resolvedRoot, wsName);
+  const adapters = settings.adapters as ManifestAdapter[];
+
+  // 2. Note on --code-root (PD6): only meaningful when repositories are
+  // explicit; autonomous discovery now consumes --code-root.
+  if (options.codeRoots && options.codeRoots.length > 0 && (options.repos?.length ?? 0) > 0) {
+    stderr.write(
+      'wsg: note: --code-root is ignored because explicit --repo inputs were supplied; remove --repo to enable autonomous discovery\n'
+    );
+  }
+
+  const explicitRepos = options.repos ?? [];
+  if (explicitRepos.length === 0) {
+    return await executeAutonomousCreate(
+      { request, wsName, wsDir, resolvedRoot, adapters, cwd },
+      options,
+      io
+    );
+  }
+
+  // 6. Scout seam invocation (defaults to ExplicitScout)
+  const scout = options.scout ?? new ExplicitScout();
+  const scoutResult = await scout.scout({
+    request,
+    repos: options.repos,
+    docs: options.docs,
+    context: options.context,
+  });
+
+  if (scoutResult.kind === 'none') {
+    throw new UsageError(scoutResult.reason);
+  }
+  if (scoutResult.kind === 'ambiguous') {
+    throw new ConflictError(
+      scoutResult.reason,
+      scoutResult.guidance ? [scoutResult.guidance] : []
+    );
+  }
+
+  // 7. Repositories inspection and preflight
+  const uniqueRepoMap = new Map<
+    string,
+    { rawPath: string; source: string; info: RepoInfo; reason?: string }
+  >();
+
+  for (const r of scoutResult.repos) {
+    const rawPath = r.source;
+    const expanded = expandHome(rawPath);
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+
+    // repoInfo throws UsageError for non-repo, bare repo, unborn HEAD, or nonexistent dir
+    const info = repoInfo(resolved);
+
+    // PD1 check: --repo must be a repo toplevel
+    const canonicalInput = canonicalize(resolved);
+    if (canonicalInput !== info.toplevel) {
+      throw new UsageError(
+        `Path '${rawPath}' is a subdirectory of git repository at '${info.toplevel}'. Please specify the repository root: --repo ${info.toplevel}`
+      );
+    }
+
+    // Deduplicate duplicate spellings of same source canonical toplevel
+    if (!uniqueRepoMap.has(info.toplevel)) {
+      uniqueRepoMap.set(info.toplevel, {
+        rawPath,
+        source: info.toplevel,
+        info,
+        reason: r.reason,
+      });
+    }
+  }
+
+  const uniqueRepos = Array.from(uniqueRepoMap.values());
+  const entryNames = assignEntryNames(uniqueRepos.map((r) => r.source));
+
+  const repos: AssemblyRepo[] = uniqueRepos.map((r) => {
+    const entryName = entryNames.get(r.source)!;
+    const branch = `wsg/${wsName}/${entryName}`;
+    if (!checkBranchName(branch)) {
+      throw new UsageError(`Invalid branch name '${branch}'`);
+    }
+    return {
+      name: entryName,
+      source: r.source,
+      dest: path.join(wsDir, entryName),
+      branch,
+      base_commit: r.info.headCommit,
+      dirty: r.info.dirty,
+      dirtyFiles: r.info.dirtyFiles,
+      reason: r.reason ?? 'Explicit repository supplied by the user.',
+      intent: 'unspecified',
+      added_by: 'user',
+      evidence: [],
+    };
+  });
+
+  // Collect gaps (submodules / LFS)
+  const allGaps: string[] = [];
+  if (scoutResult.gaps) {
+    allGaps.push(...scoutResult.gaps);
+  }
+  for (const r of repos) {
+    const gaps = detectGaps(r.source);
+    allGaps.push(...gaps);
+  }
+
+  // 8. Documents inspection and planning
+  const inspectedDocs: InspectedDoc[] = [];
+  if (scoutResult.docs) {
+    for (const d of scoutResult.docs) {
+      const kind = classifyDocInput(d.input);
+      if (kind === 'url') {
+        inspectedDocs.push(inspectDoc(d.input));
+      } else {
+        const expanded = expandHome(d.input);
+        const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+        inspectedDocs.push(inspectDoc(resolved));
+      }
+    }
+  }
+  const plannedDocs = planDocs(inspectedDocs, { addedBy: 'user' });
+
+  const assembly: CreateAssembly = {
+    wsName,
+    wsDir,
+    request,
+    context: options.context ?? [],
+    adapters,
+    repos,
+    docs: plannedDocs,
+    gaps: allGaps,
+    excluded: (scoutResult.excluded ?? []).map((e) => ({ source: e.source, reason: e.reason })),
+  };
+
+  return await runAssembly(assembly, options, io);
+}
+
+/**
+ * Returns the durable scout state directory for a workspace name.
+ */
+export function scoutStateDirFor(root: string, name: string): string {
+  return path.join(root, '.wsg-scout', name);
+}
+
+/**
+ * Autonomous create: bounded repository enumeration, retrieval, one Pi Durable
+ * scout conversation with read-only tools, evidence validation, ambiguity
+ * handling, and the same deterministic materialization as explicit create.
+ *
+ * The scout conversation is checkpointed under
+ * `<workspace-root>/.wsg-scout/<name>/` and copied into `.wsg/runtime.sqlite`
+ * after a successful assembly so an interrupted scout can resume without
+ * re-executing committed tool calls.
+ */
+async function executeAutonomousCreate(
+  ctx: AutonomousContext,
+  options: CreateOptions,
+  io: CliIO = {}
+): Promise<number> {
+  const stderr = io.stderr ?? process.stderr;
+  const cwd = ctx.cwd;
+  const settings = loadConfig(io.env, {
+    root: options.root,
+    for: options.for,
+    code_root: options.codeRoots,
+  });
+  const codeRoots = settings.code_roots;
+
+  const discovery = enumerateRepos(codeRoots);
+  const stateDir = options.scoutStateDir ?? scoutStateDirFor(ctx.resolvedRoot, ctx.wsName);
+
+  // Readable supplied documents feed retrieval and mention resolution. Missing
+  // or secret-like documents are still validated later by document planning.
+  const suppliedDocs: string[] = [];
+  for (const input of options.docs ?? []) {
+    if (classifyDocInput(input) === 'url') continue;
+    const expanded = expandHome(input);
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+    try {
+      const inspected = inspectDoc(resolved);
+      if (inspected.kind === 'file' && inspected.text) {
+        suppliedDocs.push(inspected.source);
+      }
+    } catch {
+      // planning will report the real error
+    }
+  }
+
+  const retrieval = await retrieveEvidence(ctx.request, options.context ?? [], discovery.repos, {
+    suppliedDocs,
+    codeRoots,
+    rgPath: options.rgPath,
+  });
+
+  const scout: Scout =
+    options.scout ??
+    new PiScout({
+      discovered: discovery.repos,
+      retrieval,
+      explicitSources: [],
+      suppliedDocs,
+      provider: settings.scout.provider,
+      model: settings.scout.model,
+      maxToolCalls: options.maxScoutToolCalls,
+      rgPathForTests: options.rgPath,
+    });
+
+  if (discovery.repos.length === 0) {
+    const reasons = [...discovery.gaps, ...retrieval.gaps];
+    throw new UsageError(
+      `No git repositories found under configured code roots (${codeRoots.join(', ')})` +
+        (reasons.length > 0 ? `:\n  ${reasons.join('\n  ')}` : '')
+    );
+  }
+
+  stderr.write(
+    `wsg: scouting ${discovery.repos.length} repositor${discovery.repos.length === 1 ? 'y' : 'ies'} under ${codeRoots.join(', ')}\n`
+  );
+
+  const scoutResult = await scout.scout({
+    request: ctx.request,
+    docs: options.docs,
+    context: options.context,
+    codeRoots,
+    stateDir,
+    maxDiscoveredRepos: settings.max_discovered_repos,
+    resume: options.resume,
+    env: io.env,
+  });
+
+  if (scoutResult.kind === 'none') {
+    throw new UsageError(scoutResult.reason);
+  }
+  if (scoutResult.kind === 'ambiguous') {
+    throw new ConflictError(scoutResult.reason, [
+      ...scoutResult.candidates.map((c) => `Candidate: ${c}`),
+      ...(scoutResult.guidance ? [scoutResult.guidance] : []),
+    ]);
+  }
+
+  // Validate every citation against the real repository contents. Fictional
+  // evidence and unreachable repositories fail before any materialization.
+  const allowed = discovery.repos.map((r) => ({ name: r.name, source: r.source }));
+  const validated = validateScoutSelection(scoutResult, allowed);
+
+  const ambiguity = findTargetAmbiguity(validated);
+  if (ambiguity) {
+    throw new ConflictError(ambiguity.reason, [
+      ...ambiguity.candidates.map((c) => `Candidate: ${c}`),
+      ambiguity.guidance,
+    ]);
+  }
+
+  // Explicit repositories are mandatory and never counted against the cap.
+  const explicitCanonical = new Map<string, string>();
+  for (const raw of options.repos ?? []) {
+    const expanded = expandHome(raw);
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+    explicitCanonical.set(canonicalize(resolved), raw);
+  }
+
+  const chosen: Array<{
+    name: string;
+    source: string;
+    intent: Intent;
+    added_by: AddedBy;
+    evidence: Evidence[];
+    reason: string;
+  }> = [];
+
+  for (const source of explicitCanonical.keys()) {
+    const name = path.basename(source);
+    chosen.push({
+      name,
+      source,
+      intent: 'unspecified',
+      added_by: 'user',
+      evidence: [],
+      reason: 'Explicit repository supplied by the user.',
+    });
+  }
+
+  const cap = settings.max_discovered_repos;
+  let scoutsIncluded = 0;
+  let capApplied = false;
+  for (const repo of validated.repos) {
+    if (explicitCanonical.has(repo.source)) continue;
+    if (scoutsIncluded >= cap) {
+      capApplied = true;
+      continue;
+    }
+    chosen.push({
+      name: repo.name,
+      source: repo.source,
+      intent: repo.intent,
+      added_by: repo.addedBy,
+      evidence: repo.evidence,
+      reason: repo.reason,
+    });
+    scoutsIncluded++;
+  }
+
+  const allGaps: string[] = [...discovery.gaps, ...retrieval.gaps, ...validated.gaps];
+  if (capApplied) {
+    allGaps.push(
+      `Discovered repository selection was capped at ${cap} (max_discovered_repos); additional candidates were omitted`
+    );
+  }
+
+  if (chosen.length === 0) {
+    throw new UsageError(
+      'Scout did not select any repository. No workspace was created; refine the request or supply --repo <path>.'
+    );
+  }
+
+  // Inspect git state and enforce the dirty-evidence rule before mutation.
+  const entryNames = assignEntryNames(chosen.map((r) => r.source));
+  const repos: AssemblyRepo[] = [];
+  for (const repo of chosen) {
+    const info = repoInfo(repo.source);
+    const entryName = entryNames.get(repo.source)!;
+    const branch = `wsg/${ctx.wsName}/${entryName}`;
+    if (!checkBranchName(branch)) {
+      throw new UsageError(`Invalid branch name '${branch}'`);
+    }
+
+    const dirtyEvidence = info.dirty
+      ? repo.evidence.filter((ev) => info.dirtyFiles.includes(ev.file))
+      : [];
+    if (dirtyEvidence.length > 0 && !options.allowDirtyEvidence) {
+      throw new ConflictError(
+        `Evidence for repository '${repo.name}' relies on uncommitted changes (${dirtyEvidence
+          .map((ev) => ev.file)
+          .join(', ')}).`,
+        [
+          'Commit the cited evidence and rerun, or pass --allow-dirty-evidence to proceed explicitly.',
+        ]
+      );
+    }
+
+    repos.push({
+      name: entryName,
+      source: repo.source,
+      dest: path.join(ctx.wsDir, entryName),
+      branch,
+      base_commit: info.headCommit,
+      dirty: info.dirty,
+      dirtyFiles: info.dirtyFiles,
+      reason: repo.reason,
+      intent: repo.intent,
+      added_by: repo.added_by,
+      evidence: repo.evidence,
+    });
+
+    for (const gap of detectGaps(repo.source)) {
+      allGaps.push(gap);
+    }
+  }
+
+  // Documents: same explicit-input handling as M2.
+  const inspectedDocs: InspectedDoc[] = [];
+  for (const input of options.docs ?? []) {
+    const kind = classifyDocInput(input);
+    if (kind === 'url') {
+      inspectedDocs.push(inspectDoc(input));
+    } else {
+      const expanded = expandHome(input);
+      const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+      inspectedDocs.push(inspectDoc(resolved));
+    }
+  }
+  const plannedDocs = planDocs(inspectedDocs, { addedBy: 'user' });
+
+  const assembly: CreateAssembly = {
+    wsName: ctx.wsName,
+    wsDir: ctx.wsDir,
+    request: ctx.request,
+    context: options.context ?? [],
+    adapters: ctx.adapters,
+    repos,
+    docs: plannedDocs,
+    gaps: allGaps,
+    excluded: validated.excluded,
+  };
+
+  const code = await runAssembly(assembly, options, io);
+
+  // Preserve the real scout transcript/checkpoint in the workspace runtime
+  // storage once the workspace exists (best-effort; the conversation file is
+  // disposable for using the workspace).
+  if (!options.dryRun && fs.existsSync(path.join(ctx.wsDir, '.wsg'))) {
+    try {
+      const dbPath = path.join(stateDir, 'runtime.sqlite');
+      if (fs.existsSync(dbPath)) {
+        fs.copyFileSync(dbPath, path.join(ctx.wsDir, '.wsg', 'runtime.sqlite'));
+      }
+      const checkpoint = path.join(stateDir, 'selection.json');
+      if (fs.existsSync(checkpoint)) {
+        fs.copyFileSync(checkpoint, path.join(ctx.wsDir, '.wsg', 'scout.json'));
+      }
+    } catch {
+      // runtime storage is a convenience, not a requirement for the workspace
+    }
+  }
+
+  return code;
+}
+
+
+/**
  * Public entry point for `wsg create`. Accepts either CreateOptions or string[] args.
  */
 export async function runCreate(
@@ -1750,10 +2155,6 @@ export async function runCreate(
     if (values.help) {
       (io.stdout ?? process.stdout).write(CREATE_HELP_TEXT);
       return 0;
-    }
-
-    if (values['allow-dirty-evidence']) {
-      throw new UsageError('--allow-dirty-evidence is reserved for Milestone 3');
     }
 
     const request = positionals.join(' ');
@@ -1797,10 +2198,6 @@ export async function runCreate(
       },
       io
     );
-  }
-
-  if (optionsOrArgs.allowDirtyEvidence) {
-    throw new UsageError('--allow-dirty-evidence is reserved for Milestone 3');
   }
 
   if (optionsOrArgs.resume) {
