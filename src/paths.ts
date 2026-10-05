@@ -24,6 +24,32 @@ export function canonicalize(filepath: string, homeDir?: string): string {
   }
 }
 
+/**
+ * Canonicalizes a path even when its leaf (or a suffix of ancestors) does not
+ * exist yet: the nearest existing ancestor is resolved with `realpath`, then
+ * the missing trailing segments are appended. This keeps a deleted source's
+ * identity stable across a resume while still collapsing symlinked ancestors.
+ */
+export function canonicalizeExistingPrefix(filepath: string, homeDir?: string): string {
+  const expanded = expandHome(filepath, homeDir);
+  const absolute = path.resolve(expanded);
+  let current = absolute;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(current);
+      return missing.length > 0 ? path.join(real, ...missing) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return absolute;
+      }
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 export function assertConfinedRelative(
   relPath: string,
   context: string = 'Path'

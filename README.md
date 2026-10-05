@@ -12,7 +12,7 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Milestones 1–3 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, and the Milestone 3 local scout harness are implemented. `add` and `refresh` are planned for Milestone 4. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Milestones 1–4 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, the Milestone 3 local scout harness, and the Milestone 4 incremental commands (`wsg add`, `wsg refresh`) are implemented. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
 # Explicit inputs (no model or credentials required):
@@ -31,11 +31,15 @@ wsg create "port EMR mono to modular for new system" --name port-emr --code-root
 wsg create "port EMR mono to modular for new system" --name port-emr \
   --repo ~/code/new-platform --code-root ~/code
 
-# Planned (Milestone 4):
-# wsg add ~/code/emr-importer
-# wsg add ~/docs/emr-migration.md
-# wsg refresh
+# Incremental updates (Milestone 4):
+wsg add ~/code/emr-importer
+wsg add ~/docs/mapping-notes.md
+wsg add https://internal-wiki.example/emr
+wsg add ./reproduce-timeout.sh --as script
+wsg refresh
+wsg refresh docs/mapping-notes.md
 ```
+
 
 ## Local Scouting (Milestone 3)
 
@@ -86,6 +90,80 @@ wsg explain --workspace ~/wsg/port-emr
 ```
 
 It makes no model or network call, never invokes Git, and never reads `.wsg/`, so a completed workspace stays inspectable after its runtime storage is removed.
+
+## Incremental Updates (Milestone 4)
+
+`wsg add <path-or-url>` attaches one or more explicit inputs to an existing
+workspace and regenerates the affected context. It resolves the nearest ancestor
+`workspace.yaml` (or `--workspace <dir>`), and relative inputs resolve against the
+caller's current directory before any copy.
+
+```bash
+wsg add ~/code/emr-importer                 # local Git repository
+wsg add ~/docs/mapping-notes.md             # local document snapshot
+wsg add https://example.com/spec            # public text snapshot or reference
+wsg add ./reproduce-timeout.sh --as script  # explicit external script
+wsg add https://internal.example/page --as reference   # reference, no fetch
+```
+
+- **Repositories** get only their own new worktree and branch
+  (`wsg/<workspace>/<entry>`); existing worktrees, branches, and revisions are
+  never touched, and no scouting, pruning, fetch, reset, or force operation runs.
+- **Documents** are snapshotted into `docs/`. **Scripts** are copied into
+  `scripts/` with source and hash provenance and are **never executed**. WSG
+  never runs repository commands, installs, or tests.
+- **Deduplication:** re-adding the same canonical source is a no-op. Canonical
+  paths use `realpath`, so duplicate spellings and symlink aliases collapse.
+- **Collisions:** filenames that collide with existing files — or, for documents,
+  with the generated `context.md` — get a stable `-<6hex>` suffix derived from
+  the canonical source. Repository entry names additionally avoid the reserved
+  root names (`workspace.yaml`, `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs`,
+  `scripts`, `.wsg`).
+- **URLs:** WSG tries a bounded public-text fetch (timeout, redirect limit, byte
+  cap, content-type check). Accessible plain text/Markdown/HTML/JSON is
+  snapshotted (HTML is converted conservatively). Authenticated, unsupported, or
+  unavailable URLs become honest `reference` entries with a reason instead of
+  pretending the content was read.
+- **Conflicts before mutation:** a pre-existing branch, worktree destination, or
+  live writer lock stops the run with exit code 2 before anything is written.
+  Destination allocation also inspects the actual `docs/`/`scripts/` directories,
+  so an untracked user file is never chosen as a target.
+- **Atomic against concurrent writers:** `add` takes the writer lock *before*
+  reading the manifest and planning, and refuses to publish over a
+  `workspace.yaml` that changed during a slow fetch.
+
+`wsg refresh [doc-path-or-url]` re-reads local snapshots and re-fetches URL
+snapshots, updates only the selected documents (or all documents when no
+selector is given), and always regenerates `docs/context.md`, the adapters, and
+`README.md` (even when the workspace has no documents). It never rescouts,
+prunes attachments, changes Git revisions, or replaces working files.
+
+- A changed source with an untouched snapshot is copied in and the manifest
+  hash/`fetched_at` are updated.
+- A deleted snapshot is restored from its source.
+- A readable reference is upgraded to a snapshot, allocated against the real
+  on-disk `docs/` contents so untracked files are not overwritten.
+- **User edits are never silently overwritten.** If you edited a snapshot and
+  its source also changed, WSG keeps your file and writes `<snapshot>.wsg-new`
+  with the new source bytes. If you edited a generated file
+  (`docs/context.md`, `AGENTS.md`, `CLAUDE.md`, `README.md`), WSG keeps it and
+  writes `<file>.wsg-new`. Either case exits 3.
+- **Failed fetches retain the last usable snapshot** and report a partial result
+  (exit 3); the previous manifest hash is preserved. A single wall-clock deadline
+  bounds the whole fetch, including a stalled response body.
+- `refresh` re-checks the on-disk snapshot immediately before each write and
+  refuses to publish over a `workspace.yaml` that changed during the operation.
+- `workspace.yaml` is published last and atomically, so an interrupted update
+  never leaves a half-written manifest.
+
+An interrupted `wsg add` leaves a durable operation journal in `.wsg/` and
+stages the recorded document/script bytes under `.wsg/tmp/` before any mutation.
+Rerun the same command with `--resume` to reconcile new worktrees/snapshots from
+those staged bytes — even if the original source later changed or disappeared —
+without duplicating work or overwriting edits. Resume compares canonical source
+identities, so the same relative spelling in a different directory is rejected.
+Concurrent `add`/`refresh` calls are serialized by the writer lock and fail
+closed with exit 2.
 
 ## Development
 
@@ -170,6 +248,7 @@ There is no `wsg remove` in the MVP. To reuse a workspace name, tear the workspa
 `WSG_FAULT=<name>[:<n>]` makes WSG exit with code 70 on the `n`th hit of a fault point (default 1). It exists only to test crash recovery with real processes and is not needed for normal use.
 
 - `after-lock` — after the write lock and operation journal are persisted.
+- `after-stage` — after add stages recorded document/script bytes, before any mutation.
 - `after-worktree` — after a worktree is created, before its step is marked done.
 - `after-generate` — after generated files are reconciled, before `workspace.yaml` is published.
 

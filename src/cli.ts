@@ -6,6 +6,8 @@ import { parseArgs } from 'node:util';
 import { WsgError, UsageError, ConflictError, PartialError } from './errors.ts';
 import { runCreate } from './create.ts';
 import { runExplain } from './explain.ts';
+import { runAdd } from './add.ts';
+import { runRefresh } from './refresh.ts';
 
 const pkgPath = new URL('../package.json', import.meta.url);
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version: string };
@@ -56,11 +58,11 @@ export const defaultHandlers: CommandHandlers = {
   explain: async (args: string[], io: CliIO): Promise<number> => {
     return await runExplain(args, io);
   },
-  add: async (): Promise<never> => {
-    throw new UsageError('add: not implemented in this version');
+  add: async (args: string[], io: CliIO): Promise<number> => {
+    return await runAdd(args, io);
   },
-  refresh: async (): Promise<never> => {
-    throw new UsageError('refresh: not implemented in this version');
+  refresh: async (args: string[], io: CliIO): Promise<number> => {
+    return await runRefresh(args, io);
   },
 };
 

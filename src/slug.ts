@@ -87,12 +87,23 @@ function normalizeBase(rawBase: string): string {
   return normalized;
 }
 
+export interface AssignEntryNamesOptions {
+  /**
+   * Entry names already in use by the workspace (e.g. existing manifest repos).
+   * New names never collide with these. Used by `wsg add`.
+   */
+  reservedNames?: readonly string[];
+}
+
 export function assignEntryNames(
-  sources: readonly string[]
+  sources: readonly string[],
+  options: AssignEntryNamesOptions = {}
 ): Map<string, string> {
   const result = new Map<string, string>();
   const canonicalToEntry = new Map<string, string>();
-  const usedLowerNames = new Set<string>();
+  const usedLowerNames = new Set<string>(
+    (options.reservedNames ?? []).map((name) => name.toLowerCase())
+  );
 
   for (const source of sources) {
     const canonical = canonicalize(source);

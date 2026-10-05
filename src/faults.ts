@@ -1,4 +1,8 @@
-export type FaultPointName = 'after-lock' | 'after-worktree' | 'after-generate';
+export type FaultPointName =
+  | 'after-lock'
+  | 'after-stage'
+  | 'after-worktree'
+  | 'after-generate';
 
 const faultCounters: Record<string, number> = {};
 
