@@ -12,19 +12,66 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Milestones 1–2 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, and `wsg explain` are implemented. `add` and `refresh` are planned for Milestone 4. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Milestones 1–3 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, and the Milestone 3 local scout harness are implemented. `add` and `refresh` are planned for Milestone 4. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
-wsg create "port EMR mono to modular for new system" --name port-emr
+# Explicit inputs (no model or credentials required):
+wsg create "port EMR mono to modular for new system" --name port-emr \
+  --repo ~/code/legacy-platform --repo ~/code/new-platform
 cd ~/wsg/port-emr
 wsg explain      # read-only: saved repos, docs, exclusions, gaps, commands
 codex # or claude / pi
+
+# Autonomous discovery (no --repo): one read-only Pi Durable scout conversation
+# enumerates code roots, gathers evidence, and selects the smallest useful set.
+wsg create "port EMR mono to modular for new system" --name port-emr --code-root ~/code
+
+# Combined: explicit --repo inputs are always included (outside the roots and
+# without evidence), while --code-root also scouted for dependencies.
+wsg create "port EMR mono to modular for new system" --name port-emr \
+  --repo ~/code/new-platform --code-root ~/code
 
 # Planned (Milestone 4):
 # wsg add ~/code/emr-importer
 # wsg add ~/docs/emr-migration.md
 # wsg refresh
 ```
+
+## Local Scouting (Milestone 3)
+
+`create` runs one bounded, read-only scout conversation when it is called
+without `--repo`, or whenever `--code-root` is supplied. It enumerates Git
+repositories under the code roots (default `~/code`), reads
+READMEs/manifests/agent instructions, runs bounded `rg` searches, and resolves
+local document mentions. The scout has no write, Git mutation, install, or
+arbitrary shell tool, and repository instructions are treated as data rather
+than authority.
+
+Selection is evidence-based: every automatically discovered repository must
+cite a repository-relative file that retrieval or a read/search tool actually
+observed, with a quoted snippet verified against the exact observed lines rather
+than the current file, so unseen content cannot be cited. Unseen or fictional
+evidence stops the run with an actionable error. Supplied documents and one-hop
+resolved local documents are exposed to the scout as bounded, untrusted context
+and can be planned into the workspace. The scout selects at most
+`max_discovered_repos` (default 5) automatically discovered repositories;
+explicit `--repo` inputs are always included, are not counted against the cap,
+and need no evidence. Selections that name more than one target are reported as
+ambiguous (exit 2) and never materialize an arbitrary target.
+
+Scout tool/read/search budgets are finite and durably accounted
+(`scout-budget.json`), so an uncooperative model is stopped deterministically
+and a resumed run continues the same accounting. Scout state is checkpointed
+under `<workspace-root>/.wsg-scout/<name>/` using real SQLite persistence, and
+copied into `.wsg/` after a successful assembly. Resume refuses to replay a
+selection when the request, context, documents, code roots, or repositories
+changed.
+
+`--dry-run` shows the plan without creating the target workspace. Discovery
+caches runtime state outside the target. If the pinned Pi Durable packages are
+not installed, autonomous scouting reports the blocker and explicit `--repo`
+creation (without `--code-root`) still works offline.
+
 
 Each feature gets an independent directory. There are no nested workspace groups or workspace orchestration in the MVP.
 

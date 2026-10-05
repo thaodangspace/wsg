@@ -12,6 +12,7 @@ export const SECRET_FILENAME_PATTERNS: ReadonlyArray<RegExp> = [
   /^\.env(\..*)?$/i,
   /.*\.env$/i,
   /^id_(rsa|dsa|ecdsa|ed25519)(\..*)?$/i,
+  /\.(pem|key|p12|pfx|keystore)$/i,
 ];
 
 export const SECRET_CONTENT_PATTERNS: ReadonlyArray<RegExp> = [
