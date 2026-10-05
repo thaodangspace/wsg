@@ -1,0 +1,11 @@
+code_roots:
+  - ~/code
+  - ~/work
+workspace_root: ~/wsg
+adapters:
+  - agents
+  - claude
+max_discovered_repos: 10
+scout:
+  provider: openai
+  model: gpt-4o
