@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { ConflictError, UsageError } from './errors.ts';
-import { ensureDir, writeFileAtomic } from './fsx.ts';
+import { ensureDir, writeFileAtomic, writeAllSync } from './fsx.ts';
 import { canonicalize } from './paths.ts';
 
 export type StepStatus = 'planned' | 'started' | 'done' | 'failed';
@@ -45,6 +46,7 @@ export interface LockData {
   hostname: string;
   startedAt: string;
   opId?: string;
+  token?: string;
 }
 
 export interface AcquireLockOptions {
@@ -53,7 +55,7 @@ export interface AcquireLockOptions {
 }
 
 export function isPidAlive(pid: number): boolean {
-  if (typeof pid !== 'number' || isNaN(pid) || pid <= 0) {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
     return false;
   }
   try {
@@ -71,39 +73,81 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
-export function resolveWsgDir(dir: string): string {
-  const canonical = canonicalize(dir);
-  if (path.basename(canonical) === '.wsg') {
-    return canonical;
-  }
-  return path.join(canonical, '.wsg');
-}
-
 /**
- * Initializes the .wsg directory:
- * - mode 0700
- * - creates .gitignore containing *
- * - refuses symlinks
+ * Resolves the .wsg directory while checking and refusing symlinks
+ * BEFORE calling realpath / canonicalize.
  */
-export function initWsgDir(dir: string): string {
-  const wsgDir = resolveWsgDir(dir);
+export function resolveWsgDir(dir: string): string {
+  const resolvedInput = path.resolve(dir);
 
+  let wsDir: string;
+  let wsgDir: string;
+
+  if (path.basename(resolvedInput) === '.wsg') {
+    wsgDir = resolvedInput;
+    wsDir = path.dirname(resolvedInput);
+  } else {
+    wsDir = resolvedInput;
+    wsgDir = path.join(resolvedInput, '.wsg');
+  }
+
+  // Refuse if wsgDir itself is a symbolic link before realpath
   try {
     const lstat = fs.lstatSync(wsgDir);
     if (lstat.isSymbolicLink()) {
       throw new UsageError(`Refusing to initialize .wsg directory through symbolic link: '${wsgDir}'`);
     }
   } catch (err: unknown) {
+    if (err instanceof UsageError) throw err;
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw err;
     }
   }
 
+  // Canonicalize workspace directory
+  const canonicalWs = canonicalize(wsDir);
+  const canonicalWsg = path.join(canonicalWs, '.wsg');
+
+  // Verify canonical .wsg is not a symlink either
+  try {
+    const lstat = fs.lstatSync(canonicalWsg);
+    if (lstat.isSymbolicLink()) {
+      throw new UsageError(`Refusing to initialize .wsg directory through symbolic link: '${canonicalWsg}'`);
+    }
+  } catch (err: unknown) {
+    if (err instanceof UsageError) throw err;
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  return canonicalWsg;
+}
+
+/**
+ * Initializes the .wsg directory:
+ * - mode 0700 (verifies and does not silently ignore chmod failure)
+ * - creates .gitignore containing *
+ * - refuses symlinks before realpath
+ */
+export function initWsgDir(dir: string): string {
+  const wsgDir = resolveWsgDir(dir);
+
   ensureDir(wsgDir, 0o700);
+
   try {
     fs.chmodSync(wsgDir, 0o700);
-  } catch {
-    // ignore
+  } catch (err: unknown) {
+    throw new UsageError(
+      `Failed to set required 0700 permissions on '${wsgDir}': ${(err as Error).message}`
+    );
+  }
+
+  const stat = fs.statSync(wsgDir);
+  if ((stat.mode & 0o777) !== 0o700) {
+    throw new UsageError(
+      `Directory '${wsgDir}' does not have required 0700 permissions (got ${(stat.mode & 0o777).toString(8)})`
+    );
   }
 
   const gitignorePath = path.join(wsgDir, '.gitignore');
@@ -114,11 +158,45 @@ export function initWsgDir(dir: string): string {
   return wsgDir;
 }
 
+function parseValidLockData(content: string): LockData | null {
+  try {
+    const data = JSON.parse(content);
+    if (!data || typeof data !== 'object') return null;
+
+    const raw = data as Record<string, unknown>;
+    const pid = raw.pid;
+    const hostname = raw.hostname;
+    const startedAt = raw.startedAt;
+    const opId = raw.opId;
+    const token = raw.token;
+
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+      return null;
+    }
+    if (typeof hostname !== 'string' || hostname.trim().length === 0) {
+      return null;
+    }
+    if (typeof startedAt !== 'string' || startedAt.trim().length === 0) {
+      return null;
+    }
+
+    return {
+      pid,
+      hostname,
+      startedAt,
+      ...(typeof opId === 'string' ? { opId } : {}),
+      ...(typeof token === 'string' ? { token } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Acquires exclusive workspace lock using O_EXCL.
- * If held by another host, throws ConflictError.
- * If held by live PID on same host, throws ConflictError.
- * If held by dead PID on same host, takes over stale lock and logs warning.
+ * Only reclaims a well-formed lock with matching local hostname and demonstrably dead positive integer PID.
+ * Malformed, partial, hostname-missing, or unknown process state conflicts without unlinking.
+ * Serializes stale reclamation via reclaim.lock and verifies ownership before atomic replacement.
  */
 export function acquireLock(
   dir: string,
@@ -138,8 +216,9 @@ export function acquireLock(
 
   const wsgDir = initWsgDir(dir);
   const lockPath = path.join(wsgDir, 'lock');
+  const reclaimLockPath = path.join(wsgDir, 'reclaim.lock');
 
-  const maxAttempts = 5;
+  const maxAttempts = 10;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Check if lock file is a symlink
     try {
@@ -153,10 +232,12 @@ export function acquireLock(
       }
     }
 
+    const token = crypto.randomBytes(16).toString('hex');
     const myLock: LockData = {
       pid: process.pid,
       hostname: os.hostname(),
       startedAt: new Date().toISOString(),
+      token,
       ...(opId ? { opId } : {}),
     };
     const payload = JSON.stringify(myLock, null, 2) + '\n';
@@ -170,7 +251,7 @@ export function acquireLock(
     let fd: number | null = null;
     try {
       fd = fs.openSync(lockPath, flags, 0o600);
-      fs.writeSync(fd, Buffer.from(payload, 'utf8'));
+      writeAllSync(fd, Buffer.from(payload, 'utf8'));
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = null;
@@ -190,67 +271,134 @@ export function acquireLock(
       }
     }
 
-    // Lock exists: read it
-    let existing: LockData | null = null;
-    try {
-      const content = fs.readFileSync(lockPath, 'utf8');
-      existing = JSON.parse(content) as LockData;
-    } catch {
-      existing = null;
+    // Lock file exists: read it carefully
+    // Give a concurrent writer a few microsecond turns in case it just opened the file
+    let existingContent = '';
+    let parsed: LockData | null = null;
+    for (let readAttempt = 0; readAttempt < 5; readAttempt++) {
+      try {
+        existingContent = fs.readFileSync(lockPath, 'utf8');
+        parsed = parseValidLockData(existingContent);
+        if (parsed !== null) {
+          break;
+        }
+      } catch (readErr: unknown) {
+        if ((readErr as NodeJS.ErrnoException).code === 'ENOENT') {
+          // Lock disappeared concurrently, retry acquisition
+          break;
+        }
+      }
+      // Small sync sleep: 10ms
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+
+    if (!parsed) {
+      // Still malformed, partial, or missing fields: must conflict without unlinking
+      throw new ConflictError(
+        `Workspace lock file '${lockPath}' is held or unreadable (cannot safely verify holder without conflict risk)`,
+        [
+          `A lock file exists but does not contain a verified process record.`,
+          `This may indicate another process is starting or was terminated abnormally.`,
+          `WSG will not unlink unverified lock files. Remove '${lockPath}' manually if no process is running.`,
+        ]
+      );
     }
 
     const currentHost = os.hostname();
-
-    if (existing && existing.hostname && existing.hostname !== currentHost) {
+    if (parsed.hostname !== currentHost) {
       throw new ConflictError(
-        `Workspace lock held on another host: ${existing.hostname} (pid ${existing.pid})`,
+        `Workspace lock held on another host: ${parsed.hostname} (pid ${parsed.pid})`,
         [
-          `The workspace is locked by process ${existing.pid} running on host '${existing.hostname}'.`,
+          `The workspace is locked by process ${parsed.pid} running on host '${parsed.hostname}'.`,
           `WSG cannot safely take over locks across hosts. If that process is no longer running, manually remove '${lockPath}'.`,
         ]
       );
     }
 
-    if (existing && typeof existing.pid === 'number') {
-      const alive = isPidAlive(existing.pid);
-      if (alive) {
-        throw new ConflictError(
-          `Workspace lock held by active process (pid ${existing.pid} on ${existing.hostname})`,
-          [
-            `Another wsg process (pid ${existing.pid}) is currently running in this workspace.`,
-            `If you believe this is in error, wait for it to finish or terminate pid ${existing.pid}.`,
-          ]
-        );
+    // On same host: check if PID is alive
+    const alive = isPidAlive(parsed.pid);
+    if (alive) {
+      throw new ConflictError(
+        `Workspace lock held by active process (pid ${parsed.pid} on ${parsed.hostname})`,
+        [
+          `Another wsg process (pid ${parsed.pid}) is currently running in this workspace.`,
+          `If you believe this is in error, wait for it to finish or terminate pid ${parsed.pid}.`,
+        ]
+      );
+    }
+
+    // Demonstrably dead positive integer PID on same local host:
+    // Serialize stale reclaimers via reclaim.lock to avoid races
+    let reclaimFd: number | null = null;
+    try {
+      reclaimFd = fs.openSync(reclaimLockPath, flags, 0o600);
+    } catch (reclaimErr: unknown) {
+      const recCode = (reclaimErr as NodeJS.ErrnoException).code;
+      if (recCode === 'EEXIST') {
+        // Another process is currently reclaiming, back off and retry
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        continue;
+      }
+      throw reclaimErr;
+    }
+
+    try {
+      // Protected by reclaim.lock: re-read lockPath and verify ownership before mutation
+      let verifyContent = '';
+      try {
+        verifyContent = fs.readFileSync(lockPath, 'utf8');
+      } catch {
+        // lock vanished
+        verifyContent = '';
+      }
+      const verified = parseValidLockData(verifyContent);
+
+      if (
+        !verified ||
+        verified.pid !== parsed.pid ||
+        verified.hostname !== parsed.hostname ||
+        verified.startedAt !== parsed.startedAt ||
+        verified.token !== parsed.token
+      ) {
+        // Lock changed while we were acquiring reclaim.lock! Back off and re-evaluate
+        continue;
       }
 
-      // Dead PID on same host -> stale takeover
-      const warning = `wsg: taking over stale lock from dead process (pid ${existing.pid} on ${existing.hostname})`;
+      // Still the exact dead PID: take over
+      const warning = `wsg: taking over stale lock from dead process (pid ${parsed.pid} on ${parsed.hostname})`;
       if (onWarning) {
         onWarning(warning);
       }
       process.stderr.write(`${warning}\n`);
 
-      try {
-        fs.unlinkSync(lockPath);
-      } catch (unlinkErr: unknown) {
-        if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw unlinkErr;
+      // Atomically replace lockPath using tmp file in same directory + rename
+      const tempRand = crypto.randomBytes(8).toString('hex');
+      const tempLockPath = path.join(
+        wsgDir,
+        `.lock.${process.pid}.${Date.now()}.${tempRand}.tmp`
+      );
+
+      const tfd = fs.openSync(tempLockPath, flags, 0o600);
+      writeAllSync(tfd, Buffer.from(payload, 'utf8'));
+      fs.fsyncSync(tfd);
+      fs.closeSync(tfd);
+
+      fs.renameSync(tempLockPath, lockPath);
+      return myLock;
+    } finally {
+      if (reclaimFd !== null) {
+        try {
+          fs.closeSync(reclaimFd);
+        } catch {
+          // ignore
         }
       }
-      continue;
-    }
-
-    // Corrupted or empty lock on same host
-    const warning = `wsg: taking over unreadable or empty lock file in '${wsgDir}'`;
-    if (onWarning) {
-      onWarning(warning);
-    }
-    process.stderr.write(`${warning}\n`);
-    try {
-      fs.unlinkSync(lockPath);
-    } catch (unlinkErr: unknown) {
-      if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
-        throw unlinkErr;
+      try {
+        if (fs.existsSync(reclaimLockPath)) {
+          fs.unlinkSync(reclaimLockPath);
+        }
+      } catch {
+        // ignore
       }
     }
   }
@@ -259,15 +407,38 @@ export function acquireLock(
 }
 
 /**
- * Releases the workspace lock.
+ * Releases the workspace lock only if it matches our own acquisition.
  */
-export function releaseLock(dir: string): void {
+export function releaseLock(
+  dir: string,
+  expectedLock?: LockData | { pid?: number; hostname?: string; token?: string }
+): void {
   const wsgDir = resolveWsgDir(dir);
   const lockPath = path.join(wsgDir, 'lock');
+
   try {
-    if (fs.existsSync(lockPath)) {
-      fs.unlinkSync(lockPath);
+    if (!fs.existsSync(lockPath)) {
+      return;
     }
+
+    const content = fs.readFileSync(lockPath, 'utf8');
+    const current = parseValidLockData(content);
+
+    // Verify ownership before unlinking
+    const expectedPid = expectedLock?.pid ?? process.pid;
+    const expectedHost = expectedLock?.hostname ?? os.hostname();
+
+    if (current?.pid !== expectedPid || current?.hostname !== expectedHost) {
+      // Does not belong to this process, refuse to unlink
+      return;
+    }
+
+    if (expectedLock?.token && current?.token && current.token !== expectedLock.token) {
+      // Token mismatch, refuse to unlink
+      return;
+    }
+
+    fs.unlinkSync(lockPath);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw err;

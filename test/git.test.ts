@@ -322,3 +322,101 @@ test('detectGaps flags .gitmodules and filter=lfs', () => {
     bothRepo.cleanup();
   }
 });
+
+test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom filters; sanitizes GIT_CONFIG injection', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-hook-filter-test-'));
+  const repoDir = path.join(tmpRoot, 'source-repo');
+  const wsRoot = path.join(tmpRoot, 'ws');
+  fs.mkdirSync(wsRoot);
+
+  const hookMarker = path.join(tmpRoot, 'hook-ran.txt');
+  const filterMarker = path.join(tmpRoot, 'filter-ran.txt');
+  const lfsMarker = path.join(tmpRoot, 'lfs-ran.txt');
+
+  try {
+    runGit(['init', '-b', 'main', repoDir]);
+    runGit(['-C', repoDir, 'config', 'user.name', 'WSG Test']);
+    runGit(['-C', repoDir, 'config', 'user.email', 'test@example.com']);
+
+    // 1. Install executable post-checkout hook in repo
+    const hooksDir = path.join(repoDir, '.git', 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const postCheckoutHook = path.join(hooksDir, 'post-checkout');
+    fs.writeFileSync(
+      postCheckoutHook,
+      `#!/bin/sh\necho "HOOK_RAN" > "${hookMarker}"\n`,
+      { mode: 0o755 }
+    );
+
+    // 2. Install executable custom filter smudge script
+    const customFilterScript = path.join(tmpRoot, 'custom-filter.sh');
+    fs.writeFileSync(
+      customFilterScript,
+      `#!/bin/sh\necho "CUSTOM_FILTER_RAN" > "${filterMarker}"\ncat\n`,
+      { mode: 0o755 }
+    );
+    runGit(['-C', repoDir, 'config', 'filter.custom.smudge', customFilterScript]);
+    runGit(['-C', repoDir, 'config', 'filter.custom.required', 'false']);
+
+    // 3. Install executable mock LFS smudge script
+    const lfsScript = path.join(tmpRoot, 'mock-lfs.sh');
+    fs.writeFileSync(
+      lfsScript,
+      `#!/bin/sh\necho "LFS_RAN" > "${lfsMarker}"\ncat\n`,
+      { mode: 0o755 }
+    );
+    runGit(['-C', repoDir, 'config', 'filter.lfs.smudge', lfsScript]);
+    runGit(['-C', repoDir, 'config', 'filter.lfs.clean', 'cat']);
+    runGit(['-C', repoDir, 'config', 'filter.lfs.required', 'true']);
+
+    // Write tracked files and attributes
+    fs.writeFileSync(
+      path.join(repoDir, '.gitattributes'),
+      '*.custom filter=custom\n*.bin filter=lfs diff=lfs merge=lfs -text\n',
+      'utf8'
+    );
+    fs.writeFileSync(path.join(repoDir, 'test.custom'), 'custom content\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'data.bin'), 'version https://git-lfs.github.com/spec/v1\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# Hook & Filter Test\n', 'utf8');
+
+    runGit(['-C', repoDir, 'add', '.']);
+    runGit(['-C', repoDir, 'commit', '-m', 'Add files with hook and filters']);
+    const headSha = runGit(['-C', repoDir, 'rev-parse', 'HEAD']).trim();
+
+    // Verify hooks and filters would run without wsg overrides
+    const testUnprotected = path.join(tmpRoot, 'unprotected-wt');
+    runGit(['-C', repoDir, 'worktree', 'add', '-b', 'unprotected', testUnprotected, headSha]);
+    assert.ok(fs.existsSync(hookMarker), 'Unprotected worktree add should run post-checkout hook');
+    assert.ok(fs.existsSync(filterMarker), 'Unprotected worktree add should run custom filter');
+    assert.ok(fs.existsSync(lfsMarker), 'Unprotected worktree add should run LFS filter');
+    // Remove markers
+    fs.unlinkSync(hookMarker);
+    fs.unlinkSync(filterMarker);
+    fs.unlinkSync(lfsMarker);
+
+    // 4. Test worktreeAddNewBranch with attempted GIT_CONFIG injection env
+    const dest = path.join(wsRoot, 'app');
+    const dangerousEnv: NodeJS.ProcessEnv = {
+      GIT_CONFIG_PARAMETERS: `'core.hooksPath=${hooksDir}'`,
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: hooksDir,
+      GIT_HOOKS_PATH: hooksDir,
+    };
+
+    worktreeAddNewBranch(repoDir, 'wsg/ws/app', dest, headSha, { env: dangerousEnv });
+
+    // Assert destination worktree created
+    assert.ok(fs.existsSync(dest));
+    assert.ok(fs.existsSync(path.join(dest, 'test.custom')));
+    assert.ok(fs.existsSync(path.join(dest, 'data.bin')));
+
+    // Assert that NO hook or filter executed
+    assert.equal(fs.existsSync(hookMarker), false, 'post-checkout hook must NOT execute');
+    assert.equal(fs.existsSync(filterMarker), false, 'custom filter smudge must NOT execute');
+    assert.equal(fs.existsSync(lfsMarker), false, 'LFS filter smudge must NOT execute');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+

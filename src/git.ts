@@ -32,6 +32,7 @@ export function assertSafeArg(arg: string, paramName: string = 'Argument'): stri
 /**
  * Runs git with sanitized environment and arguments.
  * Unsets parent GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, etc.
+ * Purges GIT_CONFIG_* injection variables and GIT_HOOKS_PATH.
  * Enforces GIT_TERMINAL_PROMPT=0 to avoid hangs.
  * Logs argv when WSG_DEBUG is set.
  */
@@ -46,6 +47,17 @@ export function runGit(args: string[], options: RunGitOptions = {}): string {
   delete env.GIT_INDEX_FILE;
   delete env.GIT_OBJECT_DIRECTORY;
   delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  delete env.GIT_COMMON_DIR;
+  delete env.GIT_HOOKS_PATH;
+  delete env.GIT_EXEC_PATH;
+  delete env.GIT_CONFIG_PARAMETERS;
+  delete env.GIT_CONFIG_COUNT;
+
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('GIT_CONFIG_')) {
+      delete env[key];
+    }
+  }
 
   if (process.env.WSG_DEBUG) {
     console.error(`[wsg git] git ${args.join(' ')}`);
@@ -377,8 +389,48 @@ export function worktreeList(repoPath: string, options: RunGitOptions = {}): Wor
 }
 
 /**
+ * Returns configuration arguments to disable post-checkout hooks, LFS smudge/clean,
+ * and custom filters during worktree materialization.
+ */
+export function getMaterializationConfigArgs(repoPath: string, options: RunGitOptions = {}): string[] {
+  const args: string[] = [
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'filter.lfs.smudge=',
+    '-c', 'filter.lfs.clean=',
+    '-c', 'filter.lfs.process=',
+    '-c', 'filter.lfs.required=false',
+  ];
+
+  try {
+    const canonical = canonicalize(repoPath);
+    const configOut = runGit(['-C', canonical, 'config', '--get-regexp', '^filter\\.'], options);
+    const filterNames = new Set<string>();
+    for (const line of configOut.split('\n')) {
+      const match = line.trim().match(/^filter\.([^.]+)\./);
+      if (match && match[1]) {
+        filterNames.add(match[1]);
+      }
+    }
+    for (const name of filterNames) {
+      if (name !== 'lfs') {
+        args.push(
+          '-c', `filter.${name}.smudge=`,
+          '-c', `filter.${name}.clean=`,
+          '-c', `filter.${name}.process=`,
+          '-c', `filter.${name}.required=false`
+        );
+      }
+    }
+  } catch {
+    // If config search fails, default overrides suffice
+  }
+
+  return args;
+}
+
+/**
  * Creates a new git worktree with a newly created branch.
- * git -C <repo> worktree add -b <branch> -- <dest> <commit>
+ * git -C <repo> -c core.hooksPath=/dev/null ... worktree add -b <branch> -- <dest> <commit>
  */
 export function worktreeAddNewBranch(
   repoPath: string,
@@ -398,16 +450,21 @@ export function worktreeAddNewBranch(
 
   const canonicalRepo = canonicalize(repoPath);
   const resolvedDest = path.resolve(dest);
+  const configArgs = getMaterializationConfigArgs(canonicalRepo, options);
 
   runGit(
-    ['-C', canonicalRepo, 'worktree', 'add', '-b', branch, '--', resolvedDest, commit],
+    [
+      '-C', canonicalRepo,
+      ...configArgs,
+      'worktree', 'add', '-b', branch, '--', resolvedDest, commit,
+    ],
     options
   );
 }
 
 /**
  * Creates a new git worktree using an already existing branch.
- * git -C <repo> worktree add -- <dest> <branch>
+ * git -C <repo> -c core.hooksPath=/dev/null ... worktree add -- <dest> <branch>
  */
 export function worktreeAddExisting(
   repoPath: string,
@@ -425,9 +482,14 @@ export function worktreeAddExisting(
 
   const canonicalRepo = canonicalize(repoPath);
   const resolvedDest = path.resolve(dest);
+  const configArgs = getMaterializationConfigArgs(canonicalRepo, options);
 
   runGit(
-    ['-C', canonicalRepo, 'worktree', 'add', '--', resolvedDest, branch],
+    [
+      '-C', canonicalRepo,
+      ...configArgs,
+      'worktree', 'add', '--', resolvedDest, branch,
+    ],
     options
   );
 }

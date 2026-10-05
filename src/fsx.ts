@@ -26,14 +26,44 @@ export function sha256File(filePath: string): string {
   return sha256(data);
 }
 
+export interface WriteAllSyncOptions {
+  maxChunkSize?: number;
+}
+
+/**
+ * Writes the entire buffer to fd in a loop to handle short writes safely.
+ */
+export function writeAllSync(
+  fd: number,
+  buffer: Uint8Array,
+  options: WriteAllSyncOptions = {}
+): void {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const chunkSize = options.maxChunkSize
+      ? Math.min(buffer.length - offset, options.maxChunkSize)
+      : buffer.length - offset;
+
+    const written = fs.writeSync(fd, buffer, offset, chunkSize);
+    if (written <= 0) {
+      throw new Error(
+        `writeSync returned ${written} bytes (offset ${offset} of ${buffer.length})`
+      );
+    }
+    offset += written;
+  }
+}
+
 export interface WriteFileAtomicOptions {
   mode?: number;
   tmpDir?: string;
+  _maxChunkSize?: number;
 }
 
 /**
  * Writes content atomically to filePath using tmp + fsync + rename.
  * Refuses to write through symbolic links.
+ * Handles short writes with a write loop.
  * Cleans up temp file on failure.
  */
 export function writeFileAtomic(
@@ -87,7 +117,7 @@ export function writeFileAtomic(
       }
     }
     if (buffer.length > 0) {
-      fs.writeSync(fd, buffer, 0, buffer.length, 0);
+      writeAllSync(fd, buffer, { maxChunkSize: options._maxChunkSize });
     }
     fs.fsyncSync(fd);
     fs.closeSync(fd);

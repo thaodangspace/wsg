@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import {
   initWsgDir,
   acquireLock,
@@ -49,7 +49,14 @@ test('initWsgDir refuses symlinked .wsg directory', () => {
     const symlinkPath = path.join(wsDir, '.wsg');
     fs.symlinkSync(externalDir, symlinkPath);
 
+    // Refuses workspace directory when .wsg is a symlink
     assert.throws(() => initWsgDir(wsDir), {
+      name: 'UsageError',
+      message: /Refusing to initialize \.wsg directory through symbolic link/,
+    });
+
+    // Refuses explicit .wsg argument when it is a symlink
+    assert.throws(() => initWsgDir(symlinkPath), {
       name: 'UsageError',
       message: /Refusing to initialize \.wsg directory through symbolic link/,
     });
@@ -323,3 +330,201 @@ test('no *.tmp left after operation journal writes and lock operations', () => {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
 });
+
+test('acquireLock refuses to unlink malformed, empty, or missing-hostname lock files', () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-malformed-lock-'));
+  try {
+    initWsgDir(wsDir);
+    const lockPath = path.join(wsDir, '.wsg', 'lock');
+
+    // Test 1: empty lock file
+    fs.writeFileSync(lockPath, '', 'utf8');
+    assert.throws(() => acquireLock(wsDir), {
+      name: 'ConflictError',
+      message: /is held or unreadable/,
+    });
+    // Lock file must NOT be unlinked
+    assert.ok(fs.existsSync(lockPath), 'Lock file must not be deleted on empty lock');
+
+    // Test 2: partial/invalid JSON
+    fs.writeFileSync(lockPath, '{"pid": 1234, "hostname":', 'utf8');
+    assert.throws(() => acquireLock(wsDir), {
+      name: 'ConflictError',
+      message: /is held or unreadable/,
+    });
+    assert.ok(fs.existsSync(lockPath), 'Lock file must not be deleted on malformed lock');
+
+    // Test 3: missing hostname
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 1234, startedAt: new Date().toISOString() }), 'utf8');
+    assert.throws(() => acquireLock(wsDir), {
+      name: 'ConflictError',
+      message: /is held or unreadable/,
+    });
+    assert.ok(fs.existsSync(lockPath), 'Lock file must not be deleted on missing hostname');
+
+    // Test 4: non-positive / invalid pid
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: -5, hostname: os.hostname(), startedAt: new Date().toISOString() }), 'utf8');
+    assert.throws(() => acquireLock(wsDir), {
+      name: 'ConflictError',
+      message: /is held or unreadable/,
+    });
+    assert.ok(fs.existsSync(lockPath), 'Lock file must not be deleted on invalid PID');
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test('releaseLock verifies ownership and refuses to unlink another process lock', () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-releaselock-'));
+  try {
+    initWsgDir(wsDir);
+    const lockPath = path.join(wsDir, '.wsg', 'lock');
+
+    // Lock owned by another process PID
+    const otherLock = {
+      pid: 999999,
+      hostname: os.hostname(),
+      startedAt: new Date().toISOString(),
+      token: 'foreign-token',
+    };
+    fs.writeFileSync(lockPath, JSON.stringify(otherLock, null, 2) + '\n', 'utf8');
+
+    // Calling releaseLock from this process must NOT unlink other process's lock
+    releaseLock(wsDir);
+    assert.ok(fs.existsSync(lockPath), 'releaseLock must not unlink lock belonging to different PID');
+
+    // Explicit mismatch in token
+    releaseLock(wsDir, { pid: 999999, hostname: os.hostname(), token: 'wrong-token' });
+    assert.ok(fs.existsSync(lockPath), 'releaseLock must not unlink when token mismatches');
+
+    // Matching ownership removes lock
+    releaseLock(wsDir, otherLock);
+    assert.equal(fs.existsSync(lockPath), false, 'releaseLock with matching ownership should unlink');
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test('writeFileAtomic handles short writes via writeAllSync loop with regression injection', () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-shortwrite-'));
+  try {
+    const target = path.join(wsDir, 'test.txt');
+    // 500-byte test string
+    const content = 'a'.repeat(250) + 'b'.repeat(250);
+
+    // Inject chunk size of 7 bytes to force multiple short writes in the loop
+    writeFileAtomic(target, content, { _maxChunkSize: 7 });
+
+    const readBack = fs.readFileSync(target, 'utf8');
+    assert.equal(readBack.length, 500);
+    assert.equal(readBack, content);
+    assert.equal(sha256(content), sha256File(target));
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test('multi-process lock contention: only one contender wins and losers receive ConflictError', async () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-contention-'));
+  try {
+    initWsgDir(wsDir);
+
+    const childScript = `
+      import { acquireLock, releaseLock } from './src/operation.ts';
+      import { ConflictError } from './src/errors.ts';
+
+      const wsDir = process.argv[process.argv.length - 1];
+      try {
+        const lock = acquireLock(wsDir, { opId: 'child-' + process.pid });
+        // Hold lock for 100ms
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        releaseLock(wsDir, lock);
+        process.exit(0);
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          process.exit(2);
+        }
+        process.exit(1);
+      }
+    `;
+
+    // Spawn 4 parallel child processes attempting acquireLock at the same moment
+    const procs = Array.from({ length: 4 }, () =>
+      spawn('node', ['--input-type=module', '-e', childScript, '--', wsDir], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    );
+
+    const exitCodes = await Promise.all(
+      procs.map((p) => new Promise<number>((resolve) => p.on('exit', (code) => resolve(code ?? 1))))
+    );
+
+    const winCount = exitCodes.filter((code) => code === 0).length;
+    const conflictCount = exitCodes.filter((code) => code === 2).length;
+
+    assert.equal(winCount, 1, 'Exactly one contender must acquire the lock and exit 0');
+    assert.equal(conflictCount, 3, 'All other contenders must conflict with exit code 2');
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test('multi-process stale lock takeover: contenders serialize and newly acquired lock is protected', async () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-stale-contention-'));
+  try {
+    initWsgDir(wsDir);
+    const lockPath = path.join(wsDir, '.wsg', 'lock');
+
+    // Create dead PID lock
+    const deadChild = spawnSync('node', ['-e', 'process.exit(0)']);
+    const deadPid = deadChild.pid;
+
+    const staleLock = {
+      pid: deadPid,
+      hostname: os.hostname(),
+      startedAt: '2026-10-01T00:00:00.000Z',
+      opId: 'dead-op',
+      token: 'dead-token',
+    };
+    fs.writeFileSync(lockPath, JSON.stringify(staleLock, null, 2) + '\n', 'utf8');
+
+    const childScript = `
+      import { acquireLock, releaseLock } from './src/operation.ts';
+      import { ConflictError } from './src/errors.ts';
+
+      const wsDir = process.argv[process.argv.length - 1];
+      try {
+        const lock = acquireLock(wsDir, { opId: 'reclaimer-' + process.pid });
+        // Hold lock for 100ms
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        releaseLock(wsDir, lock);
+        process.exit(0);
+      } catch (err) {
+        if (err instanceof ConflictError) {
+          process.exit(2);
+        }
+        process.exit(1);
+      }
+    `;
+
+    // Spawn 3 parallel processes competing to reclaim the stale lock
+    const procs = Array.from({ length: 3 }, () =>
+      spawn('node', ['--input-type=module', '-e', childScript, '--', wsDir], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    );
+
+    const exitCodes = await Promise.all(
+      procs.map((p) => new Promise<number>((resolve) => p.on('exit', (code) => resolve(code ?? 1))))
+    );
+
+    const winCount = exitCodes.filter((code) => code === 0).length;
+    const conflictCount = exitCodes.filter((code) => code === 2).length;
+
+    assert.equal(winCount, 1, 'Exactly one reclaimer must successfully take over and exit 0');
+    assert.equal(conflictCount, 2, 'Other contenders must observe the new live lock and conflict with code 2');
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
