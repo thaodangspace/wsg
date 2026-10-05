@@ -93,6 +93,7 @@ wsg create "port EMR mono to modular" --name port-emr --repo ~/code/a --repo ~/c
   - anything else (branch moved, destination registered on a different branch, destination is a plain directory, pre-existing branch) → conflict exit 2 that reports the observed and expected state *before* any Git mutation.
 - Regenerates `docs/context.md`, adapters, and `README.md` under the ownership rules: unchanged WSG-owned files are overwritten, a user-edited file is left intact, and `<file>.wsg-new` is written; the run exits 3 when generated files need reconciliation.
 - Publishes `workspace.yaml` last.
+- Resolves the staging directory (`.wsg/tmp/<operation-id>/`) from the workspace root before any mutation, so a symlinked staging directory that escapes the workspace is rejected and staging writes/cleanup can never occur outside it.
 
 ## Manual Teardown
 

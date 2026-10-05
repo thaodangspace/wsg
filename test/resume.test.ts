@@ -853,6 +853,146 @@ test('resume rejects a traversal operation id without writing outside .wsg/tmp',
   }
 });
 
+test('resume rejects an outside .wsg/tmp staging symlink with zero git mutation', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-stage-' });
+  const docDir = mkTmp('wsg-rsm-stage-doc-');
+  const docPath = path.join(docDir, 'guide.md');
+  fs.writeFileSync(docPath, '# Guide\nPending snapshot.\n', 'utf8');
+  const tmpRoot = mkTmp('wsg-rsm-stage-root-');
+  const outside = mkTmp('wsg-rsm-stage-out-');
+  const marker = path.join(outside, 'marker.txt');
+  fs.writeFileSync(marker, 'MARKER\n', 'utf8');
+
+  try {
+    const first = runCli(
+      [
+        'create',
+        'task',
+        '--name',
+        'ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo.dir,
+        '--doc',
+        docPath,
+      ],
+      { env: { WSG_FAULT: 'after-worktree:1' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const wsDir = path.join(tmpRoot, 'ws');
+    const tmpLink = path.join(wsDir, '.wsg', 'tmp');
+    assert.ok(!fs.existsSync(tmpLink), 'staging dir must be absent before symlink setup');
+    fs.symlinkSync(outside, tmpLink, 'dir');
+
+    const beforeList = worktreeList(repo.dir).length;
+    const beforeSha = sha256(fs.readFileSync(marker));
+
+    const resumed = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--doc',
+      docPath,
+      '--resume',
+    ]);
+    assert.equal(resumed.status, 2, `expected conflict exit 2: ${resumed.stderr}`);
+    assert.match(resumed.stderr, /unsafe staging directory/);
+
+    assert.deepEqual(fs.readdirSync(outside), ['marker.txt'], 'no outside writes/deletes');
+    assert.equal(sha256(fs.readFileSync(marker)), beforeSha, 'outside marker unchanged');
+    assert.equal(worktreeList(repo.dir).length, beforeList, 'worktree list unchanged');
+    assert.ok(fs.lstatSync(tmpLink).isSymbolicLink(), 'staging symlink untouched');
+    assert.ok(
+      !fs.existsSync(path.join(wsDir, 'workspace.yaml')),
+      'manifest must not be published'
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(docDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('resume rejects an outside .wsg/tmp/<id> staging symlink with zero git mutation', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-stageid-' });
+  const docDir = mkTmp('wsg-rsm-stageid-doc-');
+  const docPath = path.join(docDir, 'guide.md');
+  fs.writeFileSync(docPath, '# Guide\nPending snapshot.\n', 'utf8');
+  const tmpRoot = mkTmp('wsg-rsm-stageid-root-');
+  const outside = mkTmp('wsg-rsm-stageid-out-');
+  const marker = path.join(outside, 'marker.txt');
+  fs.writeFileSync(marker, 'MARKER\n', 'utf8');
+
+  try {
+    const first = runCli(
+      [
+        'create',
+        'task',
+        '--name',
+        'ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo.dir,
+        '--doc',
+        docPath,
+      ],
+      { env: { WSG_FAULT: 'after-worktree:1' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const wsDir = path.join(tmpRoot, 'ws');
+    const opFile = readOperation(wsDir);
+    assert.ok(opFile?.operation?.id, 'operation id must be recorded');
+    const opId = opFile.operation.id;
+    const tmpParent = path.join(wsDir, '.wsg', 'tmp');
+    fs.mkdirSync(tmpParent, { recursive: true });
+    const idLink = path.join(tmpParent, opId);
+    fs.symlinkSync(outside, idLink, 'dir');
+
+    const beforeList = worktreeList(repo.dir).length;
+    const beforeSha = sha256(fs.readFileSync(marker));
+
+    const resumed = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--doc',
+      docPath,
+      '--resume',
+    ]);
+    assert.equal(resumed.status, 2, `expected conflict exit 2: ${resumed.stderr}`);
+    assert.match(resumed.stderr, /unsafe staging directory/);
+
+    assert.deepEqual(fs.readdirSync(outside), ['marker.txt'], 'no outside writes/deletes');
+    assert.equal(sha256(fs.readFileSync(marker)), beforeSha, 'outside marker unchanged');
+    assert.equal(worktreeList(repo.dir).length, beforeList, 'worktree list unchanged');
+    assert.ok(fs.lstatSync(idLink).isSymbolicLink(), 'staging symlink untouched');
+    assert.ok(
+      !fs.existsSync(path.join(wsDir, 'workspace.yaml')),
+      'manifest must not be published'
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(docDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test('resume preserves an edited snapshot and writes a .wsg-new proposal', () => {
   const repo = createTestRepo({ prefix: 'wsg-rsm-snapedit-' });
   const docDir = mkTmp('wsg-rsm-snapedit-doc-');

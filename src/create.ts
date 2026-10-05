@@ -467,6 +467,23 @@ function writeSnapshotProposal(wsDir: string, relPath: string, content: Buffer):
 }
 
 /**
+ * Resolves `.wsg/tmp/<id>` from the workspace root, rejecting a `.wsg/tmp` or
+ * `.wsg/tmp/<id>` symlink that escapes the workspace. The confined result must
+ * be used for staging writes and recursive cleanup so `ensureDir`/`rmSync`
+ * never follow an outside symlink.
+ */
+export function resolveStagingDir(wsDir: string, opId: string): string {
+  const rel = path.posix.join('.wsg', 'tmp', opId);
+  try {
+    return resolveInside(wsDir, rel);
+  } catch (err: unknown) {
+    throw new ConflictError(
+      `Refusing unsafe staging directory '.wsg/tmp/${opId}' outside the workspace: ${(err as Error).message}`
+    );
+  }
+}
+
+/**
  * Reconstructs the full deterministic plan from the operation journal.
  *
  * The journal's `plan` field is authoritative: it stores base commits, document
@@ -711,6 +728,12 @@ async function executeResume(
   assertSafeOperationId(op.id);
   validateRecordedDestinations(wsDir, plan);
 
+  // Resolve the staging directory from the workspace root before the lock,
+  // journal rewrite, or any Git command. A `.wsg/tmp` or `.wsg/tmp/<id>`
+  // symlink escaping the workspace is rejected here, and the confined result
+  // is reused for staging writes and cleanup.
+  const tmpDir = resolveStagingDir(wsDir, op.id);
+
   if (options.name !== undefined && options.name !== plan.name) {
     throw new ConflictError(
       `Workspace name '${options.name}' does not match recorded operation name '${plan.name}'.`
@@ -884,7 +907,6 @@ async function executeResume(
     // - target edited (sha differs) -> never overwrite; propose <path>.wsg-new
     //   with the recorded bytes and report a partial result. If the source has
     //   also changed the recorded bytes cannot be reproduced -> fail closed.
-    const tmpDir = path.join(wsDir, '.wsg', 'tmp', op.id);
     type SnapshotRecovery =
       | { kind: 'intact'; doc: RecordedPlanDoc; finalPath: string }
       | { kind: 'restore'; doc: RecordedPlanDoc; finalPath: string; content: Buffer }
@@ -1603,7 +1625,7 @@ async function executeCreate(
     }
 
     // (g) Snapshots via .wsg/tmp/<opId>/ then rename
-    const tmpDir = path.join(wsDir, '.wsg', 'tmp', opId);
+    const tmpDir = resolveStagingDir(wsDir, opId);
     ensureDir(tmpDir);
 
     for (const d of plannedDocs) {
