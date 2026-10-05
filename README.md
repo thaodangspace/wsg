@@ -63,6 +63,15 @@ node dist/cli.js --help
 node dist/cli.js --version
 ```
 
+## Workspace Safety & Locking
+
+WSG enforces strict filesystem safety and concurrency boundaries during workspace creation and modification:
+
+- **Writer Lock (`.wsg/lock`)**: Created with `O_EXCL` and mode `0600` containing process ID, hostname, timestamp, and an acquisition token.
+- **Stale Lock Takeover**: Stale locks from demonstrably dead processes (`ESRCH`) on the same local host are automatically taken over with a warning. Live processes and foreign-host locks fail closed with conflict exit code 2.
+- **Reclamation Guard (`.wsg/reclaim.lock`)**: Stale lock reclamation is serialized using an exclusive guard to prevent multiple concurrent reclaimers from racing and unlinking newly acquired locks.
+- **Exceptional Recovery Limitation**: If a process crashes or is forcefully terminated while holding `.wsg/reclaim.lock`, WSG fails closed with exit code 2 and actionable manual recovery guidance rather than automatically overwriting the guard (which would reintroduce reclaimer races). Once the user verifies no other process is active and manually removes `.wsg/reclaim.lock`, subsequent runs automatically resume normal stale takeover of the main lock.
+
 ## Inspiration
 
 [Pi Durable](https://earendil.com/posts/pi-durable/) provides the starting point for a resumable scout harness. The portable workspace remains usable without that runtime.
