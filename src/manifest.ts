@@ -7,7 +7,7 @@ import { parseYamlStrict, type ParseYamlOptions } from './yamlio.ts';
 import { UsageError } from './errors.ts';
 import { assertConfinedRelative } from './paths.ts';
 import { assertValidSlug, isReservedRootName } from './slug.ts';
-import { checkBranchName } from './git.ts';
+import { checkBranchName } from './branch.ts';
 
 export const MANIFEST_VERSION = 1;
 

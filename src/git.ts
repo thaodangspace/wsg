@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { UsageError } from './errors.ts';
 import { canonicalize } from './paths.ts';
+import { checkBranchName } from './branch.ts';
+
+export { checkBranchName };
 
 export interface RunGitOptions {
   cwd?: string;
@@ -87,37 +90,6 @@ export function runGit(args: string[], options: RunGitOptions = {}): string {
   }
 
   return result.stdout;
-}
-
-/**
- * Checks whether a branch name is valid according to git check-ref-format --branch.
- */
-export function checkBranchName(name: string): boolean {
-  if (!name || typeof name !== 'string') {
-    return false;
-  }
-  if (name.startsWith('-') || name.includes('\0') || name.includes('\n')) {
-    return false;
-  }
-
-  try {
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      GIT_TERMINAL_PROMPT: '0',
-    };
-    delete env.GIT_DIR;
-    delete env.GIT_WORK_TREE;
-    delete env.GIT_INDEX_FILE;
-
-    const result = spawnSync('git', ['check-ref-format', '--branch', name], {
-      env,
-      encoding: 'utf8',
-    });
-
-    return result.status === 0;
-  } catch {
-    return false;
-  }
 }
 
 /**

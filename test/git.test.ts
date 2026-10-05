@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   runGit,
   gitVersion,
@@ -42,6 +43,109 @@ test('assertSafeArg rejects invalid arguments and passes safe arguments', () => 
     name: 'UsageError',
     message: /arg must not contain NUL bytes/,
   });
+});
+
+test('checkBranchName matches git check-ref-format --branch on a broad corpus', () => {
+  const gitCheck = (name: string): boolean => {
+    const result = spawnSync('git', ['check-ref-format', '--branch', name], {
+      encoding: 'utf8',
+    });
+    return result.status === 0;
+  };
+
+  const names = [
+    'main',
+    'master',
+    'wsg/port-emr/legacy-platform',
+    'feature/my-branch_123',
+    'a',
+    'b/c',
+    'refs/heads/foo',
+    'refs/heads/-bad',
+    'refs/heads/',
+    '@',
+    '@@',
+    'x@',
+    '@/x',
+    '@x',
+    'a@b',
+    '-bad',
+    '-',
+    '--',
+    'bad..name',
+    'f..oo',
+    'a..',
+    'bad/',
+    '/bad',
+    'bad.',
+    '.bad',
+    'a/.b',
+    'a/b.',
+    'a.',
+    '.',
+    '..',
+    'a./b',
+    'a/b./c',
+    'a.lock',
+    'a.lock/x',
+    'foo/bar.lock',
+    'a.lockb',
+    'a.lock.b',
+    'x.LOCK',
+    'a b',
+    'a\tb',
+    'a~b',
+    'a^b',
+    'a:b',
+    'a?b',
+    'a*b',
+    'a[b',
+    'a]b',
+    'a\\b',
+    'a@{b',
+    'a@{',
+    '@{a',
+    '@/b',
+    'a/b//c',
+    'a//b',
+    'foo/',
+    'a/b/c',
+    'a-b',
+    'a_b',
+    'a%b',
+    'a$b',
+    'a+b',
+    'a=b',
+    'a,b',
+    'a!b',
+    'a#b',
+    'a&b',
+    'a(b',
+    'a)b',
+    'a;b',
+    'a{b',
+    'a}b',
+    'a<b',
+    'a>b',
+    'a|b',
+    'ä',
+    '日本語',
+    'wsg/fixture-ws/repo-alpha',
+  ];
+
+  for (const name of names) {
+    assert.equal(
+      checkBranchName(name),
+      gitCheck(name),
+      `checkBranchName(${JSON.stringify(name)}) must match git`
+    );
+  }
+
+  // Generated repository names must remain valid.
+  assert.equal(checkBranchName('wsg/port-emr/legacy-platform'), true);
+  assert.equal(checkBranchName('bad..name'), false);
+  assert.equal(checkBranchName('bad/'), false);
+  assert.equal(checkBranchName(''), false);
 });
 
 test('gitVersion returns a version string', () => {

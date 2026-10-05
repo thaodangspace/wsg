@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { WsgError, UsageError, ConflictError, PartialError } from './errors.ts';
 import { runCreate } from './create.ts';
+import { runExplain } from './explain.ts';
 
 const pkgPath = new URL('../package.json', import.meta.url);
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version: string };
@@ -53,19 +54,7 @@ export const defaultHandlers: CommandHandlers = {
     return await runCreate(args, io);
   },
   explain: async (args: string[], io: CliIO): Promise<number> => {
-    const { values } = parseArgs({
-      args,
-      options: {
-        help: { type: 'boolean', short: 'h' },
-      },
-      allowPositionals: true,
-      strict: true,
-    });
-    if (values.help) {
-      (io.stdout ?? process.stdout).write(`Usage: wsg explain [repo-name] [options]\n`);
-      return 0;
-    }
-    return 0;
+    return await runExplain(args, io);
   },
   add: async (): Promise<never> => {
     throw new UsageError('add: not implemented in this version');
