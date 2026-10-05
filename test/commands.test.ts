@@ -7,6 +7,8 @@ import {
   allocateWrapperBasename,
   renderWrapper,
   shellQuote,
+  extractDocumentedCommandLines,
+  parseDocumentedCommand,
   type CommandRepoInput,
 } from '../src/commands.ts';
 import type { CommandEntry } from '../src/manifest.ts';
@@ -39,7 +41,7 @@ test('isSupportedNpmScript accepts concrete validation scripts only', () => {
   }
 });
 
-test('parsePackageJsonScripts tolerates malformed and non-string entries', () => {
+test('parsePackageJsonScripts tolerates malformed, non-string, and empty values', () => {
   assert.equal(parsePackageJsonScripts('{ not json'), null);
   assert.equal(parsePackageJsonScripts('[]'), null);
   assert.equal(parsePackageJsonScripts('null'), null);
@@ -50,12 +52,15 @@ test('parsePackageJsonScripts tolerates malformed and non-string entries', () =>
     { test: 'node --test', ok: 'echo' }
   );
   assert.deepEqual(parsePackageJsonScripts('{"scripts":[]}'), {});
+  // Empty / whitespace-only values name no concrete runnable command.
+  assert.deepEqual(parsePackageJsonScripts('{"scripts":{"test":"","lint":"   ","build":"\\n"}}'), {});
 });
 
 test('discoverCommands builds manifest-ready commands from a supported npm test script', () => {
   const result = discoverCommands([repo('new-platform')], {
     readPackageJson: () =>
       JSON.stringify({ scripts: { test: 'node --test', build: 'tsc -p .', postinstall: 'node install.js' } }),
+    readReadme: () => null,
   });
 
   assert.deepEqual(result.missingTestRepos, []);
@@ -79,6 +84,7 @@ test('discoverCommands builds manifest-ready commands from a supported npm test 
 test('discoverCommands reports a missing-test gap and invents no wrapper', () => {
   const result = discoverCommands([repo('legacy')], {
     readPackageJson: () => JSON.stringify({ scripts: { build: 'tsc -p .' } }),
+    readReadme: () => null,
   });
 
   assert.deepEqual(result.missingTestRepos, ['legacy']);
@@ -95,7 +101,7 @@ test('discoverCommands reports a missing-test gap and invents no wrapper', () =>
 });
 
 test('discoverCommands reports a gap when package.json is absent', () => {
-  const result = discoverCommands([repo('empty')], { readPackageJson: () => null });
+  const result = discoverCommands([repo('empty')], { readPackageJson: () => null, readReadme: () => null });
   assert.deepEqual(result.missingTestRepos, ['empty']);
   assert.deepEqual(result.commands, []);
   assert.equal(result.gaps.length, 1);
@@ -103,7 +109,7 @@ test('discoverCommands reports a gap when package.json is absent', () => {
 });
 
 test('discoverCommands reports malformed package.json without throwing', () => {
-  const result = discoverCommands([repo('broken')], { readPackageJson: () => '{ not json' });
+  const result = discoverCommands([repo('broken')], { readPackageJson: () => '{ not json', readReadme: () => null });
   assert.deepEqual(result.commands, []);
   assert.ok(result.gaps.some((g) => /could not be parsed as JSON/.test(g)));
   assert.ok(result.gaps.some((g) => /No test command discovered/.test(g)));
@@ -120,12 +126,125 @@ test('discoverCommands ignores malicious script names without building wrappers'
           test: 'node --test',
         },
       }),
+    readReadme: () => null,
   });
   assert.equal(result.commands.length, 1);
   const cmd = result.commands[0]!;
   assert.equal(cmd.name, 'test-r');
   assert.ok(cmd.wrapper!.startsWith('scripts/'));
   assert.ok(!cmd.wrapper!.includes('..'));
+});
+
+test('discoverCommands ignores empty/whitespace npm test values and reports the gap', () => {
+  const result = discoverCommands([repo('hollow')], {
+    readPackageJson: () => JSON.stringify({ scripts: { test: '   ' } }),
+    readReadme: () => null,
+  });
+  assert.deepEqual(result.commands, []);
+  assert.deepEqual(result.missingTestRepos, ['hollow']);
+  assert.ok(result.gaps.some((g) => /No test command discovered/.test(g)));
+});
+
+test('extractDocumentedCommandLines reads fenced blocks and inline code only', () => {
+  const readme = [
+    '# Repo',
+    '',
+    'Prose mentioning npm run deploy should be ignored.',
+    '',
+    '```sh',
+    'npm run verify',
+    '',
+    'sh scripts/check.sh',
+    '```',
+    '',
+    'Also run `npm test` from the repository root.',
+  ].join('\n');
+  const lines = extractDocumentedCommandLines(readme);
+  assert.ok(lines.includes('npm run verify'));
+  assert.ok(lines.includes('sh scripts/check.sh'));
+  assert.ok(lines.includes('npm test'));
+  assert.ok(!lines.some((line) => line.includes('deploy')));
+});
+
+test('parseDocumentedCommand accepts only fixed concrete command forms', () => {
+  assert.deepEqual(parseDocumentedCommand('npm test'), {
+    kind: 'npm',
+    scriptName: 'test',
+    argv: ['npm', 'run', 'test'],
+    display: 'npm test',
+  });
+  assert.deepEqual(parseDocumentedCommand('npm run verify'), {
+    kind: 'npm',
+    scriptName: 'verify',
+    argv: ['npm', 'run', 'verify'],
+    display: 'npm run verify',
+  });
+  assert.deepEqual(parseDocumentedCommand('sh scripts/check.sh'), {
+    kind: 'script',
+    scriptPath: 'scripts/check.sh',
+    argv: ['sh', 'scripts/check.sh'],
+    display: 'sh scripts/check.sh',
+  });
+  assert.deepEqual(parseDocumentedCommand('bash bin/run.sh'), {
+    kind: 'script',
+    scriptPath: 'bin/run.sh',
+    argv: ['bash', 'bin/run.sh'],
+    display: 'bash bin/run.sh',
+  });
+
+  for (const line of [
+    'npm run deploy',
+    'npm run',
+    'npm run verify && rm -rf /',
+    'sh ../evil.sh',
+    'sh /tmp/evil.sh',
+    'sh scripts/check.sh; rm -rf /',
+    'node scripts/check.js',
+    'sh scripts/no-extension',
+    'sh tools/run.sh extra-arg',
+    'echo hello',
+  ]) {
+    assert.equal(parseDocumentedCommand(line), null, `${JSON.stringify(line)} must be rejected`);
+  }
+});
+
+test('discoverCommands honors a documented npm run command only when the script exists and is non-empty', () => {
+  const readme = ['## Validation', '', '```sh', 'npm run verify', '```', ''].join('\n');
+
+  const withScript = discoverCommands([repo('docs-repo')], {
+    readPackageJson: () => JSON.stringify({ scripts: {} }),
+    readReadme: () => readme,
+  });
+  assert.equal(withScript.commands.length, 0);
+
+  const withEmptyScript = discoverCommands([repo('docs-repo')], {
+    readPackageJson: () => JSON.stringify({ scripts: { verify: '  ' } }),
+    readReadme: () => readme,
+  });
+  assert.equal(withEmptyScript.commands.length, 0);
+  assert.ok(
+    withEmptyScript.gaps.some((g) => /no matching non-empty package.json script/.test(g)),
+    JSON.stringify(withEmptyScript.gaps)
+  );
+
+  const withRealScript = discoverCommands([repo('docs-repo')], {
+    readPackageJson: () => JSON.stringify({ scripts: { verify: 'node verify.js' } }),
+    readReadme: () => readme,
+  });
+  const verify = withRealScript.commands.find((c) => c.name === 'verify-docs-repo');
+  assert.ok(verify, JSON.stringify(withRealScript.commands));
+  assert.deepEqual(verify.argv, ['npm', 'run', 'verify']);
+  assert.match(verify.evidence!, /^README\.md: documented/);
+  assert.equal(verify.wrapper, 'scripts/verify-docs-repo.sh');
+});
+
+test('discoverCommands dedupes a documented npm command already found in package.json', () => {
+  const result = discoverCommands([repo('dupe-repo')], {
+    readPackageJson: () => JSON.stringify({ scripts: { test: 'node --test' } }),
+    readReadme: () =>
+      ['```', 'npm test', '```', ''].join('\n'),
+  });
+  assert.equal(result.commands.filter((c) => c.name === 'test-dupe-repo').length, 1);
 });
 
 test('allocateWrapperBasename avoids reserved/used basenames deterministically', () => {

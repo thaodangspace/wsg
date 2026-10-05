@@ -9,6 +9,7 @@ import { runMain } from './helpers/cli.ts';
 import { createTestRepo } from './helpers/git-fixture.ts';
 import { parseManifest } from '../src/manifest.ts';
 import { sha256 } from '../src/fsx.ts';
+import { readOperation } from '../src/operation.ts';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = path.join(REPO_ROOT, 'src', 'cli.ts');
@@ -184,16 +185,19 @@ test('M5: a repository without a test reports the gap and gets no invented verif
   }
 });
 
-test('M5: create, add, and refresh never execute tests, scripts, or installs', async () => {
+test('M5: create, add, and refresh never execute tests, documented scripts, or installs', async () => {
   const repoA = createTestRepo({
     prefix: 'wsg-m5-record-a-',
     files: {
       'package.json': JSON.stringify({
         name: 'a',
-        scripts: { test: 'sh evil.sh', postinstall: 'node install.js' },
+        scripts: { test: 'sh evil.sh', verify: 'sh verify-evil.sh', postinstall: 'node install.js' },
       }),
       'evil.sh': '#!/bin/sh\ntouch EXECUTED_TEST\n',
-      'install.js': "require('fs').writeFileSync('EXECUTED_INSTALL','x')\n",
+      'verify-evil.sh': '#!/bin/sh\ntouch EXECUTED_VERIFY\n',
+      'scripts/check.sh': '#!/bin/sh\ntouch EXECUTED_CHECK\n',
+      'README.md':
+        '# A\n\n## Validation\n\n```sh\nnpm run verify\nsh scripts/check.sh\n```\n',
     },
   });
   const repoB = createTestRepo({
@@ -225,9 +229,16 @@ test('M5: create, add, and refresh never execute tests, scripts, or installs', a
 
     const recorded = fs.existsSync(shimLog) ? fs.readFileSync(shimLog, 'utf8') : '';
     assert.equal(recorded, '', `no project command may run:\n${recorded}`);
+    for (const marker of ['EXECUTED_TEST', 'EXECUTED_VERIFY', 'EXECUTED_CHECK', 'EXECUTED_INSTALL']) {
+      assert.ok(!fs.existsSync(path.join(repoA.dir, marker)), `${marker} must not exist`);
+    }
 
     const manifest = readManifest(wsDir);
     assert.ok(manifest.commands.length >= 2, 'both repositories contribute commands');
+    assert.ok(
+      manifest.commands.some((c) => (c.evidence ?? '').startsWith('README.md: documented')),
+      `documented command expected, got ${JSON.stringify(manifest.commands)}`
+    );
   } finally {
     repoA.cleanup();
     repoB.cleanup();
@@ -377,6 +388,119 @@ test('M5: wrapper names avoid untracked user scripts instead of clobbering them'
   }
 });
 
+test('M5: a documented validation script gets a wrapper that runs from any cwd and propagates exit', () => {
+  const repo = createTestRepo({
+    prefix: 'wsg-m5-doc-script-',
+    files: {
+      'scripts/check.sh': '#!/bin/sh\nexit 6\n',
+      'README.md': '# Repo\n\n## Validation\n\n```sh\nsh scripts/check.sh\n```\n',
+    },
+  });
+  const root = mkTmp('wsg-m5-doc-script-root-');
+  const wsDir = path.join(root, 'doc-script');
+
+  try {
+    const created = runCli(
+      ['create', 'doc task', '--name', 'doc-script', '--root', root, '--repo', repo.dir]
+    );
+    assert.equal(created.status, 0, created.stderr);
+
+    const manifest = readManifest(wsDir);
+    const cmd = manifest.commands.find(
+      (c) => (c.evidence ?? '').startsWith('README.md: documented') && c.argv[0] === 'sh'
+    );
+    assert.ok(cmd, `documented script command expected, got ${JSON.stringify(manifest.commands)}`);
+    assert.deepEqual(cmd.argv, ['sh', 'scripts/check.sh']);
+    assert.equal(cmd.cwd, path.basename(repo.dir));
+    assert.match(cmd.wrapper!, /^scripts\/check-[^/]+\.sh$/);
+
+    const wrapperPath = path.join(wsDir, cmd.wrapper!);
+    assert.ok(fs.existsSync(wrapperPath), 'documented script wrapper must exist');
+    const ran = spawnSync('sh', [wrapperPath], { cwd: '/', env: process.env, encoding: 'utf8' });
+    assert.equal(ran.status, 6, `expected propagated exit 6: ${ran.stderr}`);
+
+    // The repository still has no test command, so the gap is reported.
+    assert.ok(manifest.discovery.gaps.some((g) => /No test command discovered/.test(g)));
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('M5: a documented validation path that does not exist reports a gap and no wrapper', () => {
+  const repo = createTestRepo({
+    prefix: 'wsg-m5-doc-missing-',
+    files: {
+      'README.md': '# Repo\n\n## Validation\n\n```sh\nsh scripts/missing.sh\n```\n',
+    },
+  });
+  const root = mkTmp('wsg-m5-doc-missing-root-');
+  const wsDir = path.join(root, 'doc-missing');
+
+  try {
+    const created = runCli(
+      ['create', 'missing task', '--name', 'doc-missing', '--root', root, '--repo', repo.dir]
+    );
+    assert.equal(created.status, 0, created.stderr);
+
+    const manifest = readManifest(wsDir);
+    assert.ok(
+      !manifest.commands.some((c) => c.argv.join(' ').includes('missing')),
+      `no wrapper for a missing documented path: ${JSON.stringify(manifest.commands)}`
+    );
+    assert.ok(
+      manifest.discovery.gaps.some((g) => /does not exist at the recorded commit/.test(g)),
+      `missing documented path gap expected, got ${JSON.stringify(manifest.discovery.gaps)}`
+    );
+    const scriptsDir = path.join(wsDir, 'scripts');
+    const wrappers = fs.existsSync(scriptsDir) ? fs.readdirSync(scriptsDir) : [];
+    assert.ok(!wrappers.some((name) => name.includes('missing')), wrappers.join(', '));
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('M5: an empty npm test value reports the gap and gets no wrapper', () => {
+  const repo = createTestRepo({
+    prefix: 'wsg-m5-empty-test-',
+    files: {
+      'package.json': JSON.stringify({
+        name: 'empty-test',
+        scripts: { test: '   ', build: 'node -e "process.exit(0)"' },
+      }),
+    },
+  });
+  const root = mkTmp('wsg-m5-empty-test-root-');
+  const wsDir = path.join(root, 'empty-test');
+
+  try {
+    const created = runCli(
+      ['create', 'empty task', '--name', 'empty-test', '--root', root, '--repo', repo.dir]
+    );
+    assert.equal(created.status, 0, created.stderr);
+
+    const manifest = readManifest(wsDir);
+    assert.ok(
+      !manifest.commands.some((c) => c.argv.join(' ') === 'npm run test'),
+      `no test wrapper for an empty script: ${JSON.stringify(manifest.commands)}`
+    );
+    assert.ok(
+      manifest.discovery.gaps.some((g) => /No test command discovered/.test(g)),
+      `missing-test gap expected, got ${JSON.stringify(manifest.discovery.gaps)}`
+    );
+    const scriptsDir = path.join(wsDir, 'scripts');
+    const wrappers = fs.existsSync(scriptsDir) ? fs.readdirSync(scriptsDir) : [];
+    assert.ok(
+      !wrappers.some((name) => /^test[-.]/.test(name)),
+      `no test wrapper expected, got ${wrappers.join(', ')}`
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('M5: resume preserves a user-edited wrapper and writes a .wsg-new proposal', () => {
   const repo = createTestRepo({
     prefix: 'wsg-m5-resume-',
@@ -389,6 +513,11 @@ test('M5: resume preserves a user-edited wrapper and writes a .wsg-new proposal'
   try {
     const crashed = runCli(args, { env: { WSG_FAULT: 'after-generate:1' } });
     assert.equal(crashed.status, 70, `expected fault exit 70: ${crashed.stderr}`);
+
+    const crashedJournal = readOperation(wsDir);
+    const recordedCommands = ((crashedJournal?.operation?.plan as Record<string, unknown> | undefined)
+      ?.commands as unknown[]) ?? [];
+    assert.ok(recordedCommands.length > 0, 'commands must be recorded in the plan');
 
     const scriptsDir = path.join(wsDir, 'scripts');
     const wrapperName = fs.readdirSync(scriptsDir).find((name) => name.endsWith('.sh'));
@@ -407,6 +536,19 @@ test('M5: resume preserves a user-edited wrapper and writes a .wsg-new proposal'
     assert.ok(fs.existsSync(proposalPath), 'a .wsg-new proposal must be written');
     assert.match(fs.readFileSync(proposalPath, 'utf8'), /Generated by WSG/);
     assert.ok(fs.existsSync(path.join(wsDir, 'workspace.yaml')), 'manifest must be published last');
+
+    // The resumed manifest replays the exact recorded command set (deterministic).
+    const manifest = readManifest(wsDir);
+    assert.deepEqual(
+      manifest.commands.map((c) => ({
+        name: c.name,
+        cwd: c.cwd,
+        argv: c.argv,
+        evidence: c.evidence,
+        wrapper: c.wrapper,
+      })),
+      recordedCommands
+    );
   } finally {
     repo.cleanup();
     fs.rmSync(root, { recursive: true, force: true });

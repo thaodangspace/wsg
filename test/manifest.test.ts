@@ -322,6 +322,95 @@ test('commands[0].cwd: nope rejected', () => {
   );
 });
 
+test('command wrapper must be a scripts/*.sh file and must not collide with other outputs', () => {
+  const base = parseManifest(readFixture('spec-section-5.yaml'));
+  const clone = () => JSON.parse(JSON.stringify(base)) as Manifest;
+
+  // Root / generated / control outputs outside scripts/ are rejected.
+  for (const wrapper of ['docs/context.md', 'evil.sh', 'README.md', 'workspace.yaml', 'scripts']) {
+    const manifest = clone();
+    manifest.commands[0].wrapper = wrapper;
+    assert.throws(
+      () => validateManifest(manifest),
+      (err: unknown) => {
+        assert(err instanceof UsageError, `expected UsageError for ${wrapper}`);
+        assert.match(err.message, /must be a file under 'scripts\/'/);
+        return true;
+      },
+      `wrapper ${wrapper} must be rejected`
+    );
+  }
+
+  // A non-.sh wrapper (which chmod/ownership would not treat as a wrapper).
+  const noExtension = clone();
+  noExtension.commands[0].wrapper = 'scripts/check';
+  assert.throws(
+    () => validateManifest(noExtension),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /must end with '\.sh'/);
+      return true;
+    }
+  );
+
+  // Collision with an attached script, including a case-insensitive alias.
+  const scriptCollision = clone();
+  scriptCollision.scripts = [
+    {
+      source: '/home/user/code/new-platform/scripts/check.sh',
+      path: 'scripts/check.sh',
+      sha256: 'a'.repeat(64),
+      added_by: 'user',
+    },
+  ];
+  scriptCollision.commands[0].wrapper = 'Scripts/Check.SH';
+  assert.throws(
+    () => validateManifest(scriptCollision),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /collides with the attached script/);
+      return true;
+    }
+  );
+
+  // Collision with a document snapshot path.
+  const docCollision = clone();
+  docCollision.docs = [
+    {
+      source: '/home/user/docs/verify.sh',
+      path: 'scripts/verify.sh',
+      mode: 'snapshot',
+      added_by: 'user',
+      sha256: 'b'.repeat(64),
+      fetched_at: '2026-10-05T12:00:00.000Z',
+    },
+  ];
+  docCollision.commands[0].wrapper = 'scripts/verify.sh';
+  assert.throws(
+    () => validateManifest(docCollision),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /collides with a document snapshot/);
+      return true;
+    }
+  );
+
+  // Duplicate wrappers that are case-insensitive normalized aliases.
+  const duplicate = clone();
+  duplicate.commands = [
+    { name: 'a', cwd: 'new-platform', argv: ['npm', 'run', 'test'], wrapper: 'scripts/a.sh' },
+    { name: 'b', cwd: 'new-platform', argv: ['npm', 'run', 'test'], wrapper: 'Scripts/A.SH' },
+  ];
+  assert.throws(
+    () => validateManifest(duplicate),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /duplicate command wrapper/);
+      return true;
+    }
+  );
+});
+
 test('reference doc with path rejected', () => {
   assert.throws(
     () => parseManifest(readFixture('invalid-reference-doc.yaml')),

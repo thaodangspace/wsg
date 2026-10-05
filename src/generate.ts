@@ -1,5 +1,6 @@
 import type { Manifest, ManifestAdapter } from './manifest.ts';
 import { renderWrapper } from './commands.ts';
+import { UsageError } from './errors.ts';
 
 export interface RenderContextOptions {
   unreadDocs?: Set<string> | readonly string[];
@@ -263,26 +264,42 @@ export function renderAll(
   options: RenderContextOptions = {}
 ): Map<string, string> {
   const result = new Map<string, string>();
+  const emitted = new Map<string, string>();
+
+  // Defense in depth: the manifest validator already rejects wrapper paths
+  // that overlap generated/control outputs, but the renderer must never let one
+  // output silently overwrite another (e.g. a wrapper named docs/context.md).
+  const put = (relPath: string, content: string): void => {
+    const key = relPath.toLowerCase();
+    const existing = emitted.get(key);
+    if (existing !== undefined) {
+      throw new UsageError(
+        `Duplicate generated output '${relPath}' would overwrite '${existing}'`
+      );
+    }
+    emitted.set(key, relPath);
+    result.set(relPath, content);
+  };
 
   // Canonical context
-  result.set('docs/context.md', renderContext(manifest, options));
+  put('docs/context.md', renderContext(manifest, options));
 
   // Workspace README
-  result.set('README.md', renderReadme(manifest));
+  put('README.md', renderReadme(manifest));
 
   // Adapters
   const planned = plannedGeneratedFiles(manifest);
   if (planned.includes('AGENTS.md')) {
-    result.set('AGENTS.md', renderAdapter('agents', manifest));
+    put('AGENTS.md', renderAdapter('agents', manifest));
   }
   if (planned.includes('CLAUDE.md')) {
-    result.set('CLAUDE.md', renderAdapter('claude', manifest));
+    put('CLAUDE.md', renderAdapter('claude', manifest));
   }
 
   // Discovered-command wrappers (fixed argv; never executed during assembly)
   for (const cmd of manifest.commands ?? []) {
     if (cmd.wrapper) {
-      result.set(cmd.wrapper, renderWrapper(cmd));
+      put(cmd.wrapper, renderWrapper(cmd));
     }
   }
 

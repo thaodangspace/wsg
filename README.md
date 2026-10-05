@@ -168,18 +168,22 @@ closed with exit 2.
 ## Validation Commands and Wrappers (Milestone 5)
 
 WSG discovers concrete validation commands from each repository's `package.json`
-at the **recorded base commit** (the assembled worktree revision), never from the
-dirty source checkout. It records the command name, working directory, argument
-vector, and evidence (`package.json scripts.<name>`) in `workspace.yaml` and, for
-each supported script, generates a thin wrapper under `scripts/`:
+and directly documented README validation instructions at the **recorded base
+commit** (the assembled worktree revision), never from the dirty source checkout.
+It records the command name, working directory, argument vector, and evidence in
+`workspace.yaml` and, for each supported command, generates a thin wrapper under
+`scripts/`:
 
 ```bash
 sh scripts/test-new-platform.sh   # works from any directory; propagates exit status
 ```
 
-- **Supported sources:** npm manifests are the supported command source in this
-  release; additional command sources are added only with fixtures. A missing
-  `test` script is reported as a gap and **no verification wrapper is invented**.
+- **Supported sources:** npm `package.json` scripts and directly documented
+  README validation commands (a documented `npm run <name>` must resolve to a
+  non-empty package script; a documented `sh <path>`/`bash <path>` must exist at
+  the recorded commit). Other command sources are added only with fixtures. A
+  missing `test` script — or a documented command with no matching script — is
+  reported as a gap and **no verification wrapper is invented**.
 - **Never executed:** `create`, `add`, `refresh`, and `--resume` never run tests,
   copied scripts, installs, or project bootstrap. Commands are labelled
   "discovered, not verified".

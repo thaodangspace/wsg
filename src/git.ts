@@ -277,6 +277,34 @@ export function showFileAtCommit(
 }
 
 /**
+ * Reports whether a repository-relative path exists at `commit` as a blob
+ * (file) or tree (directory), or null when absent. Used to prove a documented
+ * validation script actually exists at the recorded revision before WSG builds
+ * a wrapper for it. Never throws for a missing path.
+ */
+export function commitPathType(
+  repoPath: string,
+  commit: string,
+  relPath: string,
+  options: RunGitOptions = {}
+): 'blob' | 'tree' | null {
+  assertSafeArg(repoPath, 'Repository path');
+  assertSafeArg(commit, 'Commit');
+  assertSafeArg(relPath, 'Path');
+  if (!/^[0-9a-fA-F]{40}$/.test(commit)) {
+    return null;
+  }
+  const canonical = canonicalize(repoPath);
+  try {
+    const out = runGit(['-C', canonical, 'cat-file', '-t', `${commit}:${relPath}`], options).trim();
+    if (out === 'blob' || out === 'tree') return out;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Checks whether a branch exists in the given repository.
  */
 export function branchExists(repoPath: string, branchName: string, options: RunGitOptions = {}): boolean {

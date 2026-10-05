@@ -1,18 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { suffixForSource } from './slug.ts';
-import { showFileAtCommit } from './git.ts';
-import { resolveInside } from './paths.ts';
+import { showFileAtCommit, commitPathType } from './git.ts';
+import { resolveInside, assertConfinedRelative } from './paths.ts';
 import { sha256 } from './fsx.ts';
 import type { CommandEntry } from './manifest.ts';
 import type { OwnedFileEntry } from './operation.ts';
 
 /**
  * Npm scripts WSG treats as concrete, supported validation commands. The
- * milestone decision is deliberately narrow: start with npm manifests and only
- * add other command sources alongside fixtures. We never synthesize a command
- * from the feature name (e.g. no invented migration test) and we never execute
- * a discovered command during create/add/refresh.
+ * milestone decision is deliberately narrow: start with npm manifests and
+ * directly documented repository scripts, and only add other command sources
+ * alongside fixtures. We never synthesize a command from the feature name
+ * (e.g. no invented migration test) and we never execute a discovered command
+ * during create/add/refresh.
  */
 export const SUPPORTED_NPM_SCRIPT_NAMES: readonly string[] = [
   'test',
@@ -21,6 +22,24 @@ export const SUPPORTED_NPM_SCRIPT_NAMES: readonly string[] = [
   'build',
   'check',
 ];
+
+/**
+ * A documented `npm run <name>` is only recognized when `<name>` is a
+ * validation-shaped script name and the package.json script exists with a
+ * non-empty value. This keeps README prose from turning arbitrary scripts
+ * (deploy, release, ...) into validation wrappers.
+ */
+const DOCUMENTED_NPM_NAME_RE = /^(test|lint|check|typecheck|build|verify|validate|ci)([-:_][A-Za-z0-9_-]+)?$/i;
+
+/** Directories a documented repository validation script may live under. */
+const DOCUMENTED_SCRIPT_ROOTS: readonly string[] = ['scripts/', 'bin/', 'tools/'];
+
+/** Largest README prefix considered for documented-command extraction. */
+export const MAX_README_BYTES = 64 * 1024;
+
+const DOCUMENTED_NPM_TEST_RE = /^npm\s+test$/;
+const DOCUMENTED_NPM_RUN_RE = /^npm\s+(?:run|run-script)\s+([A-Za-z0-9:_-]+)$/;
+const DOCUMENTED_SHELL_RE = /^(sh|bash)\s+((?:\.\/)?[A-Za-z0-9][A-Za-z0-9._/-]*\.(?:sh|bash))$/;
 
 /**
  * A conservative predicate over a package.json script name. Names containing
@@ -36,10 +55,15 @@ export function isSupportedNpmScript(name: string): boolean {
   return name.startsWith('test:') || name.startsWith('test-');
 }
 
+function isTestScriptName(name: string): boolean {
+  return name === 'test' || name.startsWith('test:') || name.startsWith('test-');
+}
+
 /**
  * Parses the `scripts` object from a package.json string. Returns null when the
  * JSON is malformed or not an object; returns an empty object when there are no
- * usable scripts. Non-string script values are ignored rather than coerced.
+ * usable scripts. Non-string and empty/whitespace-only values are ignored, since
+ * they name no concrete runnable command.
  */
 export function parsePackageJsonScripts(text: string): Record<string, string> | null {
   let parsed: unknown;
@@ -56,7 +80,9 @@ export function parsePackageJsonScripts(text: string): Record<string, string> | 
   if (typeof scripts !== 'object' || Array.isArray(scripts)) return {};
   const result: Record<string, string> = {};
   for (const [name, value] of Object.entries(scripts as Record<string, unknown>)) {
-    if (typeof value === 'string') result[name] = value;
+    if (typeof value === 'string' && value.trim().length > 0) {
+      result[name] = value;
+    }
   }
   return result;
 }
@@ -81,6 +107,8 @@ export interface DiscoverCommandsOptions {
   reservedBasenames?: Iterable<string>;
   /** Test seam: overrides how package.json is read for a repository. */
   readPackageJson?: (repo: CommandRepoInput) => string | null;
+  /** Test seam: overrides how README.md is read for a repository. */
+  readReadme?: (repo: CommandRepoInput) => string | null;
 }
 
 export interface CommandsDiscoveryResult {
@@ -106,27 +134,146 @@ function noTestGap(repo: CommandRepoInput): string {
   );
 }
 
+function readWorktreeFile(repo: CommandRepoInput, relPath: string): string | null {
+  if (!repo.dest) return null;
+  const candidate = path.join(repo.dest, relPath);
+  try {
+    if (fs.existsSync(candidate)) {
+      return fs.readFileSync(candidate, 'utf8');
+    }
+  } catch {
+    // fall through to the recorded commit
+  }
+  return null;
+}
+
 /**
- * Reads `package.json` for a repository from the *assembled worktree* when it
+ * Reads a repository-relative file from the *assembled worktree* when it
  * exists, and otherwise from the recorded base commit via `git show`. Either
  * path reflects the recorded revision; the dirty source checkout is never used.
  */
+export function readRepoFile(
+  repo: CommandRepoInput,
+  relPath: string,
+  override?: (repo: CommandRepoInput) => string | null
+): string | null {
+  if (override) return override(repo);
+  return readWorktreeFile(repo, relPath) ?? showFileAtCommit(repo.source, repo.base_commit, relPath);
+}
+
+/** Reads `package.json` for a repository (worktree first, then recorded commit). */
 export function readRepoPackageJson(
   repo: CommandRepoInput,
   override?: (repo: CommandRepoInput) => string | null
 ): string | null {
-  if (override) return override(repo);
-  if (repo.dest) {
-    const worktreeManifest = path.join(repo.dest, 'package.json');
-    try {
-      if (fs.existsSync(worktreeManifest)) {
-        return fs.readFileSync(worktreeManifest, 'utf8');
+  return readRepoFile(repo, 'package.json', override);
+}
+
+/** Reads `README.md` for a repository (worktree first, then recorded commit). */
+export function readRepoReadme(
+  repo: CommandRepoInput,
+  override?: (repo: CommandRepoInput) => string | null
+): string | null {
+  return readRepoFile(repo, 'README.md', override);
+}
+
+export interface DocumentedCommandCandidate {
+  kind: 'npm' | 'script';
+  scriptName?: string;
+  scriptPath?: string;
+  argv: string[];
+  display: string;
+}
+
+/**
+ * Extracts candidate documented command lines from fenced code blocks and
+ * inline code spans only. Prose is never scanned, so an incidental mention
+ * cannot become a wrapper.
+ */
+export function extractDocumentedCommandLines(readme: string): string[] {
+  const lines: string[] = [];
+  let inFence = false;
+  let fenceMarker = '';
+
+  for (const raw of readme.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    const leading = line.trimStart();
+    const fenceMatch = leading.match(/^(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0];
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = marker;
+      } else if (marker === fenceMarker) {
+        inFence = false;
+        fenceMarker = '';
       }
-    } catch {
-      // fall through to the recorded commit
+      continue;
+    }
+
+    if (inFence) {
+      const trimmed = line.trim();
+      if (trimmed) lines.push(trimmed);
+      continue;
+    }
+
+    const inline = /`([^`]+)`/g;
+    let match: RegExpExecArray | null;
+    while ((match = inline.exec(line)) !== null) {
+      const span = match[1].trim();
+      if (span) lines.push(span);
     }
   }
-  return showFileAtCommit(repo.source, repo.base_commit, 'package.json');
+
+  return lines;
+}
+
+function isSafeDocumentedScriptPath(scriptPath: string): boolean {
+  if (!scriptPath || scriptPath.startsWith('/') || scriptPath.includes('\\')) return false;
+  try {
+    assertConfinedRelative(scriptPath, 'documented script');
+  } catch {
+    return false;
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*\.(?:sh|bash)$/.test(scriptPath)) return false;
+  return DOCUMENTED_SCRIPT_ROOTS.some((root) => scriptPath.startsWith(root));
+}
+
+/**
+ * Parses one candidate line into a concrete documented command. Only a single
+ * fixed command form is accepted (`npm test`, `npm run <name>`, `sh <path>`,
+ * `bash <path>`); arbitrary shell strings, pipes, redirects, substitutions, and
+ * multiple commands are rejected rather than interpolated.
+ */
+export function parseDocumentedCommand(rawLine: string): DocumentedCommandCandidate | null {
+  const line = rawLine.trim().replace(/\s+/g, ' ');
+  if (!line) return null;
+
+  if (DOCUMENTED_NPM_TEST_RE.test(line)) {
+    return { kind: 'npm', scriptName: 'test', argv: ['npm', 'run', 'test'], display: 'npm test' };
+  }
+
+  const npmRun = line.match(DOCUMENTED_NPM_RUN_RE);
+  if (npmRun) {
+    const name = npmRun[1];
+    if (!DOCUMENTED_NPM_NAME_RE.test(name)) return null;
+    return { kind: 'npm', scriptName: name, argv: ['npm', 'run', name], display: `npm run ${name}` };
+  }
+
+  const shell = line.match(DOCUMENTED_SHELL_RE);
+  if (shell) {
+    const interpreter = shell[1];
+    const scriptPath = shell[2].replace(/^\.\//, '');
+    if (!isSafeDocumentedScriptPath(scriptPath)) return null;
+    return {
+      kind: 'script',
+      scriptPath,
+      argv: [interpreter, scriptPath],
+      display: `${interpreter} ${scriptPath}`,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -192,9 +339,11 @@ export function renderWrapper(command: CommandEntry): string {
 
 /**
  * Discovers concrete, supported commands for the supplied repositories from
- * their package.json manifests. Produces manifest-ready CommandEntry values,
- * reports a missing-test gap for each repository without a test command, and
- * never executes anything.
+ * their package.json manifests and directly documented README validation
+ * instructions. Produces manifest-ready CommandEntry values, reports a
+ * missing-test gap for each repository without a test command, and never
+ * executes anything. Discovery is a pure function of the recorded revision, so
+ * a resumed operation replays the same commands from the recorded plan.
  */
 export function discoverCommands(
   repos: readonly CommandRepoInput[],
@@ -210,43 +359,89 @@ export function discoverCommands(
   const missingTestRepos: string[] = [];
 
   for (const repo of repos) {
-    const text = readRepoPackageJson(repo, options.readPackageJson);
-    if (text === null) {
-      missingTestRepos.push(repo.name);
-      gaps.push(noTestGap(repo));
-      continue;
-    }
-
-    const scripts = parsePackageJsonScripts(text);
-    if (scripts === null) {
-      gaps.push(
-        `package.json for repository '${repo.name}' could not be parsed as JSON; no commands discovered.`
-      );
-      missingTestRepos.push(repo.name);
-      gaps.push(noTestGap(repo));
-      continue;
+    // --- package.json manifest scripts -------------------------------------
+    let scripts: Record<string, string> = {};
+    const packageText = readRepoPackageJson(repo, options.readPackageJson);
+    if (packageText !== null) {
+      const parsed = parsePackageJsonScripts(packageText);
+      if (parsed === null) {
+        gaps.push(
+          `package.json for repository '${repo.name}' could not be parsed as JSON; no manifest commands discovered.`
+        );
+      } else {
+        scripts = parsed;
+      }
     }
 
     const supported = Object.keys(scripts).filter(isSupportedNpmScript).sort();
-    const hasTest = supported.some(
-      (name) => name === 'test' || name.startsWith('test:') || name.startsWith('test-')
-    );
+    const commandScriptNames = new Set<string>(supported);
+    const hasTest = supported.some(isTestScriptName);
     if (!hasTest) {
       missingTestRepos.push(repo.name);
       gaps.push(noTestGap(repo));
     }
 
     for (const scriptName of supported) {
-      const wrapperBasename = allocateWrapperBasename(
-        scriptName,
-        repo,
-        usedWrapperBasenames
-      );
+      const wrapperBasename = allocateWrapperBasename(scriptName, repo, usedWrapperBasenames);
       commands.push({
         name: wrapperBasename.replace(/\.sh$/, ''),
         cwd: repo.name,
         argv: ['npm', 'run', scriptName],
         evidence: `package.json scripts.${scriptName}`,
+        wrapper: `scripts/${wrapperBasename}`,
+      });
+    }
+
+    // --- documented README validation commands ------------------------------
+    const readmeText = readRepoReadme(repo, options.readReadme);
+    if (readmeText === null) continue;
+
+    const documentedLines = extractDocumentedCommandLines(readmeText.slice(0, MAX_README_BYTES));
+    const seenCandidates = new Set<string>();
+    for (const line of documentedLines) {
+      const candidate = parseDocumentedCommand(line);
+      if (!candidate) continue;
+      const key =
+        candidate.kind === 'npm' ? `npm:${candidate.scriptName}` : `script:${candidate.scriptPath}`;
+      if (seenCandidates.has(key)) continue;
+      seenCandidates.add(key);
+
+      if (candidate.kind === 'npm') {
+        const scriptName = candidate.scriptName as string;
+        const value = scripts[scriptName];
+        if (value === undefined || value.trim().length === 0) {
+          gaps.push(
+            `Documented command '${candidate.display}' for repository '${repo.name}' has no matching non-empty package.json script; no wrapper generated.`
+          );
+          continue;
+        }
+        if (commandScriptNames.has(scriptName)) continue;
+        commandScriptNames.add(scriptName);
+        const wrapperBasename = allocateWrapperBasename(scriptName, repo, usedWrapperBasenames);
+        commands.push({
+          name: wrapperBasename.replace(/\.sh$/, ''),
+          cwd: repo.name,
+          argv: ['npm', 'run', scriptName],
+          evidence: `README.md: documented \`${candidate.display}\``,
+          wrapper: `scripts/${wrapperBasename}`,
+        });
+        continue;
+      }
+
+      const scriptPath = candidate.scriptPath as string;
+      if (commitPathType(repo.source, repo.base_commit, scriptPath) !== 'blob') {
+        gaps.push(
+          `Documented validation script '${scriptPath}' for repository '${repo.name}' does not exist at the recorded commit; no wrapper generated.`
+        );
+        continue;
+      }
+      const baseRaw = path.basename(scriptPath).replace(/\.(?:sh|bash)$/i, '');
+      const wrapperBasename = allocateWrapperBasename(baseRaw, repo, usedWrapperBasenames);
+      commands.push({
+        name: wrapperBasename.replace(/\.sh$/, ''),
+        cwd: repo.name,
+        argv: [...candidate.argv],
+        evidence: `README.md: documented \`${candidate.display}\``,
         wrapper: `scripts/${wrapperBasename}`,
       });
     }
