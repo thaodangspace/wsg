@@ -84,7 +84,8 @@ wsg create "port EMR mono to modular" --name port-emr --repo ~/code/a --repo ~/c
 
 - Requires an existing workspace directory for the same `--name` with an incomplete `create` operation and no `workspace.yaml`. An absent directory exits 1; a completed workspace exits 2 and is never overwritten.
 - Compares the supplied `--name`, request, `--repo` set, `--doc` set, `--context`, and `--for` against the recorded plan. Any mismatch exits 2 with a diff (added/missing repositories or documents).
-- Uses the recorded base commits, document hashes, unread metadata, and context, so it never rebuilds the plan from source state that changed after the crash. A snapshot whose source changed is reported as a conflict rather than silently rebuilt.
+- Uses the recorded base commits, document hashes, unread metadata, and context, so it never rebuilds the plan from source state that changed after the crash. A missing snapshot is restored only from its recorded hash; if the source changed it is reported as a conflict rather than silently rebuilt.
+- Never overwrites a user-edited snapshot: the edit is left intact, the recorded bytes are written to a nonclobbering `<path>.wsg-new` proposal (a preexisting proposal is preserved and a numbered sibling is used), and the run exits 3. If the snapshot was edited *and* its source changed, the recorded bytes cannot be reproduced and the resume fails closed with exit 2 before further mutation.
 - Recovers each worktree with a fixed matrix and **no destructive Git** (no `reset`, `stash`, `fetch`, `pull`, `prune`, `remove`, `force`, or branch deletion):
   - branch and destination absent → create the worktree and branch;
   - registered at the recorded destination with matching branch and base commit → adopt it;

@@ -24,7 +24,7 @@ import {
   type InspectedDoc,
 } from './documents.ts';
 import { canonicalize, expandHome, resolveInside } from './paths.ts';
-import { assertValidSlug, deriveSlug, assignEntryNames } from './slug.ts';
+import { assertValidSlug, validateSlug, deriveSlug, assignEntryNames } from './slug.ts';
 import { loadConfig } from './config.ts';
 import {
   validateManifest,
@@ -321,6 +321,151 @@ function normalizeSource(source: string): string {
   return canonicalize(source);
 }
 
+const OPERATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Validates the operation id before it is used as a path segment in
+ * `.wsg/tmp/<id>`. The id comes from the journal and is otherwise an arbitrary
+ * string, so traversal or separators must be rejected before any file write.
+ */
+export function assertSafeOperationId(id: unknown): string {
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new ConflictError('Operation journal is missing a valid id; refusing to resume.');
+  }
+  if (
+    id === '.' ||
+    id === '..' ||
+    id.includes('/') ||
+    id.includes('\\') ||
+    id.includes('\0') ||
+    !OPERATION_ID_RE.test(id)
+  ) {
+    throw new ConflictError(
+      `Operation journal id '${id}' is not a safe path segment; refusing to resume.`,
+      [
+        `Observed: ${JSON.stringify(id)}`,
+        `Expected: a single path segment without separators or traversal`,
+      ]
+    );
+  }
+  return id;
+}
+
+/**
+ * Verifies that a recorded worktree destination is exactly the confined
+ * destination derived from the workspace root and the repository entry name.
+ * Rejects traversal, outside paths, and symlink aliases before any Git or
+ * journal mutation.
+ */
+export function assertConfinedRecordedDest(
+  wsDir: string,
+  repo: { name: string; dest: string }
+): string {
+  if (!validateSlug(repo.name)) {
+    throw new ConflictError(
+      `Recorded repository name '${repo.name}' is not a valid workspace entry name.`
+    );
+  }
+
+  const expected = path.join(wsDir, repo.name);
+
+  if (typeof repo.dest !== 'string' || repo.dest.length === 0) {
+    throw new ConflictError(
+      `Recorded worktree destination for repository '${repo.name}' is missing.`
+    );
+  }
+
+  const resolvedDest = path.resolve(repo.dest);
+  if (resolvedDest !== expected) {
+    throw new ConflictError(
+      `Recorded worktree destination '${repo.dest}' for repository '${repo.name}' is not the expected workspace path '${expected}'.`,
+      [
+        `Observed: ${resolvedDest}`,
+        `Expected: ${expected}`,
+        `Refusing to run Git outside the workspace.`,
+      ]
+    );
+  }
+
+  // Reject symlink aliases at the recorded destination itself.
+  try {
+    const st = fs.lstatSync(expected);
+    if (st.isSymbolicLink()) {
+      throw new ConflictError(
+        `Recorded worktree destination '${expected}' is a symbolic link; refusing to operate through it.`
+      );
+    }
+  } catch (err: unknown) {
+    if (err instanceof ConflictError) throw err;
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  // Confinement check (rejects symlinked parents/components escaping the
+  // workspace). The destination may not exist yet, so compare the resolution
+  // of the canonical expected path instead of canonicalizing the raw dest.
+  let confined: string;
+  try {
+    confined = resolveInside(wsDir, repo.name);
+  } catch (err: unknown) {
+    throw new ConflictError(
+      `Recorded worktree destination '${repo.dest}' is not confined to the workspace: ${(err as Error).message}`
+    );
+  }
+  const canonicalExpected = path.join(canonicalize(wsDir), repo.name);
+  if (canonicalExpected !== confined) {
+    throw new ConflictError(
+      `Recorded worktree destination '${repo.dest}' resolves outside the expected workspace path.`,
+      [`Observed: ${confined}`, `Expected: ${canonicalExpected}`]
+    );
+  }
+
+  return expected;
+}
+
+/**
+ * Validates all recorded worktree destinations and rejects duplicates before
+ * any mutation.
+ */
+export function validateRecordedDestinations(wsDir: string, plan: RecordedPlan): void {
+  const seen = new Set<string>();
+  for (const r of plan.repos) {
+    const expected = assertConfinedRecordedDest(wsDir, r);
+    const key = canonicalize(expected).toLowerCase();
+    if (seen.has(key)) {
+      throw new ConflictError(
+        `Duplicate recorded worktree destination for repository '${r.name}'.`
+      );
+    }
+    seen.add(key);
+  }
+}
+
+/**
+ * Writes a nonclobbering `.wsg-new` proposal for a snapshot. A preexisting
+ * proposal is preserved; if it already holds the proposed bytes it is reused,
+ * otherwise a numbered sibling is written.
+ */
+function writeSnapshotProposal(wsDir: string, relPath: string, content: Buffer): string {
+  const baseRel = `${relPath}.wsg-new`;
+  let chosenRel = baseRel;
+  let chosenFull = resolveInside(wsDir, chosenRel);
+  let counter = 1;
+
+  while (fs.existsSync(chosenFull)) {
+    if (fs.readFileSync(chosenFull).equals(content)) {
+      return chosenRel;
+    }
+    chosenRel = `${baseRel}-${counter}`;
+    chosenFull = resolveInside(wsDir, chosenRel);
+    counter++;
+  }
+
+  writeFileAtomic(chosenFull, content);
+  return chosenRel;
+}
+
 /**
  * Reconstructs the full deterministic plan from the operation journal.
  *
@@ -559,6 +704,13 @@ async function executeResume(
 
   const plan = extractRecordedPlan(op, wsName);
 
+  // The journal is trusted only after its path-bearing fields are validated:
+  // the operation id is used as a tmp directory segment and each recorded
+  // destination must be the confined workspace/<entry> path. This runs before
+  // the lock, journal rewrites, or any Git command.
+  assertSafeOperationId(op.id);
+  validateRecordedDestinations(wsDir, plan);
+
   if (options.name !== undefined && options.name !== plan.name) {
     throw new ConflictError(
       `Workspace name '${options.name}' does not match recorded operation name '${plan.name}'.`
@@ -725,27 +877,40 @@ async function executeResume(
       worktreeDecisions.push(decision);
     }
 
-    // Snapshot reproducibility preflight. The recorded sha is authoritative:
-    // an intact target needs nothing, otherwise the source must still hash to
-    // the recorded value. Never rebuild a snapshot from changed source state.
+    // Snapshot recovery preflight. The recorded sha is authoritative:
+    // - target intact (sha matches) -> nothing to do;
+    // - target missing -> restore only if the source still hashes to the
+    //   recorded sha;
+    // - target edited (sha differs) -> never overwrite; propose <path>.wsg-new
+    //   with the recorded bytes and report a partial result. If the source has
+    //   also changed the recorded bytes cannot be reproduced -> fail closed.
     const tmpDir = path.join(wsDir, '.wsg', 'tmp', op.id);
-    const snapshotRepair: Array<{ doc: RecordedPlanDoc; finalPath: string; content: Buffer }> = [];
-    const intactSnapshots: string[] = [];
+    type SnapshotRecovery =
+      | { kind: 'intact'; doc: RecordedPlanDoc; finalPath: string }
+      | { kind: 'restore'; doc: RecordedPlanDoc; finalPath: string; content: Buffer }
+      | { kind: 'proposal'; doc: RecordedPlanDoc; finalPath: string; content: Buffer };
+    const snapshotRecoveries: SnapshotRecovery[] = [];
+    let snapshotPartial = false;
+
     for (const d of plan.docs) {
       if (d.mode !== 'snapshot' || !d.path) continue;
       const finalPath = resolveInside(wsDir, d.path);
-      if (d.sha256 && fs.existsSync(finalPath)) {
+      const targetExists = fs.existsSync(finalPath);
+
+      if (targetExists && d.sha256) {
         const currentSha = sha256(fs.readFileSync(finalPath));
         if (currentSha === d.sha256) {
-          intactSnapshots.push(d.path);
+          snapshotRecoveries.push({ kind: 'intact', doc: d, finalPath });
           continue;
         }
       }
+
       if (!d.sha256) {
         throw new ConflictError(
           `Recorded snapshot '${d.path}' is missing its sha256; cannot verify recovery.`
         );
       }
+
       let sourceContent: Buffer;
       try {
         sourceContent = fs.readFileSync(d.source);
@@ -760,6 +925,16 @@ async function executeResume(
       }
       const sourceSha = sha256(sourceContent);
       if (sourceSha !== d.sha256) {
+        if (targetExists) {
+          throw new ConflictError(
+            `Snapshot '${d.path}' was edited and its source '${d.source}' also changed; cannot reproduce the recorded snapshot.`,
+            [
+              `Observed: edited target and source sha256 ${sourceSha}`,
+              `Recorded: source sha256 ${d.sha256}`,
+              `Restore the recorded source or start a new workspace.`,
+            ]
+          );
+        }
         throw new ConflictError(
           `Snapshot source '${d.source}' changed since the interrupted operation; refusing to rebuild '${d.path}' from changed source state.`,
           [
@@ -769,7 +944,14 @@ async function executeResume(
           ]
         );
       }
-      snapshotRepair.push({ doc: d, finalPath, content: sourceContent });
+
+      if (targetExists) {
+        // User-edited snapshot: preserve it and propose the recorded bytes.
+        snapshotRecoveries.push({ kind: 'proposal', doc: d, finalPath, content: sourceContent });
+        snapshotPartial = true;
+      } else {
+        snapshotRecoveries.push({ kind: 'restore', doc: d, finalPath, content: sourceContent });
+      }
     }
 
     if (options.dryRun) {
@@ -858,26 +1040,24 @@ async function executeResume(
 
     // Snapshot steps
     ensureDir(tmpDir);
-    for (const d of plan.docs) {
-      if (d.mode === 'snapshot' && d.path && intactSnapshots.includes(d.path)) {
-        markStep(wsDir, `snapshot:${d.path}`, 'done', {
-          detail: { recovered: 'intact' },
-        });
-      }
-    }
-    for (const entry of snapshotRepair) {
-      const d = entry.doc;
-      const relPath = d.path as string;
+    for (const rec of snapshotRecoveries) {
+      const relPath = rec.doc.path as string;
       const stepId = `snapshot:${relPath}`;
-      markStep(wsDir, stepId, 'started');
-      const stagingPath = path.join(tmpDir, relPath);
-      ensureDir(path.dirname(stagingPath));
-      writeFileAtomic(stagingPath, entry.content, { tmpDir });
-      ensureDir(path.dirname(entry.finalPath));
-      fs.renameSync(stagingPath, entry.finalPath);
-      markStep(wsDir, stepId, 'done', {
-        detail: { recovered: 'copy' },
-      });
+      if (rec.kind === 'intact') {
+        markStep(wsDir, stepId, 'done', { detail: { recovered: 'intact' } });
+      } else if (rec.kind === 'restore') {
+        markStep(wsDir, stepId, 'started');
+        const stagingPath = resolveInside(tmpDir, relPath);
+        ensureDir(path.dirname(stagingPath));
+        writeFileAtomic(stagingPath, rec.content, { tmpDir });
+        ensureDir(path.dirname(rec.finalPath));
+        fs.renameSync(stagingPath, rec.finalPath);
+        markStep(wsDir, stepId, 'done', { detail: { recovered: 'restore' } });
+      } else {
+        // Preserve the user-edited snapshot; write a nonclobbering proposal.
+        markStep(wsDir, stepId, 'done', { detail: { recovered: 'edited-proposal' } });
+        writeSnapshotProposal(wsDir, relPath, rec.content);
+      }
     }
 
     // Generation & ownership reconciliation
@@ -915,8 +1095,14 @@ async function executeResume(
     }
 
     writeStdout(`\nWorkspace resumed at ${wsDir}\n`);
-    if (reconcileResult.partial || reconcileResult.proposals.length > 0) {
-      writeStdout(`Note: Some generated files required reconciliation (.wsg-new proposals written).\n`);
+    if (
+      reconcileResult.partial ||
+      reconcileResult.proposals.length > 0 ||
+      snapshotPartial
+    ) {
+      writeStdout(
+        `Note: Some files required reconciliation; preserved edits and wrote .wsg-new proposals.\n`
+      );
       return 3;
     }
 
@@ -1429,7 +1615,7 @@ async function executeCreate(
           options._beforeSnapshotWrite(d);
         }
 
-        const stagingPath = path.join(tmpDir, d.path);
+        const stagingPath = resolveInside(tmpDir, d.path);
         const finalPath = resolveInside(wsDir, d.path);
         const stagingDir = path.dirname(stagingPath);
         const finalDir = path.dirname(finalPath);

@@ -708,6 +708,337 @@ test('resume refuses to rebuild a snapshot from changed source state', () => {
   }
 });
 
+test('resume rejects a recorded destination outside the workspace with zero git mutation', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-dest-' });
+  const tmpRoot = mkTmp('wsg-rsm-dest-root-');
+  const wsDir = path.join(tmpRoot, 'ws');
+  const sibling = path.join(tmpRoot, 'sibling');
+
+  try {
+    const first = runCli(
+      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      { env: { WSG_FAULT: 'after-lock' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const opFile = readOperation(wsDir);
+    assert.ok(opFile?.operation?.plan, 'journal plan must exist');
+    const planRepos = (opFile.operation.plan as { repos: Array<{ name: string; dest: string }> })
+      .repos;
+    const entry = planRepos[0].name;
+    const branch = `wsg/ws/${entry}`;
+    planRepos[0].dest = sibling;
+    writeOperation(wsDir, opFile);
+
+    const before = worktreeList(repo.dir).length;
+    const result = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--resume',
+    ]);
+    assert.equal(result.status, 2, `expected conflict exit 2: ${result.stderr}`);
+    assert.match(result.stderr, /not the expected workspace path|outside the workspace/);
+
+    assert.ok(!fs.existsSync(sibling), 'no worktree written outside the workspace');
+    assert.ok(!branchExists(repo.dir, branch), 'no branch created');
+    assert.equal(worktreeList(repo.dir).length, before, 'worktree list unchanged');
+    assert.ok(
+      !fs.existsSync(path.join(wsDir, 'workspace.yaml')),
+      'manifest must not be published'
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('resume rejects a symlinked recorded destination with zero git mutation', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-destlink-' });
+  const tmpRoot = mkTmp('wsg-rsm-destlink-root-');
+  const wsDir = path.join(tmpRoot, 'ws');
+
+  try {
+    const first = runCli(
+      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      { env: { WSG_FAULT: 'after-lock' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const opFile = readOperation(wsDir);
+    const planRepos = (opFile?.operation?.plan as { repos: Array<{ name: string; dest: string }> })
+      .repos;
+    const entry = planRepos[0].name;
+    const branch = `wsg/ws/${entry}`;
+    const dest = path.join(wsDir, entry);
+    const realTarget = path.join(wsDir, 'real-target');
+    fs.mkdirSync(realTarget, { recursive: true });
+    fs.symlinkSync(realTarget, dest, 'dir');
+
+    const before = worktreeList(repo.dir).length;
+    const result = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--resume',
+    ]);
+    assert.equal(result.status, 2, `expected conflict exit 2: ${result.stderr}`);
+    assert.match(result.stderr, /symbolic link/);
+
+    assert.ok(!branchExists(repo.dir, branch), 'no branch created');
+    assert.equal(worktreeList(repo.dir).length, before, 'worktree list unchanged');
+    assert.ok(fs.lstatSync(realTarget).isDirectory(), 'symlink target preserved');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('resume rejects a traversal operation id without writing outside .wsg/tmp', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-opid-' });
+  const tmpRoot = mkTmp('wsg-rsm-opid-root-');
+  const wsDir = path.join(tmpRoot, 'ws');
+
+  try {
+    const first = runCli(
+      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      { env: { WSG_FAULT: 'after-lock' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const opFile = readOperation(wsDir);
+    assert.ok(opFile?.operation);
+    opFile.operation.id = '../../escape';
+    writeOperation(wsDir, opFile);
+
+    const before = worktreeList(repo.dir).length;
+    const result = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--resume',
+    ]);
+    assert.equal(result.status, 2, `expected conflict exit 2: ${result.stderr}`);
+    assert.match(result.stderr, /not a safe path segment/);
+
+    assert.ok(!fs.existsSync(path.join(wsDir, 'escape')), 'no escaped directory in workspace');
+    assert.ok(
+      !fs.existsSync(path.join(wsDir, '.wsg', 'escape')),
+      'no escaped directory under .wsg'
+    );
+    assert.ok(!fs.existsSync(path.join(tmpRoot, 'escape')), 'no escaped directory in root');
+    assert.equal(worktreeList(repo.dir).length, before, 'worktree list unchanged');
+    assert.ok(
+      !fs.existsSync(path.join(wsDir, 'workspace.yaml')),
+      'manifest must not be published'
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('resume preserves an edited snapshot and writes a .wsg-new proposal', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-snapedit-' });
+  const docDir = mkTmp('wsg-rsm-snapedit-doc-');
+  const docPath = path.join(docDir, 'guide.md');
+  const recorded = '# Guide\nRecorded snapshot.\n';
+  fs.writeFileSync(docPath, recorded, 'utf8');
+  const tmpRoot = mkTmp('wsg-rsm-snapedit-root-');
+
+  try {
+    const first = runCli(
+      [
+        'create',
+        'task',
+        '--name',
+        'ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo.dir,
+        '--doc',
+        docPath,
+      ],
+      { env: { WSG_FAULT: 'after-generate' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const wsDir = path.join(tmpRoot, 'ws');
+    const snapshotPath = path.join(wsDir, 'docs', 'guide.md');
+    assert.ok(fs.existsSync(snapshotPath), 'snapshot must exist before resume');
+    const edited = recorded + 'USER SNAPSHOT EDIT\n';
+    fs.writeFileSync(snapshotPath, edited, 'utf8');
+
+    const resumed = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--doc',
+      docPath,
+      '--resume',
+    ]);
+    assert.equal(resumed.status, 3, `expected partial exit 3: ${resumed.stderr}`);
+
+    assert.equal(fs.readFileSync(snapshotPath, 'utf8'), edited, 'snapshot edit intact');
+    const proposalPath = `${snapshotPath}.wsg-new`;
+    assert.ok(fs.existsSync(proposalPath), '.wsg-new proposal must be written');
+    assert.equal(fs.readFileSync(proposalPath, 'utf8'), recorded, 'proposal holds recorded bytes');
+
+    const manifest = parseManifest(
+      fs.readFileSync(path.join(wsDir, 'workspace.yaml'), 'utf8')
+    );
+    assert.equal(manifest.docs[0].sha256, sha256(recorded));
+  } finally {
+    repo.cleanup();
+    fs.rmSync(docDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('resume preserves a preexisting snapshot proposal and numbers the new one', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-snappro-' });
+  const docDir = mkTmp('wsg-rsm-snappro-doc-');
+  const docPath = path.join(docDir, 'guide.md');
+  const recorded = '# Guide\nRecorded snapshot.\n';
+  fs.writeFileSync(docPath, recorded, 'utf8');
+  const tmpRoot = mkTmp('wsg-rsm-snappro-root-');
+
+  try {
+    const first = runCli(
+      [
+        'create',
+        'task',
+        '--name',
+        'ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo.dir,
+        '--doc',
+        docPath,
+      ],
+      { env: { WSG_FAULT: 'after-generate' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const wsDir = path.join(tmpRoot, 'ws');
+    const snapshotPath = path.join(wsDir, 'docs', 'guide.md');
+    fs.writeFileSync(snapshotPath, recorded + 'USER SNAPSHOT EDIT\n', 'utf8');
+    const preexistingProposal = `${snapshotPath}.wsg-new`;
+    fs.writeFileSync(preexistingProposal, 'PREEXISTING PROPOSAL\n', 'utf8');
+
+    const resumed = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--doc',
+      docPath,
+      '--resume',
+    ]);
+    assert.equal(resumed.status, 3, `expected partial exit 3: ${resumed.stderr}`);
+
+    assert.equal(
+      fs.readFileSync(preexistingProposal, 'utf8'),
+      'PREEXISTING PROPOSAL\n',
+      'preexisting proposal preserved'
+    );
+    const numberedProposal = `${snapshotPath}.wsg-new-1`;
+    assert.ok(fs.existsSync(numberedProposal), 'numbered proposal must be written');
+    assert.equal(fs.readFileSync(numberedProposal, 'utf8'), recorded);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(docDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('resume fails closed when an edited snapshot source also changed', () => {
+  const repo = createTestRepo({ prefix: 'wsg-rsm-snapboth-' });
+  const docDir = mkTmp('wsg-rsm-snapboth-doc-');
+  const docPath = path.join(docDir, 'guide.md');
+  const recorded = '# Guide\nRecorded snapshot.\n';
+  fs.writeFileSync(docPath, recorded, 'utf8');
+  const tmpRoot = mkTmp('wsg-rsm-snapboth-root-');
+
+  try {
+    const first = runCli(
+      [
+        'create',
+        'task',
+        '--name',
+        'ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo.dir,
+        '--doc',
+        docPath,
+      ],
+      { env: { WSG_FAULT: 'after-generate' } }
+    );
+    assert.equal(first.status, 70, first.stderr);
+
+    const wsDir = path.join(tmpRoot, 'ws');
+    const snapshotPath = path.join(wsDir, 'docs', 'guide.md');
+    const edited = recorded + 'USER SNAPSHOT EDIT\n';
+    fs.writeFileSync(snapshotPath, edited, 'utf8');
+    fs.writeFileSync(docPath, '# Guide\nChanged source.\n', 'utf8');
+
+    const resumed = runCli([
+      'create',
+      'task',
+      '--name',
+      'ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+      '--doc',
+      docPath,
+      '--resume',
+    ]);
+    assert.equal(resumed.status, 2, `expected conflict exit 2: ${resumed.stderr}`);
+    assert.match(resumed.stderr, /also changed/);
+
+    assert.equal(fs.readFileSync(snapshotPath, 'utf8'), edited, 'snapshot edit intact');
+    assert.ok(!fs.existsSync(`${snapshotPath}.wsg-new`), 'no proposal for unverifiable bytes');
+    assert.ok(
+      !fs.existsSync(path.join(wsDir, 'workspace.yaml')),
+      'manifest must not be published'
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(docDir, { recursive: true, force: true });
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
 test('WSG_FAULT=after-lock leaves a stale lock that resume takes over with a warning', () => {
   const repo = createTestRepo({ prefix: 'wsg-rsm-lock-' });
   const tmpRoot = mkTmp('wsg-rsm-lock-root-');
