@@ -1,0 +1,4 @@
+code_roots:
+  - ~/code
+workspace_root: ~/wsg
+api_key: sk-secret-12345
