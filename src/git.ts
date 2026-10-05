@@ -251,6 +251,32 @@ export function repoInfo(repoPath: string, options: RunGitOptions = {}): RepoInf
 }
 
 /**
+ * Reads a repository-relative file exactly as committed at `commit`. This is
+ * used to discover validation commands from the *recorded* worktree revision
+ * rather than the (possibly dirty) source checkout. Returns null when the file
+ * (or commit) is not present instead of throwing, so callers can report a gap.
+ */
+export function showFileAtCommit(
+  repoPath: string,
+  commit: string,
+  relPath: string,
+  options: RunGitOptions = {}
+): string | null {
+  assertSafeArg(repoPath, 'Repository path');
+  assertSafeArg(commit, 'Commit');
+  assertSafeArg(relPath, 'Path');
+  if (!/^[0-9a-fA-F]{40}$/.test(commit)) {
+    return null;
+  }
+  const canonical = canonicalize(repoPath);
+  try {
+    return runGit(['-C', canonical, 'show', `${commit}:${relPath}`], options);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Checks whether a branch exists in the given repository.
  */
 export function branchExists(repoPath: string, branchName: string, options: RunGitOptions = {}): boolean {

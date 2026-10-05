@@ -516,6 +516,9 @@ export function validateManifest(manifest: Manifest): Manifest {
 
   const validRepoPaths = new Set(manifest.repos.map((r) => r.path));
 
+  const seenCommandNames = new Set<string>();
+  const seenCommandWrappers = new Set<string>();
+
   for (let i = 0; i < (manifest.commands ?? []).length; i++) {
     const cmd = manifest.commands[i];
     const cmdLabel = cmd.name || `commands[${i}]`;
@@ -528,8 +531,19 @@ export function validateManifest(manifest: Manifest): Manifest {
       );
     }
 
+    const lowerName = cmd.name.toLowerCase();
+    if (seenCommandNames.has(lowerName)) {
+      throw new UsageError(`duplicate command name '${cmd.name}'`);
+    }
+    seenCommandNames.add(lowerName);
+
     if (cmd.wrapper) {
       assertConfinedRelative(cmd.wrapper, `command '${cmdLabel}' wrapper`);
+      const lowerWrapper = path.posix.normalize(cmd.wrapper).toLowerCase();
+      if (seenCommandWrappers.has(lowerWrapper)) {
+        throw new UsageError(`duplicate command wrapper '${cmd.wrapper}'`);
+      }
+      seenCommandWrappers.add(lowerWrapper);
     }
   }
 

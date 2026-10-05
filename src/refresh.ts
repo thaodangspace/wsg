@@ -29,6 +29,7 @@ import {
 } from './operation.ts';
 import { reconcileGenerated } from './ownership.ts';
 import { renderAll } from './generate.ts';
+import { applyWrapperModes } from './commands.ts';
 import { writeFileAtomic, ensureDir, sha256, listBasenames } from './fsx.ts';
 import { writeWorkspaceFile } from './staging.ts';
 import { deriveUrlBasename } from './add.ts';
@@ -491,6 +492,23 @@ function printResults(writeStdout: (chunk: string) => void, decision: RefreshDec
       writeStdout(`  - ${result.source}${location}: ${result.outcome} (${result.detail})\n`);
     }
   }
+  const commands = decision.updatedManifest.commands ?? [];
+  if (commands.length > 0) {
+    writeStdout(`Commands discovered (${commands.length}, not executed):\n`);
+    for (const cmd of commands) {
+      const wrapper = cmd.wrapper ? ` -> ${cmd.wrapper}` : '';
+      writeStdout(
+        `  - ${cmd.name}: ${cmd.argv.join(' ')} (cwd: ${cmd.cwd})${wrapper}\n`
+      );
+    }
+  }
+  const gaps = decision.updatedManifest.discovery.gaps ?? [];
+  if (gaps.length > 0) {
+    writeStdout(`Gaps and unresolved questions (${gaps.length}):\n`);
+    for (const gap of gaps) {
+      writeStdout(`  - ${gap}\n`);
+    }
+  }
   for (const warning of decision.warnings) {
     writeStdout(`  ! ${warning}\n`);
   }
@@ -601,6 +619,7 @@ export async function runRefresh(
     const generatedFiles = renderAll(decision.updatedManifest);
     const journal = readOperation(wsDir);
     const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
+    applyWrapperModes(wsDir, generatedFiles, reconcileResult.owned);
 
     const currentManifestSha = sha256(fs.readFileSync(manifestPathFor(wsDir)));
     if (currentManifestSha !== baselineManifestSha) {

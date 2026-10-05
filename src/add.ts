@@ -13,6 +13,7 @@ import {
   type DocEntry,
   type ScriptEntry,
   type RepoEntry,
+  type CommandEntry,
   type Intent,
   type AddedBy,
   type Evidence,
@@ -42,6 +43,7 @@ import {
 } from './operation.ts';
 import { reconcileGenerated } from './ownership.ts';
 import { renderAll } from './generate.ts';
+import { discoverCommands, applyWrapperModes } from './commands.ts';
 import { writeFileAtomic, ensureDir, sha256, listBasenames } from './fsx.ts';
 import { stageFile, commitStagedFile, writeWorkspaceFile } from './staging.ts';
 import { faultPoint } from './faults.ts';
@@ -115,6 +117,7 @@ export interface AddPlan {
   repos: PlannedRepo[];
   docs: PlannedDocWrite[];
   scripts: PlannedScriptWrite[];
+  commands: CommandEntry[];
   noops: string[];
   warnings: string[];
 }
@@ -128,6 +131,7 @@ export interface AddRecordedPlan {
   repos: PlannedRepo[];
   docs: Array<DocEntry & { text?: boolean }>;
   scripts: Array<ScriptEntry & { text?: boolean }>;
+  commands: CommandEntry[];
   noops: string[];
   warnings: string[];
 }
@@ -451,6 +455,36 @@ export async function planAdditions(
     }
   }
 
+  // Discover supported commands for the newly attached repositories from their
+  // recorded base commits (never the dirty source checkout). Wrapper basenames
+  // avoid existing wrappers, attached scripts, and untracked files, and are
+  // reserved before external scripts are allocated so nothing is clobbered.
+  const commands: CommandEntry[] = [];
+  if (repos.length > 0) {
+    const reservedWrapperBasenames = new Set<string>(usedScript);
+    for (const existing of manifest.commands) {
+      if (existing.wrapper) {
+        reservedWrapperBasenames.add(path.posix.basename(existing.wrapper));
+      }
+    }
+    const discovery = discoverCommands(
+      repos.map((r) => ({
+        name: r.name,
+        source: r.source,
+        base_commit: r.base_commit,
+        dest: r.dest,
+      })),
+      { reservedBasenames: reservedWrapperBasenames }
+    );
+    commands.push(...discovery.commands);
+    for (const basename of discovery.usedWrapperBasenames) {
+      usedScript.add(basename);
+    }
+    for (const gap of discovery.gaps) {
+      warnings.push(gap);
+    }
+  }
+
   // Materialize doc plans (URL fetch is bounded and never throws for network
   // failures; inaccessible/nontext URLs fall back to honest references).
   const fetchedAt = new Date().toISOString();
@@ -529,7 +563,7 @@ export async function planAdditions(
     });
   }
 
-  return { repos, docs, scripts, noops, warnings };
+  return { repos, docs, scripts, commands, noops, warnings };
 }
 
 function buildUpdatedManifest(manifest: Manifest, plan: AddPlan): Manifest {
@@ -542,7 +576,7 @@ function buildUpdatedManifest(manifest: Manifest, plan: AddPlan): Manifest {
     repos: [...manifest.repos, ...plan.repos.map(repoEntryFromPlan)],
     docs: [...manifest.docs, ...plan.docs.map((d) => d.entry)],
     scripts: [...manifest.scripts, ...plan.scripts.map((s) => s.entry)],
-    commands: [...manifest.commands],
+    commands: [...manifest.commands, ...plan.commands],
     discovery: {
       excluded: [...manifest.discovery.excluded],
       gaps: [...manifest.discovery.gaps, ...plan.warnings],
@@ -620,6 +654,7 @@ function planToRecorded(
       ...s.entry,
       ...(typeof s.text === 'boolean' ? { text: s.text } : {}),
     })),
+    commands: plan.commands.map((c) => ({ ...c, argv: [...c.argv] })),
     noops: [...plan.noops],
     warnings: [...plan.warnings],
   };
@@ -630,6 +665,7 @@ export function extractAddPlan(op: Operation, fallbackName: string): AddRecorded
   const rawRepos = Array.isArray(raw.repos) ? (raw.repos as any[]) : [];
   const rawDocs = Array.isArray(raw.docs) ? (raw.docs as any[]) : [];
   const rawScripts = Array.isArray(raw.scripts) ? (raw.scripts as any[]) : [];
+  const rawCommands = Array.isArray(raw.commands) ? (raw.commands as any[]) : [];
 
   return {
     wsName: (raw.wsName as string) ?? fallbackName,
@@ -666,6 +702,13 @@ export function extractAddPlan(op: Operation, fallbackName: string): AddRecorded
       ...(s.added_by ? { added_by: s.added_by as AddedBy } : {}),
       ...(s.reason ? { reason: s.reason as string } : {}),
       ...(typeof s.text === 'boolean' ? { text: s.text as boolean } : {}),
+    })),
+    commands: rawCommands.map((c) => ({
+      name: c.name,
+      cwd: c.cwd,
+      argv: Array.isArray(c.argv) ? (c.argv as string[]) : [],
+      ...(c.evidence !== undefined ? { evidence: c.evidence as string } : {}),
+      ...(c.wrapper !== undefined ? { wrapper: c.wrapper as string } : {}),
     })),
     noops: Array.isArray(raw.noops) ? (raw.noops as string[]) : [],
     warnings: Array.isArray(raw.warnings) ? (raw.warnings as string[]) : [],
@@ -704,6 +747,20 @@ function manifestFromRecorded(manifest: Manifest, recorded: AddRecordedPlan): Ma
       return out;
     });
 
+  const existingCommandNames = new Set(manifest.commands.map((c) => c.name.toLowerCase()));
+  const existingCommandWrappers = new Set(
+    manifest.commands
+      .map((c) => c.wrapper?.toLowerCase())
+      .filter((w): w is string => typeof w === 'string')
+  );
+  const newCommands = recorded.commands
+    .filter(
+      (c) =>
+        !existingCommandNames.has(c.name.toLowerCase()) &&
+        !(c.wrapper && existingCommandWrappers.has(c.wrapper.toLowerCase()))
+    )
+    .map((c) => ({ ...c, argv: [...c.argv] }));
+
   return {
     version: 1,
     name: manifest.name,
@@ -713,7 +770,7 @@ function manifestFromRecorded(manifest: Manifest, recorded: AddRecordedPlan): Ma
     repos: [...manifest.repos, ...newRepos],
     docs: [...manifest.docs, ...newDocs],
     scripts: [...manifest.scripts, ...newScripts],
-    commands: [...manifest.commands],
+    commands: [...manifest.commands, ...newCommands],
     discovery: {
       excluded: [...manifest.discovery.excluded],
       gaps: [...manifest.discovery.gaps, ...recorded.warnings],
@@ -807,6 +864,15 @@ function printPlan(
       writeStdout(`  - ${script.entry.path} (sha256: ${script.entry.sha256?.slice(0, 8)}) <- ${script.entry.source}\n`);
     }
   }
+  if (plan.commands.length > 0) {
+    writeStdout(`Commands discovered (${plan.commands.length}, not executed):\n`);
+    for (const cmd of plan.commands) {
+      const wrapper = cmd.wrapper ? ` -> ${cmd.wrapper}` : '';
+      writeStdout(
+        `  - ${cmd.name}: ${cmd.argv.join(' ')} (cwd: ${cmd.cwd}, evidence: ${cmd.evidence ?? 'n/a'})${wrapper}\n`
+      );
+    }
+  }
   if (plan.warnings.length > 0) {
     writeStdout(`Warnings:\n`);
     for (const warning of plan.warnings) {
@@ -816,7 +882,12 @@ function printPlan(
 }
 
 function hasAdditions(plan: AddPlan): boolean {
-  return plan.repos.length > 0 || plan.docs.length > 0 || plan.scripts.length > 0;
+  return (
+    plan.repos.length > 0 ||
+    plan.docs.length > 0 ||
+    plan.scripts.length > 0 ||
+    plan.commands.length > 0
+  );
 }
 
 function readManifestFrom(wsDir: string): Manifest {
@@ -949,6 +1020,7 @@ function applyAddLocked(
   const generatedFiles = renderAll(updatedManifest, { unreadDocs: unreadDocsFor(plan) });
   const journal = readOperation(wsDir);
   const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
+  applyWrapperModes(wsDir, generatedFiles, reconcileResult.owned);
   markStep(wsDir, 'generate', 'done');
   faultPoint('after-generate', io.env);
 
@@ -1203,6 +1275,7 @@ async function executeAddResume(
     const generatedFiles = renderAll(updatedManifest, { unreadDocs: unread });
     const journal = readOperation(wsDir);
     const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
+    applyWrapperModes(wsDir, generatedFiles, reconcileResult.owned);
     markStep(wsDir, 'generate', 'done');
     faultPoint('after-generate', io.env);
 

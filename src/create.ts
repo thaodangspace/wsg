@@ -36,6 +36,7 @@ import {
   type Intent,
   type Evidence,
   type ExcludedRepo,
+  type CommandEntry,
 } from './manifest.ts';
 import {
   initWsgDir,
@@ -53,6 +54,7 @@ import {
 } from './operation.ts';
 import { reconcileGenerated, type ReconcileResult } from './ownership.ts';
 import { renderAll } from './generate.ts';
+import { discoverCommands, applyWrapperModes } from './commands.ts';
 import { writeFileAtomic, ensureDir, sha256 } from './fsx.ts';
 import { faultPoint } from './faults.ts';
 import {
@@ -159,6 +161,7 @@ export interface CreateAssembly {
   adapters: ManifestAdapter[];
   repos: AssemblyRepo[];
   docs: PlannedDoc[];
+  commands: CommandEntry[];
   gaps: string[];
   excluded: ExcludedRepo[];
 }
@@ -365,6 +368,7 @@ export interface RecordedPlan {
   adapters: ManifestAdapter[];
   repos: AssemblyRepo[];
   docs: RecordedPlanDoc[];
+  commands?: CommandEntry[];
   gaps: string[];
   excluded?: ExcludedRepo[];
 }
@@ -583,6 +587,15 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
         ...(d.reason ? { reason: d.reason as string } : {}),
         ...(typeof d.text === 'boolean' ? { text: d.text as boolean } : {}),
       })),
+      commands: Array.isArray(rawPlan.commands)
+        ? (rawPlan.commands as CommandEntry[]).map((c) => ({
+            name: c.name,
+            cwd: c.cwd,
+            argv: [...c.argv],
+            ...(c.evidence !== undefined ? { evidence: c.evidence } : {}),
+            ...(c.wrapper !== undefined ? { wrapper: c.wrapper } : {}),
+          }))
+        : [],
       gaps: Array.isArray(rawPlan.gaps) ? (rawPlan.gaps as string[]) : [],
       excluded: Array.isArray(rawPlan.excluded) ? (rawPlan.excluded as ExcludedRepo[]) : [],
     };
@@ -630,6 +643,7 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
         : (['agents'] as ManifestAdapter[]),
     repos,
     docs,
+    commands: [],
     gaps: [],
   };
 }
@@ -947,7 +961,7 @@ async function executeResume(
       ...(d.reason ? { reason: d.reason } : {}),
     })),
     scripts: [],
-    commands: [],
+    commands: [...(plan.commands ?? [])],
     discovery: {
       excluded: plan.excluded ?? [],
       gaps: plan.gaps,
@@ -1179,6 +1193,7 @@ async function executeResume(
     const currentJournal = readOperation(wsDir);
     const owned = currentJournal?.owned ?? {};
     const reconcileResult = reconcileGenerated(wsDir, generatedFiles, owned);
+    applyWrapperModes(wsDir, generatedFiles, reconcileResult.owned);
     markStep(wsDir, 'generate', 'done');
     faultPoint('after-generate', io.env);
 
@@ -1260,6 +1275,7 @@ async function runAssembly(
     adapters,
     repos,
     docs: plannedDocs,
+    commands,
     gaps: allGaps,
     excluded,
   } = assembly;
@@ -1292,7 +1308,7 @@ async function runAssembly(
       ...(d.reason ? { reason: d.reason } : {}),
     })),
     scripts: [],
-    commands: [],
+    commands,
     discovery: {
       excluded,
       gaps: allGaps,
@@ -1399,9 +1415,8 @@ async function runAssembly(
   }
   writeStdout(`Repositories (${repos.length}):\n`);
   for (const r of repos) {
-    const role = r.added_by === 'scout' ? `, intent: ${r.intent}` : '';
     writeStdout(
-      `  - ${r.name}: ${r.source} -> ${r.name} (branch: ${r.branch}, base: ${r.base_commit.slice(0, 8)}${role})\n`
+      `  - ${r.name} (intent: ${r.intent}, added_by: ${r.added_by}): ${r.source} -> ${r.name} (branch: ${r.branch}, base: ${r.base_commit.slice(0, 8)})\n`
     );
   }
   if (plannedDocs.length > 0) {
@@ -1412,8 +1427,17 @@ async function runAssembly(
           `  - ${d.path} (mode: snapshot, sha256: ${d.sha256?.slice(0, 8)}) <- ${d.source}\n`
         );
       } else {
-        writeStdout(`  - ${d.source} (mode: reference) - ${d.reason}\n`);
+        writeStdout(`  - ${d.source} (mode: reference, unresolved) - ${d.reason}\n`);
       }
+    }
+  }
+  if (commands.length > 0) {
+    writeStdout(`Commands discovered (${commands.length}, not executed):\n`);
+    for (const cmd of commands) {
+      const wrapper = cmd.wrapper ? ` -> ${cmd.wrapper}` : '';
+      writeStdout(
+        `  - ${cmd.name}: ${cmd.argv.join(' ')} (cwd: ${cmd.cwd}, evidence: ${cmd.evidence ?? 'n/a'})${wrapper}\n`
+      );
     }
   }
   if (allGaps.length > 0) {
@@ -1532,6 +1556,7 @@ async function runAssembly(
         ...(d.reason ? { reason: d.reason } : {}),
         ...(typeof d.text === 'boolean' ? { text: d.text } : {}),
       })),
+      commands: commands.map((c) => ({ ...c, argv: [...c.argv] })),
       gaps: allGaps,
       excluded,
     };
@@ -1654,6 +1679,7 @@ async function runAssembly(
     const currentJournal = readOperation(wsDir);
     const owned = currentJournal?.owned ?? {};
     const reconcileResult = reconcileGenerated(wsDir, generatedFiles, owned);
+    applyWrapperModes(wsDir, generatedFiles, reconcileResult.owned);
     markStep(wsDir, 'generate', 'done');
     faultPoint('after-generate', io.env);
 
@@ -1841,6 +1867,18 @@ async function executeCreate(
     allGaps.push(...gaps);
   }
 
+  // Discover supported validation commands from the recorded revision (never
+  // the dirty source checkout) and never execute them.
+  const commandDiscovery = discoverCommands(
+    repos.map((r) => ({
+      name: r.name,
+      source: r.source,
+      base_commit: r.base_commit,
+      dest: r.dest,
+    }))
+  );
+  allGaps.push(...commandDiscovery.gaps);
+
   // 8. Documents inspection and planning
   const inspectedDocs: InspectedDoc[] = [];
   if (scoutResult.docs) {
@@ -1866,6 +1904,7 @@ async function executeCreate(
     adapters,
     repos,
     docs: plannedDocs,
+    commands: commandDiscovery.commands,
     gaps: allGaps,
     excluded: (scoutResult.excluded ?? []).map((e) => ({ source: e.source, reason: e.reason })),
   };
@@ -2239,6 +2278,17 @@ async function executeAutonomousCreate(
     userDocSources.has(d.source) ? d : { ...d, added_by: 'scout' as AddedBy }
   );
 
+  // Discover supported validation commands from each recorded base commit.
+  const commandDiscovery = discoverCommands(
+    repos.map((r) => ({
+      name: r.name,
+      source: r.source,
+      base_commit: r.base_commit,
+      dest: r.dest,
+    }))
+  );
+  allGaps.push(...commandDiscovery.gaps);
+
   const assembly: CreateAssembly = {
     wsName: ctx.wsName,
     wsDir: ctx.wsDir,
@@ -2248,6 +2298,7 @@ async function executeAutonomousCreate(
     adapters: ctx.adapters,
     repos,
     docs: plannedDocs,
+    commands: commandDiscovery.commands,
     gaps: allGaps,
     excluded: validated.excluded,
   };
