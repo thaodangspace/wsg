@@ -514,21 +514,15 @@ export function validateManifest(manifest: Manifest): Manifest {
     }
   }
 
-  const validRepoPaths = new Set(
-    manifest.repos.map((r) =>
-      path.posix.normalize(r.path).replace(/\/+$/, '').toLowerCase()
-    )
-  );
+  const validRepoPaths = new Set(manifest.repos.map((r) => r.path));
 
   for (let i = 0; i < (manifest.commands ?? []).length; i++) {
     const cmd = manifest.commands[i];
     const cmdLabel = cmd.name || `commands[${i}]`;
-    const normalizedCmdCwd = path.posix
-      .normalize(cmd.cwd)
-      .replace(/\/+$/, '')
-      .toLowerCase();
 
-    if (!validRepoPaths.has(normalizedCmdCwd)) {
+    assertConfinedRelative(cmd.cwd, `command '${cmdLabel}' cwd`);
+
+    if (!validRepoPaths.has(cmd.cwd)) {
       throw new UsageError(
         `command '${cmdLabel}' cwd '${cmd.cwd}' does not match any repo path in the workspace`
       );

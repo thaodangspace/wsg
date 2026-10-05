@@ -282,6 +282,44 @@ test('commands[0].cwd: nope rejected', () => {
       return true;
     }
   );
+
+  const base = parseManifest(readFixture('spec-section-5.yaml'));
+
+  // Reject traversal in command cwd
+  const traversalCwdManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  traversalCwdManifest.commands[0].cwd = 'elsewhere/../new-platform';
+  assert.throws(
+    () => validateManifest(traversalCwdManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /path traversal/);
+      return true;
+    }
+  );
+
+  // Reject casing alias in command cwd (case-sensitive check)
+  const casingAliasCwdManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  casingAliasCwdManifest.commands[0].cwd = 'New-Platform';
+  assert.throws(
+    () => validateManifest(casingAliasCwdManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /cwd 'New-Platform' does not match any repo path/);
+      return true;
+    }
+  );
+
+  // Reject path alias with dot
+  const dotAliasCwdManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  dotAliasCwdManifest.commands[0].cwd = 'new-platform/.';
+  assert.throws(
+    () => validateManifest(dotAliasCwdManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /cwd 'new-platform\/\.' does not match any repo path/);
+      return true;
+    }
+  );
 });
 
 test('reference doc with path rejected', () => {
