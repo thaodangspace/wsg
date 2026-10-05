@@ -1,0 +1,10 @@
+version: 1
+name: port-emr
+request: |
+  Some request
+repos: []
+docs:
+  - source: /home/user/docs/doc.md
+    path: docs/doc.md
+    mode: snapshot
+    added_by: user

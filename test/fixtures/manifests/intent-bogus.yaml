@@ -1,0 +1,14 @@
+version: 1
+name: port-emr
+request: |
+  Some request
+repos:
+  - name: legacy-platform
+    source: /home/user/code/legacy-platform
+    path: legacy-platform
+    base_commit: 0123456789abcdef0123456789abcdef01234567
+    branch: wsg/port-emr/legacy-platform
+    intent: bogus
+    added_by: scout
+    reason: Owns the current EMR implementation.
+docs: []

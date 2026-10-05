@@ -1,0 +1,58 @@
+version: 1
+name: port-emr
+request: |
+  Port EMR from the monolith to the modular architecture of the new system.
+context:
+  - The target uses patient-service module boundaries.
+adapters: [agents, claude]
+
+repos:
+  - name: legacy-platform
+    source: /home/user/code/legacy-platform
+    path: legacy-platform
+    base_commit: 0123456789abcdef0123456789abcdef01234567
+    branch: wsg/port-emr/legacy-platform
+    intent: reference
+    added_by: scout
+    reason: Owns the current EMR implementation.
+    evidence:
+      - file: src/emr/MedicalRecord.ts
+        lines: [12, 48]
+        summary: Defines the source MedicalRecord model.
+  - name: new-platform
+    source: /home/user/code/new-platform
+    path: new-platform
+    base_commit: abcdef0123456789abcdef0123456789abcdef01
+    branch: wsg/port-emr/new-platform
+    intent: target
+    added_by: user
+    reason: Explicit target repository supplied by the user.
+    evidence: []
+
+docs:
+  - source: /home/user/docs/emr-migration.md
+    path: docs/emr-migration.md
+    mode: snapshot
+    added_by: user
+    sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    fetched_at: '2026-10-05T12:00:00.000Z'
+    reason: Supplied migration proposal.
+  - source: https://internal-wiki.example/emr
+    mode: reference
+    added_by: user
+    reason: Authentication required; content not fetched.
+
+scripts: []
+commands:
+  - name: test-new-platform
+    cwd: new-platform
+    argv: [npm, run, test]
+    evidence: package.json scripts.test
+    wrapper: scripts/test-new-platform.sh
+
+discovery:
+  excluded:
+    - source: /home/user/code/billing-service
+      reason: EMR mention is incidental; no matching implementation found.
+  gaps:
+    - No verified cross-repository migration test was found.

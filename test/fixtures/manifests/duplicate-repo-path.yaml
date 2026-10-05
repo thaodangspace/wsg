@@ -1,0 +1,22 @@
+version: 1
+name: port-emr
+request: |
+  Some request
+repos:
+  - name: repo1
+    source: /home/user/code/repo1
+    path: shared-path
+    base_commit: 0123456789abcdef0123456789abcdef01234567
+    branch: wsg/port-emr/repo1
+    intent: reference
+    added_by: scout
+    reason: First repo
+  - name: repo2
+    source: /home/user/code/repo2
+    path: shared-path
+    base_commit: abcdef0123456789abcdef0123456789abcdef01
+    branch: wsg/port-emr/repo2
+    intent: reference
+    added_by: scout
+    reason: Duplicate repo path
+docs: []

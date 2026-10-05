@@ -1,0 +1,14 @@
+version: 1
+name: port-emr
+request: |
+  Some request
+repos:
+  - name: repo1
+    source: relative-source
+    path: repo1
+    base_commit: 0123456789abcdef0123456789abcdef01234567
+    branch: wsg/port-emr/repo1
+    intent: reference
+    added_by: user
+    reason: Repo 1
+docs: []
