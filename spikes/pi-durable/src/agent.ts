@@ -24,6 +24,27 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 export const MAX_READ_BYTES = 16 * 1024; // 16 KiB cap
 export const TRUNCATION_MARKER = "\n[TRUNCATED: 16 KiB limit reached]";
 
+export function sliceUtf8Safe(buf: Uint8Array | Buffer, maxLen: number): string {
+  if (buf.byteLength <= maxLen) {
+    return new TextDecoder("utf-8").decode(buf);
+  }
+  let end = maxLen;
+  while (end > 0 && ((buf[end] ?? 0) & 0xc0) === 0x80) {
+    end--;
+  }
+  const first = buf[end] ?? 0;
+  let charLen = 1;
+  if ((first & 0xe0) === 0xc0) charLen = 2;
+  else if ((first & 0xf0) === 0xe0) charLen = 3;
+  else if ((first & 0xf8) === 0xf0) charLen = 4;
+
+  if (end + charLen > maxLen) {
+    return new TextDecoder("utf-8").decode(buf.subarray(0, end));
+  } else {
+    return new TextDecoder("utf-8").decode(buf.subarray(0, end + charLen));
+  }
+}
+
 export const ReadFileSchema = Type.Object(
   {
     path: Type.String({ description: "Relative path to file within the fixture directory" }),
@@ -97,6 +118,8 @@ export function createReadFileTool(options?: {
 }) {
   const maxBytes = options?.maxBytes ?? MAX_READ_BYTES;
   const marker = options?.truncationMarker ?? TRUNCATION_MARKER;
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const maxHeadBytes = Math.max(0, maxBytes - markerBytes);
 
   return defineTool({
     name: "read_file",
@@ -111,10 +134,24 @@ export function createReadFileTool(options?: {
       const fixtureDir = options?.fixtureDir ?? process.env.SPIKE_FIXTURE_PATH ?? process.cwd();
       const targetPath = resolveConfinedPath(fixtureDir, args.path);
 
-      const buffer = await fs.readFile(targetPath);
-      if (buffer.byteLength > maxBytes) {
-        const truncatedHead = buffer.subarray(0, maxBytes).toString("utf8");
-        const text = truncatedHead + marker;
+      // Bounded filesystem I/O: read at most maxBytes + 1 bytes using a file handle
+      const handle = await fs.open(targetPath, "r");
+      let readBuf: Buffer;
+      let bytesRead: number;
+      try {
+        readBuf = Buffer.alloc(maxBytes + 1);
+        const res = await handle.read(readBuf, 0, maxBytes + 1, 0);
+        bytesRead = res.bytesRead;
+      } finally {
+        await handle.close();
+      }
+
+      const isOverCap = bytesRead > maxBytes;
+      if (isOverCap) {
+        // Budget headText + marker so that combined length does not exceed maxBytes
+        // and respect UTF-8 character boundaries.
+        const headText = sliceUtf8Safe(readBuf.subarray(0, bytesRead), maxHeadBytes);
+        const text = headText + marker;
         api.diagnostic({
           severity: "warn",
           code: "truncated",
@@ -132,7 +169,7 @@ export function createReadFileTool(options?: {
         };
       }
 
-      const text = buffer.toString("utf8");
+      const text = readBuf.subarray(0, bytesRead).toString("utf8");
       return {
         content: [{ type: "text", text }],
       };

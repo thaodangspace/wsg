@@ -124,22 +124,34 @@ export async function runSpike(options: RunOptions = {}): Promise<SubmitSelectio
 
   await submission.wait(context);
 
-  let finalSelection = capturedSelection;
-  if (!finalSelection) {
-    const convContext = await root.context(context);
-    for (const entry of convContext.entries) {
-      if (entry.kind === "pi.assistant" && entry.model) {
-        for (const m of entry.model) {
-          if (m.role === "assistant" && Array.isArray(m.content)) {
-            for (const c of m.content) {
-              if (c.type === "toolCall" && c.name === "submit_selection") {
-                finalSelection = c.arguments as SubmitSelection;
-              }
+  // Recover terminal selection from successfully persisted submit_selection tool-result details
+  const convContext = await root.context(context);
+  let finalSelection: SubmitSelection | undefined;
+
+  for (const entry of convContext.entries) {
+    if (entry.kind === "pi.tool-result" && entry.model) {
+      for (const m of entry.model) {
+        if (m.role === "toolResult" && m.toolName === "submit_selection" && !m.isError) {
+          if (m.details && typeof m.details === "object" && "repos" in m.details && "reason" in m.details) {
+            finalSelection = m.details as SubmitSelection;
+          } else if (Array.isArray(m.content) && m.content.length > 0 && "text" in m.content[0]) {
+            try {
+              finalSelection = JSON.parse((m.content[0] as { text: string }).text);
+            } catch {
+              // Ignore parse error
             }
           }
         }
       }
     }
+  }
+
+  if (!finalSelection && capturedSelection) {
+    finalSelection = capturedSelection;
+  }
+
+  if (!finalSelection) {
+    throw new Error("No successful persisted submit_selection tool result found");
   }
 
   await harness.close(context);
