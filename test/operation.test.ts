@@ -621,61 +621,151 @@ test('writeFileAtomic handles short writes via writeAllSync loop with regression
   }
 });
 
+/**
+ * Runs `count` child processes that all race to acquire the writer lock in
+ * `wsDir`. Startup timing is not assumed:
+ *
+ *  1. every child announces readiness, and the parent releases a start barrier
+ *     only after all of them are ready;
+ *  2. the winner holds the lock until every other contender has reported that
+ *     it attempted the acquisition, so a slow child can never acquire after the
+ *     winner releases;
+ *  3. child-side waits are bounded, and the parent kills any survivors and
+ *     removes its scratch directory on every path.
+ *
+ * Returns the child exit codes (winner=0, conflict=2) and captured stderr.
+ */
+async function raceForLock(
+  wsDir: string,
+  count: number,
+  opIdPrefix: string
+): Promise<{ exitCodes: number[]; stderr: string[] }> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-race-'));
+  const goFile = path.join(dir, 'go');
+  const readyFile = (i: number) => path.join(dir, `ready-${i}`);
+  const reportedFile = (i: number) => path.join(dir, `reported-${i}`);
+
+  const childScript = `
+    import fs from 'node:fs';
+    import path from 'node:path';
+    import { acquireLock, releaseLock } from './src/operation.ts';
+    import { ConflictError } from './src/errors.ts';
+
+    const dir = process.env.WSG_RACE_DIR;
+    const wsDir = process.env.WSG_RACE_WS;
+    const index = Number(process.env.WSG_RACE_INDEX);
+    const count = Number(process.env.WSG_RACE_COUNT);
+    const goFile = path.join(dir, 'go');
+    const readyFile = (i) => path.join(dir, 'ready-' + i);
+    const reportedFile = (i) => path.join(dir, 'reported-' + i);
+    const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    const waitFor = (predicate, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!predicate()) {
+        if (Date.now() > deadline) return false;
+        sleep(5);
+      }
+      return true;
+    };
+
+    // Announce readiness, then wait for the parent's go signal so every
+    // contender attempts the acquisition at the same moment.
+    fs.writeFileSync(readyFile(index), '1');
+    if (!waitFor(() => fs.existsSync(goFile), 20000)) process.exit(1);
+
+    let code = 1;
+    try {
+      const lock = acquireLock(wsDir, { opId: '${opIdPrefix}' + process.pid });
+      fs.writeFileSync(reportedFile(index), '1');
+      // Hold the winning lock until every other contender has reported that it
+      // attempted the acquisition; no timing guesswork.
+      waitFor(() => {
+        for (let i = 0; i < count; i++) {
+          if (i !== index && !fs.existsSync(reportedFile(i))) return false;
+        }
+        return true;
+      }, 20000);
+      releaseLock(wsDir, lock);
+      code = 0;
+    } catch (err) {
+      try { fs.writeFileSync(reportedFile(index), '1'); } catch {}
+      code = err instanceof ConflictError ? 2 : 1;
+    }
+    process.exit(code);
+  `;
+
+  const procs = Array.from({ length: count }, (_, i) =>
+    spawn('node', ['--input-type=module', '-e', childScript], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        WSG_RACE_DIR: dir,
+        WSG_RACE_WS: wsDir,
+        WSG_RACE_INDEX: String(i),
+        WSG_RACE_COUNT: String(count),
+      },
+    })
+  );
+
+  const stderrChunks: string[] = new Array(count).fill('');
+  procs.forEach((proc, i) => {
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderrChunks[i] += chunk.toString('utf8');
+    });
+  });
+
+  try {
+    // Wait for a real ready handshake from every child before starting the race.
+    const deadline = Date.now() + 20000;
+    let allReady = false;
+    while (!allReady && Date.now() < deadline) {
+      allReady = procs.every((_, i) => fs.existsSync(readyFile(i)));
+      if (!allReady) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    if (!allReady) {
+      throw new Error(
+        `contenders did not all become ready within 20s; stderr:\n${stderrChunks.join('\n---\n')}`
+      );
+    }
+    fs.writeFileSync(goFile, 'go');
+
+    const exitCodes = await Promise.all(
+      procs.map((proc) => new Promise<number>((resolve) => proc.on('exit', (code) => resolve(code ?? 1))))
+    );
+    return { exitCodes, stderr: stderrChunks };
+  } finally {
+    for (const proc of procs) {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 test('multi-process lock contention: only one contender wins and losers receive ConflictError', async () => {
   const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-contention-'));
   try {
     initWsgDir(wsDir);
 
-    const childScript = `
-      import fs from 'node:fs';
-      import { acquireLock, releaseLock } from './src/operation.ts';
-      import { ConflictError } from './src/errors.ts';
+    const { exitCodes, stderr } = await raceForLock(wsDir, 4, 'child-');
+    const winCount = exitCodes.filter((code) => code === 0).length;
+    const conflictCount = exitCodes.filter((code) => code === 2).length;
 
-      const wsDir = process.argv[process.argv.length - 2];
-      const goFile = process.argv[process.argv.length - 1];
-      // Wait for the parent's start barrier so all contenders attempt the
-      // acquire at the same moment regardless of process startup jitter.
-      while (!fs.existsSync(goFile)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-      }
-      try {
-        const lock = acquireLock(wsDir, { opId: 'child-' + process.pid });
-        // Hold lock for 300ms
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
-        releaseLock(wsDir, lock);
-        process.exit(0);
-      } catch (err) {
-        if (err instanceof ConflictError) {
-          process.exit(2);
-        }
-        process.exit(1);
-      }
-    `;
-
-    const goFile = path.join(os.tmpdir(), `wsg-contention-go-${process.pid}-${Date.now()}`);
-    // Spawn 4 parallel child processes attempting acquireLock at the same moment
-    const procs = Array.from({ length: 4 }, () =>
-      spawn('node', ['--input-type=module', '-e', childScript, '--', wsDir, goFile], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+    assert.equal(
+      winCount,
+      1,
+      `Exactly one contender must acquire the lock and exit 0; codes=${exitCodes}; stderr=${stderr.join(' | ')}`
     );
-
-    // Wait for children to be alive, then release the barrier.
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    fs.writeFileSync(goFile, 'go');
-    try {
-      const exitCodes = await Promise.all(
-        procs.map((p) => new Promise<number>((resolve) => p.on('exit', (code) => resolve(code ?? 1))))
-      );
-
-      const winCount = exitCodes.filter((code) => code === 0).length;
-      const conflictCount = exitCodes.filter((code) => code === 2).length;
-
-      assert.equal(winCount, 1, 'Exactly one contender must acquire the lock and exit 0');
-      assert.equal(conflictCount, 3, 'All other contenders must conflict with exit code 2');
-    } finally {
-      fs.rmSync(goFile, { force: true });
-    }
+    assert.equal(
+      conflictCount,
+      3,
+      `All other contenders must conflict with exit code 2; codes=${exitCodes}; stderr=${stderr.join(' | ')}`
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
@@ -700,55 +790,20 @@ test('multi-process stale lock takeover: contenders serialize and newly acquired
     };
     fs.writeFileSync(lockPath, JSON.stringify(staleLock, null, 2) + '\n', 'utf8');
 
-    const childScript = `
-      import fs from 'node:fs';
-      import { acquireLock, releaseLock } from './src/operation.ts';
-      import { ConflictError } from './src/errors.ts';
+    const { exitCodes, stderr } = await raceForLock(wsDir, 3, 'reclaimer-');
+    const winCount = exitCodes.filter((code) => code === 0).length;
+    const conflictCount = exitCodes.filter((code) => code === 2).length;
 
-      const wsDir = process.argv[process.argv.length - 2];
-      const goFile = process.argv[process.argv.length - 1];
-      // Wait for the parent's start barrier so all reclaimers race together.
-      while (!fs.existsSync(goFile)) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-      }
-      try {
-        const lock = acquireLock(wsDir, { opId: 'reclaimer-' + process.pid });
-        // Hold lock for 300ms
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
-        releaseLock(wsDir, lock);
-        process.exit(0);
-      } catch (err) {
-        if (err instanceof ConflictError) {
-          process.exit(2);
-        }
-        process.exit(1);
-      }
-    `;
-
-    const goFile = path.join(os.tmpdir(), `wsg-stale-go-${process.pid}-${Date.now()}`);
-    // Spawn 3 parallel processes competing to reclaim the stale lock
-    const procs = Array.from({ length: 3 }, () =>
-      spawn('node', ['--input-type=module', '-e', childScript, '--', wsDir, goFile], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+    assert.equal(
+      winCount,
+      1,
+      `Exactly one reclaimer must successfully take over and exit 0; codes=${exitCodes}; stderr=${stderr.join(' | ')}`
     );
-
-    // Wait for children to be alive, then release the barrier.
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    fs.writeFileSync(goFile, 'go');
-    try {
-      const exitCodes = await Promise.all(
-        procs.map((p) => new Promise<number>((resolve) => p.on('exit', (code) => resolve(code ?? 1))))
-      );
-
-      const winCount = exitCodes.filter((code) => code === 0).length;
-      const conflictCount = exitCodes.filter((code) => code === 2).length;
-
-      assert.equal(winCount, 1, 'Exactly one reclaimer must successfully take over and exit 0');
-      assert.equal(conflictCount, 2, 'Other contenders must observe the new live lock and conflict with code 2');
-    } finally {
-      fs.rmSync(goFile, { force: true });
-    }
+    assert.equal(
+      conflictCount,
+      2,
+      `Other contenders must observe the new live lock and conflict with code 2; codes=${exitCodes}; stderr=${stderr.join(' | ')}`
+    );
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }

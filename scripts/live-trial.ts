@@ -92,10 +92,11 @@ try {
   } else {
     console.error(`No completed workspace to report (exit ${code}).`);
   }
-  process.exit(code === 0 ? 0 : 1);
+  // Set exitCode (not process.exit) so the finally cleanup below still runs.
+  process.exitCode = code === 0 ? 0 : 1;
 } catch (err) {
   console.error(`\nLive trial failed: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
+  process.exitCode = 1;
 } finally {
   fixture.cleanup();
   fs.rmSync(configDir, { recursive: true, force: true });
