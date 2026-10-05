@@ -17,7 +17,7 @@ Status: **Milestones 1–3 implemented.** Config, slugs/paths, manifest, documen
 ```bash
 # Explicit inputs (no model or credentials required):
 wsg create "port EMR mono to modular for new system" --name port-emr \
-  --repo ~/code/legacy-platform --repo ~/code/new-platform --code-root ~/code
+  --repo ~/code/legacy-platform --repo ~/code/new-platform
 cd ~/wsg/port-emr
 wsg explain      # read-only: saved repos, docs, exclusions, gaps, commands
 codex # or claude / pi
@@ -25,6 +25,11 @@ codex # or claude / pi
 # Autonomous discovery (no --repo): one read-only Pi Durable scout conversation
 # enumerates code roots, gathers evidence, and selects the smallest useful set.
 wsg create "port EMR mono to modular for new system" --name port-emr --code-root ~/code
+
+# Combined: explicit --repo inputs are always included (outside the roots and
+# without evidence), while --code-root also scouted for dependencies.
+wsg create "port EMR mono to modular for new system" --name port-emr \
+  --repo ~/code/new-platform --code-root ~/code
 
 # Planned (Milestone 4):
 # wsg add ~/code/emr-importer
@@ -34,29 +39,35 @@ wsg create "port EMR mono to modular for new system" --name port-emr --code-root
 
 ## Local Scouting (Milestone 3)
 
-When `create` is called without `--repo`, WSG runs one bounded, read-only scout
-conversation. It enumerates Git repositories under `--code-root` (default
-`~/code`), reads READMEs/manifests/agent instructions, runs bounded `rg`
-searches, and resolves local document mentions. The scout has no write, Git
-mutation, install, or arbitrary shell tool, and repository instructions are
-treated as data rather than authority.
+`create` runs one bounded, read-only scout conversation when it is called
+without `--repo`, or whenever `--code-root` is supplied. It enumerates Git
+repositories under the code roots (default `~/code`), reads
+READMEs/manifests/agent instructions, runs bounded `rg` searches, and resolves
+local document mentions. The scout has no write, Git mutation, install, or
+arbitrary shell tool, and repository instructions are treated as data rather
+than authority.
 
 Selection is evidence-based: every automatically discovered repository must
-cite a real repository-relative file and a quoted snippet that is verified
-against the file, otherwise the run stops with an actionable error. The scout
-selects at most `max_discovered_repos` (default 5) automatically discovered
-repositories; explicit `--repo` inputs are always included and are not counted.
-Selections that name more than one target are reported as ambiguous (exit 2)
-and never materialize an arbitrary target.
+cite a repository-relative file that retrieval or a read/search tool actually
+observed, with a quoted snippet verified against the file. Unseen or fictional
+evidence stops the run with an actionable error. The scout selects at most
+`max_discovered_repos` (default 5) automatically discovered repositories;
+explicit `--repo` inputs are always included, are not counted against the cap,
+and need no evidence. Selections that name more than one target are reported as
+ambiguous (exit 2) and never materialize an arbitrary target.
 
-Scout state is checkpointed under `<workspace-root>/.wsg-scout/<name>/` using
-real SQLite persistence, and copied to `.wsg/runtime.sqlite` after a successful
-assembly. An interrupted scout resumes with the same command plus `--resume`.
+Scout tool/read/search budgets are finite and durably accounted
+(`scout-budget.json`), so an uncooperative model is stopped deterministically
+and a resumed run continues the same accounting. Scout state is checkpointed
+under `<workspace-root>/.wsg-scout/<name>/` using real SQLite persistence, and
+copied into `.wsg/` after a successful assembly. Resume refuses to replay a
+selection when the request, context, documents, code roots, or repositories
+changed.
 
 `--dry-run` shows the plan without creating the target workspace. Discovery
 caches runtime state outside the target. If the pinned Pi Durable packages are
 not installed, autonomous scouting reports the blocker and explicit `--repo`
-creation still works.
+creation (without `--code-root`) still works offline.
 
 
 Each feature gets an independent directory. There are no nested workspace groups or workspace orchestration in the MVP.

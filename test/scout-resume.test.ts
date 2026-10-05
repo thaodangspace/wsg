@@ -8,6 +8,7 @@ import { enumerateRepos } from '../src/discovery.ts';
 import { PiScout, SCOUT_DB_FILENAME, SCOUT_TOOL_NAMES } from '../src/pi-scout.ts';
 import { runCreate } from '../src/create.ts';
 import { parseManifest } from '../src/manifest.ts';
+import { ConflictError } from '../src/errors.ts';
 
 let piAvailable = true;
 try {
@@ -132,5 +133,72 @@ test('the scout toolset is read-only and never exposes write or shell tools', ()
   assert.deepEqual(SCOUT_TOOL_NAMES, ['list_repos', 'read_file', 'rg_search', 'submit_selection']);
   for (const name of SCOUT_TOOL_NAMES) {
     assert.doesNotMatch(name, /write|edit|shell|exec|run|install|delete|remove|git/i);
+  }
+});
+
+test('resuming scouting with a changed task conflicts instead of replaying the old selection', { skip }, async () => {
+  const fixture = makeEmrFixture();
+  const stateDir = path.join(fixture.workspaceRoot, '.wsg-scout', 'identity');
+  try {
+    const discovery = enumerateRepos([fixture.codeRoot]);
+    const first = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: [
+        {
+          tool: 'submit_selection',
+          args: {
+            repos: [
+              {
+                source: fixture.names.legacy,
+                intent: 'source',
+                reason: 'legacy',
+                evidence: [
+                  {
+                    file: 'src/emr/MedicalRecord.ts',
+                    lines: [1, 3],
+                    summary: 'MedicalRecord',
+                    quote: 'export class MedicalRecord',
+                  },
+                ],
+              },
+            ],
+            exclusions: [],
+            gaps: [],
+            context: [],
+          },
+        },
+      ],
+    });
+    await first.scout({
+      request: 'Port EMR from monolith to modular',
+      codeRoots: [fixture.codeRoot],
+      stateDir,
+    });
+    assert.ok(fs.existsSync(path.join(stateDir, 'selection.json')));
+
+    const changed = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: [{ tool: 'submit_selection', args: { repos: [], exclusions: [], gaps: [], context: [] } }],
+    });
+    await assert.rejects(
+      () =>
+        runCreate(
+          {
+            request: 'A completely different migration task',
+            name: 'identity',
+            root: fixture.workspaceRoot,
+            codeRoots: [fixture.codeRoot],
+            scout: changed,
+            resume: true,
+          },
+          io
+        ),
+      (err: unknown) => err instanceof ConflictError && /does not match/.test(err.message)
+    );
+    assert.equal(fs.existsSync(path.join(fixture.workspaceRoot, 'identity')), false);
+  } finally {
+    fixture.cleanup();
   }
 });

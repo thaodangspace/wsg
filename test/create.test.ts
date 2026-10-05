@@ -765,32 +765,24 @@ test('Submodule/LFS fixture -> discovery.gaps in manifest and context', async ()
   }
 });
 
-test('--code-root -> stderr note (PD6)', async () => {
-  const repo = createTestRepo({ prefix: 'wsg-coderoot-' });
+test('--code-root without --repo is routed to autonomous discovery', async () => {
+  // Explicit --repo inputs keep the offline path; --code-root enables discovery.
+  // This exercises the routing decision only; the scout itself is covered by the
+  // M3 autonomous tests with an injected/real scout.
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
-
+  const codeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-empty-code-'));
   try {
-    const result = await runMain([
-      'create',
-      'code root note test',
-      '--name',
-      'coderoot-ws',
-      '--root',
-      tmpRoot,
-      '--repo',
-      repo.dir,
-      '--code-root',
-      '/tmp/code',
-    ]);
-
-    assert.equal(result.exitCode, 0);
-    assert.match(result.stderr, /wsg: note: --code-root is ignored because explicit --repo/);
-
-    const wsDir = path.join(tmpRoot, 'coderoot-ws');
-    assert.ok(fs.existsSync(path.join(wsDir, 'workspace.yaml')));
+    const result = await runMain(
+      ['create', 'code root routing', '--name', 'route-ws', '--root', tmpRoot, '--code-root', codeRoot],
+      { env: { ...process.env, WSG_CONFIG: path.join(tmpRoot, 'no-config.yaml') } }
+    );
+    // No repositories under the empty root: a bounded, actionable discovery error.
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /No git repositories found under configured code roots/);
+    assert.equal(fs.existsSync(path.join(tmpRoot, 'route-ws')), false);
   } finally {
-    repo.cleanup();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(codeRoot, { recursive: true, force: true });
   }
 });
 

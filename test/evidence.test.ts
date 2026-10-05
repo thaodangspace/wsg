@@ -64,7 +64,7 @@ test('validateEvidenceItem rejects missing files, bad ranges, fictional quotes, 
     );
     assert.throws(
       () => validateEvidenceItem(allowed, { ...base, file: 'node_modules/x.ts' }),
-      /vendor path/
+      /vendor\/build directory/
     );
     assert.throws(
       () => validateEvidenceItem(allowed, { ...base, file: '../secret.ts' }),
@@ -89,7 +89,9 @@ test('validateScoutSelection requires evidence for discovered selections and res
       ],
       docs: [],
     };
-    const validated = validateScoutSelection(selection, allowed);
+    const validated = validateScoutSelection(selection, allowed, {
+      observed: new Map([[repo.dir, new Set(['src/a.ts'])]]),
+    });
     assert.equal(validated.repos.length, 1);
     assert.equal(validated.repos[0].source, repo.dir);
     assert.equal(validated.repos[0].intent, 'target');
@@ -109,7 +111,7 @@ test('validateScoutSelection rejects unknown repositories and evidence-free sele
           { kind: 'selection', repos: [{ source: '/nope', evidence: [] }], docs: [] },
           allowed
         ),
-      /was not enumerated/
+      /neither an explicit --repo input nor enumerated/
     );
 
     assert.throws(
@@ -121,13 +123,16 @@ test('validateScoutSelection rejects unknown repositories and evidence-free sele
       /without evidence/
     );
 
-    // Explicit (user) repos may legitimately carry no evidence.
-    const explicit = validateScoutSelection(
-      { kind: 'selection', repos: [{ source: 'ev', addedBy: 'user' }], docs: [] },
-      allowed
+    // Explicit allowed entries may legitimately carry no evidence (covered by
+    // the dedicated explicit-repository test).
+    assert.throws(
+      () =>
+        validateScoutSelection(
+          { kind: 'selection', repos: [{ source: 'ev', addedBy: 'user' }], docs: [] },
+          allowed
+        ),
+      /without evidence/
     );
-    assert.equal(explicit.repos[0].addedBy, 'user');
-    assert.deepEqual(explicit.repos[0].evidence, []);
   } finally {
     repo.cleanup();
   }
@@ -138,6 +143,7 @@ test('findTargetAmbiguity flags more than one target repository', () => {
     name: 'x',
     source: '/x',
     addedBy: 'scout' as const,
+    explicit: false,
     reason: 'r',
     evidence: [],
   };
@@ -175,3 +181,81 @@ test('validateEvidenceItem surfaces a UsageError for empty summaries', () => {
     repo.cleanup();
   }
 });
+
+test('validateEvidenceItem rejects intermediate directory symlink escapes', () => {
+  const repo = createTestRepo({ prefix: 'wsg-ev-intermediate-', files: { 'sub/real.ts': 'export const real = 1;\n' } });
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-ev-outside-'));
+  fs.writeFileSync(path.join(outside, 'secret.ts'), 'export const secret = 1;\n');
+  fs.symlinkSync(outside, path.join(repo.dir, 'escape'));
+  try {
+    const allowed: AllowedRepo = { name: 'ev', source: repo.dir };
+    assert.throws(
+      () => validateEvidenceItem(allowed, { file: 'escape/secret.ts', summary: 's', quote: 'secret' }),
+      /not confined|escapes/
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('validateEvidenceItem rejects multi-level vendor paths and .pem secrets', () => {
+  const repo = createTestRepo({
+    prefix: 'wsg-ev-vendor-',
+    files: { 'src/node_modules/x.ts': 'export const x = 1;\n', 'key.pem': 'PRIVATE\n' },
+  });
+  try {
+    const allowed: AllowedRepo = { name: 'ev', source: repo.dir };
+    assert.throws(
+      () => validateEvidenceItem(allowed, { file: 'src/node_modules/x.ts', summary: 's', quote: 'x' }),
+      /vendor\/build directory/
+    );
+    assert.throws(
+      () => validateEvidenceItem(allowed, { file: 'key.pem', summary: 's', quote: 'PRIVATE' }),
+      /secret-like/
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test('validateEvidenceItem refuses unseen evidence unless it was observed', () => {
+  const repo = createTestRepo({
+    prefix: 'wsg-ev-unseen-',
+    files: { 'src/real.ts': 'export const real = 1;\n' },
+  });
+  try {
+    const allowed: AllowedRepo = { name: 'ev', source: repo.dir };
+    const item = { file: 'src/real.ts', summary: 's', quote: 'export const real' };
+
+    assert.throws(
+      () => validateEvidenceItem(allowed, item, { observed: new Map() }),
+      /never retrieved or observed/
+    );
+
+    const observed = new Map<string, ReadonlySet<string>>([[repo.dir, new Set(['src/real.ts'])]]);
+    const evidence = validateEvidenceItem(allowed, item, { observed });
+    assert.deepEqual(evidence, { file: 'src/real.ts', summary: 's' });
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test('validateScoutSelection accepts explicit repositories outside the roots without evidence', () => {
+  const allowed: AllowedRepo[] = [
+    { name: 'outside', source: '/outside', explicit: true },
+  ];
+  const validated = validateScoutSelection(
+    {
+      kind: 'selection',
+      repos: [{ source: '/outside', intent: 'target', reason: 'user supplied' }],
+      docs: [],
+    },
+    allowed
+  );
+  assert.equal(validated.repos.length, 1);
+  assert.equal(validated.repos[0].explicit, true);
+  assert.equal(validated.repos[0].addedBy, 'user');
+  assert.deepEqual(validated.repos[0].evidence, []);
+});
+

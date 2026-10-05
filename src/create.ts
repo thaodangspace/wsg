@@ -55,7 +55,12 @@ import { reconcileGenerated, type ReconcileResult } from './ownership.ts';
 import { renderAll } from './generate.ts';
 import { writeFileAtomic, ensureDir, sha256 } from './fsx.ts';
 import { faultPoint } from './faults.ts';
-import { ExplicitScout, type Scout, type ScoutResult } from './scout.ts';
+import {
+  ExplicitScout,
+  type Scout,
+  type ScoutOptions,
+  type ScoutResult,
+} from './scout.ts';
 import type { CliIO } from './cli.ts';
 import { enumerateRepos, type DiscoveredRepo } from './discovery.ts';
 import { retrieveEvidence } from './retrieve.ts';
@@ -63,15 +68,22 @@ import {
   validateScoutSelection,
   findTargetAmbiguity,
   type ValidatedSelection,
+  type AllowedRepo,
 } from './evidence.ts';
-import { PiScout } from './pi-scout.ts';
+import {
+  PiScout,
+  SCOUT_META_FILENAME,
+  SCOUT_BUDGET_FILENAME,
+  SCOUT_CHECKPOINT_FILENAME,
+  SCOUT_DB_FILENAME,
+} from './pi-scout.ts';
 
 export const CREATE_HELP_TEXT = `Usage: wsg create <request> [options]
 
 Options:
   --name <name>                  Workspace directory name
   --root <dir>                   Output root directory (default: ~/wsg)
-  --repo <path>                  Add a repository (repeatable; skips discovery)
+  --repo <path>                  Add a repository (repeatable; always included)
   --doc <path-or-url>            Add a document or URL (repeatable)
   --context <text>               Add task context line (repeatable)
   --code-root <dir>              Code discovery root (repeatable)
@@ -730,7 +742,9 @@ async function executeResume(
     const hasScoutState =
       fs.existsSync(path.join(stateDir, 'runtime.sqlite')) ||
       fs.existsSync(path.join(stateDir, 'selection.json'));
-    if ((options.repos?.length ?? 0) === 0 && hasScoutState) {
+    const willScout =
+      (options.repos?.length ?? 0) === 0 || (options.codeRoots?.length ?? 0) > 0;
+    if (willScout && hasScoutState) {
       return await executeAutonomousCreate(
         {
           request: options.request ?? '',
@@ -1681,7 +1695,6 @@ async function executeCreate(
   options: CreateOptions,
   io: CliIO = {}
 ): Promise<number> {
-  const stderr = io.stderr ?? process.stderr;
   const cwd = getCwd(io);
 
   // (a) Preflight validations before any mutation
@@ -1719,16 +1732,13 @@ async function executeCreate(
   const wsDir = path.resolve(resolvedRoot, wsName);
   const adapters = settings.adapters as ManifestAdapter[];
 
-  // 2. Note on --code-root (PD6): only meaningful when repositories are
-  // explicit; autonomous discovery now consumes --code-root.
-  if (options.codeRoots && options.codeRoots.length > 0 && (options.repos?.length ?? 0) > 0) {
-    stderr.write(
-      'wsg: note: --code-root is ignored because explicit --repo inputs were supplied; remove --repo to enable autonomous discovery\n'
-    );
-  }
-
+  // Routing (repo spec §6): without --code-root, explicit --repo inputs keep
+  // the offline, model-free path. With --code-root, discovery runs as well:
+  // explicit repositories are included separately and never require evidence,
+  // while auto-discovered candidates are capped and evidence-validated.
   const explicitRepos = options.repos ?? [];
-  if (explicitRepos.length === 0) {
+  const cliCodeRoots = options.codeRoots ?? [];
+  if (explicitRepos.length === 0 || cliCodeRoots.length > 0) {
     return await executeAutonomousCreate(
       { request, wsName, wsDir, resolvedRoot, adapters, cwd },
       options,
@@ -1865,10 +1875,13 @@ export function scoutStateDirFor(root: string, name: string): string {
  * scout conversation with read-only tools, evidence validation, ambiguity
  * handling, and the same deterministic materialization as explicit create.
  *
+ * Explicit `--repo` inputs are always included (even outside the code roots and
+ * without evidence) and are never counted against the auto-discovered cap.
+ *
  * The scout conversation is checkpointed under
- * `<workspace-root>/.wsg-scout/<name>/` and copied into `.wsg/runtime.sqlite`
- * after a successful assembly so an interrupted scout can resume without
- * re-executing committed tool calls.
+ * `<workspace-root>/.wsg-scout/<name>/` and copied into `.wsg/` after a
+ * successful assembly so an interrupted scout can resume without re-executing
+ * committed tool calls.
  */
 async function executeAutonomousCreate(
   ctx: AutonomousContext,
@@ -1886,6 +1899,16 @@ async function executeAutonomousCreate(
 
   const discovery = enumerateRepos(codeRoots);
   const stateDir = options.scoutStateDir ?? scoutStateDirFor(ctx.resolvedRoot, ctx.wsName);
+
+  // Explicit repositories are mandatory, may live outside the code roots, and
+  // are never counted against the discovery cap.
+  const explicitCanonical = new Map<string, string>();
+  for (const raw of options.repos ?? []) {
+    const expanded = expandHome(raw);
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+    const canonical = canonicalize(resolved);
+    if (!explicitCanonical.has(canonical)) explicitCanonical.set(canonical, raw);
+  }
 
   // Readable supplied documents feed retrieval and mention resolution. Missing
   // or secret-like documents are still validated later by document planning.
@@ -1910,32 +1933,43 @@ async function executeAutonomousCreate(
     rgPath: options.rgPath,
   });
 
-  const scout: Scout =
-    options.scout ??
-    new PiScout({
-      discovered: discovery.repos,
-      retrieval,
-      explicitSources: [],
-      suppliedDocs,
-      provider: settings.scout.provider,
-      model: settings.scout.model,
-      maxToolCalls: options.maxScoutToolCalls,
-      rgPathForTests: options.rgPath,
-    });
-
-  if (discovery.repos.length === 0) {
-    const reasons = [...discovery.gaps, ...retrieval.gaps];
-    throw new UsageError(
-      `No git repositories found under configured code roots (${codeRoots.join(', ')})` +
-        (reasons.length > 0 ? `:\n  ${reasons.join('\n  ')}` : '')
-    );
+  // The read model includes discovered repos plus explicit repos so the
+  // read-only tools can inspect explicit sources outside the roots too.
+  const readableRepos: DiscoveredRepo[] = [...discovery.repos];
+  for (const source of explicitCanonical.keys()) {
+    if (!readableRepos.some((r) => r.source === source)) {
+      readableRepos.push({ name: path.basename(source), source, gitKind: 'dir' });
+    }
   }
 
-  stderr.write(
-    `wsg: scouting ${discovery.repos.length} repositor${discovery.repos.length === 1 ? 'y' : 'ies'} under ${codeRoots.join(', ')}\n`
-  );
+  // Durable observed-evidence tracking: retrieval files/matches plus anything
+  // a read-only tool actually read or matched.
+  const observed = new Map<string, Set<string>>();
+  const recordObserved = (source: string, relPath: string) => {
+    let set = observed.get(source);
+    if (!set) {
+      set = new Set();
+      observed.set(source, set);
+    }
+    set.add(path.posix.normalize(relPath));
+  };
+  for (const corpus of retrieval.repos.values()) {
+    for (const relPath of corpus.files.keys()) recordObserved(corpus.source, relPath);
+    for (const match of corpus.matches) recordObserved(corpus.source, match.relPath);
+  }
 
-  const scoutResult = await scout.scout({
+  // Explicit allowed entries come first so an explicit source wins over the
+  // same auto-discovered repository when resolving a selection.
+  const allowed: AllowedRepo[] = [
+    ...[...explicitCanonical.keys()].map((source) => ({
+      name: path.basename(source),
+      source,
+      explicit: true,
+    })),
+    ...discovery.repos.map((r) => ({ name: r.name, source: r.source })),
+  ];
+
+  const scoutOptions: ScoutOptions = {
     request: ctx.request,
     docs: options.docs,
     context: options.context,
@@ -1944,7 +1978,37 @@ async function executeAutonomousCreate(
     maxDiscoveredRepos: settings.max_discovered_repos,
     resume: options.resume,
     env: io.env,
-  });
+  };
+
+  let scoutResult: ScoutResult;
+  if (discovery.repos.length === 0 && explicitCanonical.size === 0) {
+    const reasons = [...discovery.gaps, ...retrieval.gaps];
+    throw new UsageError(
+      `No git repositories found under configured code roots (${codeRoots.join(', ')})` +
+        (reasons.length > 0 ? `:\n  ${reasons.join('\n  ')}` : '')
+    );
+  } else if (options.scout) {
+    scoutResult = await options.scout.scout(scoutOptions);
+  } else if (discovery.repos.length > 0) {
+    const scout = new PiScout({
+      discovered: readableRepos,
+      retrieval,
+      explicitSources: [...explicitCanonical.values()],
+      suppliedDocs,
+      provider: settings.scout.provider,
+      model: settings.scout.model,
+      maxToolCalls: options.maxScoutToolCalls,
+      rgPathForTests: options.rgPath,
+      onObserve: recordObserved,
+    });
+    stderr.write(
+      `wsg: scouting ${discovery.repos.length} repositor${discovery.repos.length === 1 ? 'y' : 'ies'} under ${codeRoots.join(', ')}\n`
+    );
+    scoutResult = await scout.scout(scoutOptions);
+  } else {
+    // Nothing to discover; materialize the explicit inputs offline.
+    scoutResult = { kind: 'selection', repos: [], docs: [], excluded: [], gaps: [] };
+  }
 
   if (scoutResult.kind === 'none') {
     throw new UsageError(scoutResult.reason);
@@ -1956,10 +2020,10 @@ async function executeAutonomousCreate(
     ]);
   }
 
-  // Validate every citation against the real repository contents. Fictional
-  // evidence and unreachable repositories fail before any materialization.
-  const allowed = discovery.repos.map((r) => ({ name: r.name, source: r.source }));
-  const validated = validateScoutSelection(scoutResult, allowed);
+  // Validate every discovered citation against the real, actually-observed
+  // repository contents. Fictional/unseen evidence and unreachable repositories
+  // fail before any materialization; explicit inputs need no evidence.
+  const validated = validateScoutSelection(scoutResult, allowed, { observed });
 
   const ambiguity = findTargetAmbiguity(validated);
   if (ambiguity) {
@@ -1969,13 +2033,7 @@ async function executeAutonomousCreate(
     ]);
   }
 
-  // Explicit repositories are mandatory and never counted against the cap.
-  const explicitCanonical = new Map<string, string>();
-  for (const raw of options.repos ?? []) {
-    const expanded = expandHome(raw);
-    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
-    explicitCanonical.set(canonicalize(resolved), raw);
-  }
+  const validatedBySource = new Map(validated.repos.map((r) => [r.source, r]));
 
   const chosen: Array<{
     name: string;
@@ -1986,24 +2044,26 @@ async function executeAutonomousCreate(
     reason: string;
   }> = [];
 
+  // Explicit repositories are always included and keep any role/evidence the
+  // scout inferred for the same source.
   for (const source of explicitCanonical.keys()) {
-    const name = path.basename(source);
+    const inferred = validatedBySource.get(source);
     chosen.push({
-      name,
+      name: path.basename(source),
       source,
-      intent: 'unspecified',
+      intent: inferred?.intent ?? 'unspecified',
       added_by: 'user',
-      evidence: [],
-      reason: 'Explicit repository supplied by the user.',
+      evidence: inferred?.evidence ?? [],
+      reason: inferred?.reason ?? 'Explicit repository supplied by the user.',
     });
   }
 
   const cap = settings.max_discovered_repos;
-  let scoutsIncluded = 0;
+  let autoIncluded = 0;
   let capApplied = false;
   for (const repo of validated.repos) {
-    if (explicitCanonical.has(repo.source)) continue;
-    if (scoutsIncluded >= cap) {
+    if (repo.explicit || explicitCanonical.has(repo.source)) continue;
+    if (autoIncluded >= cap) {
       capApplied = true;
       continue;
     }
@@ -2015,7 +2075,7 @@ async function executeAutonomousCreate(
       evidence: repo.evidence,
       reason: repo.reason,
     });
-    scoutsIncluded++;
+    autoIncluded++;
   }
 
   const allGaps: string[] = [...discovery.gaps, ...retrieval.gaps, ...validated.gaps];
@@ -2036,6 +2096,11 @@ async function executeAutonomousCreate(
   const repos: AssemblyRepo[] = [];
   for (const repo of chosen) {
     const info = repoInfo(repo.source);
+    if (repo.source !== info.toplevel) {
+      throw new UsageError(
+        `Path '${repo.source}' is a subdirectory of git repository at '${info.toplevel}'. Please specify the repository root: --repo ${info.toplevel}`
+      );
+    }
     const entryName = entryNames.get(repo.source)!;
     const branch = `wsg/${ctx.wsName}/${entryName}`;
     if (!checkBranchName(branch)) {
@@ -2103,18 +2168,21 @@ async function executeAutonomousCreate(
 
   const code = await runAssembly(assembly, options, io);
 
-  // Preserve the real scout transcript/checkpoint in the workspace runtime
-  // storage once the workspace exists (best-effort; the conversation file is
+  // Preserve the real scout transcript, checkpoint, identity and budget in the
+  // workspace runtime storage once the workspace exists (best-effort; these are
   // disposable for using the workspace).
   if (!options.dryRun && fs.existsSync(path.join(ctx.wsDir, '.wsg'))) {
     try {
-      const dbPath = path.join(stateDir, 'runtime.sqlite');
-      if (fs.existsSync(dbPath)) {
-        fs.copyFileSync(dbPath, path.join(ctx.wsDir, '.wsg', 'runtime.sqlite'));
-      }
-      const checkpoint = path.join(stateDir, 'selection.json');
-      if (fs.existsSync(checkpoint)) {
-        fs.copyFileSync(checkpoint, path.join(ctx.wsDir, '.wsg', 'scout.json'));
+      const copies: Array<[string, string]> = [
+        [path.join(stateDir, SCOUT_DB_FILENAME), 'runtime.sqlite'],
+        [path.join(stateDir, SCOUT_CHECKPOINT_FILENAME), 'scout.json'],
+        [path.join(stateDir, SCOUT_META_FILENAME), 'scout-meta.json'],
+        [path.join(stateDir, SCOUT_BUDGET_FILENAME), 'scout-budget.json'],
+      ];
+      for (const [from, to] of copies) {
+        if (fs.existsSync(from)) {
+          fs.copyFileSync(from, path.join(ctx.wsDir, '.wsg', to));
+        }
       }
     } catch {
       // runtime storage is a convenience, not a requirement for the workspace
@@ -2123,6 +2191,7 @@ async function executeAutonomousCreate(
 
   return code;
 }
+
 
 
 /**

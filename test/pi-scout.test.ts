@@ -5,8 +5,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { createTestRepo } from './helpers/git-fixture.ts';
 import { enumerateRepos } from '../src/discovery.ts';
-import { PiScout, confinedRepoFile, SCOUT_DB_FILENAME, SCOUT_CHECKPOINT_FILENAME } from '../src/pi-scout.ts';
-import { UsageError } from '../src/errors.ts';
+import {
+  PiScout,
+  confinedRepoFile,
+  SCOUT_DB_FILENAME,
+  SCOUT_CHECKPOINT_FILENAME,
+  SCOUT_BUDGET_FILENAME,
+} from '../src/pi-scout.ts';
+import { UsageError, ConflictError } from '../src/errors.ts';
 
 let piAvailable = true;
 try {
@@ -74,6 +80,40 @@ test('PiScout runs one real Pi Durable conversation and persists a checkpoint', 
     }
     assert.ok(fs.existsSync(path.join(stateDir, SCOUT_DB_FILENAME)), 'SQLite checkpoint must exist');
     assert.ok(fs.existsSync(path.join(stateDir, SCOUT_CHECKPOINT_FILENAME)), 'selection checkpoint must exist');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
+  }
+});
+
+test('rg_search returns matching files through the real harness tool', { skip }, async () => {
+  const { codeRoot, repo } = setupRepo();
+  fs.writeFileSync(path.join(repo.dir, 'secret.pem'), 'Widget private material\n');
+  const stateDir = path.join(tmp('wsg-pi-rg-'), 'scout');
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const observed: string[] = [];
+    const scout = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      onObserve: (_source, relPath) => observed.push(relPath),
+      fauxScript: [
+        { tool: 'rg_search', args: { query: 'Widget', repo: 'widget-repo' } },
+        { tool: 'submit_selection', args: selectionPayload },
+      ],
+    });
+
+    const result = await scout.scout({ request: 'find widget', codeRoots: [codeRoot], stateDir });
+    assert.equal(result.kind, 'selection');
+    assert.ok(
+      observed.some((p) => p === 'src/Widget.ts'),
+      `rg_search must report the matching source file, observed=${JSON.stringify(observed)}`
+    );
+    assert.ok(
+      !observed.some((p) => p.endsWith('.pem')),
+      'rg_search must not surface secret-like files'
+    );
   } finally {
     repo.cleanup();
     fs.rmSync(codeRoot, { recursive: true, force: true });
@@ -157,6 +197,40 @@ test('PiScout resumes from the SQLite checkpoint after a simulated crash', { ski
   }
 });
 
+test('PiScout refuses to replay a cached selection for a changed request', { skip }, async () => {
+  const { codeRoot, repo } = setupRepo();
+  const stateDir = path.join(tmp('wsg-pi-identity-'), 'scout');
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const first = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: [{ tool: 'submit_selection', args: selectionPayload }],
+    });
+    await first.scout({ request: 'port widget', codeRoots: [codeRoot], stateDir });
+
+    const changed = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: [{ tool: 'submit_selection', args: selectionPayload }],
+    });
+    await assert.rejects(
+      () =>
+        changed.scout({
+          request: 'a completely different task',
+          codeRoots: [codeRoot],
+          stateDir,
+          resume: true,
+        }),
+      (err: unknown) => err instanceof ConflictError && /does not match/.test(err.message)
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
+  }
+});
+
 test('PiScout reuses a completed checkpoint on resume without reopening the harness', { skip }, async () => {
   const { codeRoot, repo } = setupRepo();
   const stateDir = path.join(tmp('wsg-pi-cache-'), 'scout');
@@ -186,14 +260,83 @@ test('PiScout reuses a completed checkpoint on resume without reopening the harn
   }
 });
 
-test('read tool confinement refuses traversal, absolute paths, and symlink escapes', () => {
+test('an uncooperative provider is stopped by the durable tool budget', { skip }, async () => {
   const { codeRoot, repo } = setupRepo();
+  const stateDir = path.join(tmp('wsg-pi-budget-'), 'scout');
   try {
     const discovery = enumerateRepos([codeRoot]);
-    const outside = path.join(os.tmpdir(), 'wsg-pi-outside.txt');
-    fs.writeFileSync(outside, 'secret');
-    const escape = path.join(repo.dir, 'escape.txt');
-    fs.symlinkSync(outside, escape);
+    const scout = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      maxToolCalls: 1,
+      // The provider only ever calls list_repos; it never submits.
+      fauxScript: [{ tool: 'list_repos', args: {} }],
+    });
+    const result = await scout.scout({ request: 'uncooperative', codeRoots: [codeRoot], stateDir });
+    assert.equal(result.kind, 'none');
+    if (result.kind === 'none') {
+      assert.match(result.reason, /budget/);
+    }
+    const budget = JSON.parse(fs.readFileSync(path.join(stateDir, SCOUT_BUDGET_FILENAME), 'utf8'));
+    assert.match(String(budget.exhausted), /budget/);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
+  }
+});
+
+test('a resumed scout past an exhausted budget performs no further work', { skip }, async () => {
+  const { codeRoot, repo } = setupRepo();
+  const stateDir = path.join(tmp('wsg-pi-budget-resume-'), 'scout');
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const first = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      maxToolCalls: 1,
+      fauxScript: [{ tool: 'list_repos', args: {} }],
+    });
+    const firstResult = await first.scout({ request: 'uncooperative', codeRoots: [codeRoot], stateDir });
+    assert.equal(firstResult.kind, 'none');
+
+    // Simulate resuming after a crash that lost the completed checkpoint but
+    // kept the durable budget accounting.
+    fs.rmSync(path.join(stateDir, SCOUT_CHECKPOINT_FILENAME), { force: true });
+
+    const observed: string[] = [];
+    const resumed = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      onObserve: (_s, p) => observed.push(p),
+      // Would submit if the harness ran; the exhausted budget must prevent that.
+      fauxScript: [{ tool: 'submit_selection', args: selectionPayload }],
+    });
+    const result = await resumed.scout({
+      request: 'uncooperative',
+      codeRoots: [codeRoot],
+      stateDir,
+      resume: true,
+    });
+    assert.equal(result.kind, 'none');
+    assert.match(result.kind === 'none' ? result.reason : '', /budget/);
+    assert.deepEqual(observed, [], 'no tools may run when the durable budget is exhausted');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
+  }
+});
+
+test('read tool confinement refuses traversal, absolute paths, symlink escapes, and secrets', () => {
+  const { codeRoot, repo } = setupRepo();
+  let outside: string | undefined;
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    outside = tmp('wsg-pi-outside-');
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
+    fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(repo.dir, 'escape.txt'));
+    fs.symlinkSync(outside, path.join(repo.dir, 'escape-dir'));
 
     assert.throws(
       () => confinedRepoFile(discovery.repos, 'widget-repo', '../outside.txt'),
@@ -205,7 +348,7 @@ test('read tool confinement refuses traversal, absolute paths, and symlink escap
     );
     assert.throws(
       () => confinedRepoFile(discovery.repos, 'widget-repo', 'node_modules/x.ts'),
-      /vendor path/
+      /vendor/
     );
     assert.throws(
       () => confinedRepoFile(discovery.repos, 'widget-repo', '.env'),
@@ -213,43 +356,20 @@ test('read tool confinement refuses traversal, absolute paths, and symlink escap
     );
     assert.throws(
       () => confinedRepoFile(discovery.repos, 'widget-repo', 'escape.txt'),
-      /symlinks|outside/
+      /outside|symlink/
+    );
+    assert.throws(
+      () => confinedRepoFile(discovery.repos, 'widget-repo', 'escape-dir/secret.txt'),
+      /outside|symlink/
     );
     assert.throws(() => confinedRepoFile(discovery.repos, 'nope', 'README.md'), /Unknown repository/);
 
     const valid = confinedRepoFile(discovery.repos, 'widget-repo', 'README.md');
     assert.equal(valid.repo.source, fs.realpathSync(repo.dir));
-
-    fs.unlinkSync(escape);
-    fs.unlinkSync(outside);
   } finally {
     repo.cleanup();
+    if (outside) fs.rmSync(outside, { recursive: true, force: true });
     fs.rmSync(codeRoot, { recursive: true, force: true });
-  }
-});
-
-test('PiScout bounds the number of tool turns and still terminates with a result', { skip }, async () => {
-  const { codeRoot, repo } = setupRepo();
-  const stateDir = path.join(tmp('wsg-pi-turn-'), 'scout');
-  try {
-    const discovery = enumerateRepos([codeRoot]);
-    const scout = new PiScout({
-      discovered: discovery.repos,
-      provider: 'faux',
-      maxToolCalls: 1,
-      fauxScript: [
-        { tool: 'list_repos', args: {} },
-        { tool: 'list_repos', args: {} },
-        { tool: 'list_repos', args: {} },
-        { tool: 'submit_selection', args: selectionPayload },
-      ],
-    });
-    const result = await scout.scout({ request: 'bounded', codeRoots: [codeRoot], stateDir });
-    assert.equal(result.kind, 'selection');
-  } finally {
-    repo.cleanup();
-    fs.rmSync(codeRoot, { recursive: true, force: true });
-    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
   }
 });
 

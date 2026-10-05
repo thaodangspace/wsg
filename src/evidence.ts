@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { UsageError } from './errors.ts';
-import { assertConfinedRelative, canonicalize } from './paths.ts';
+import { assertConfinedRelative, canonicalize, resolveInside } from './paths.ts';
 import { VENDOR_DIR_NAMES, type DiscoveredRepo } from './discovery.ts';
 import { isSecretFilename } from './documents.ts';
 import type { Evidence, Intent } from './manifest.ts';
@@ -15,11 +15,18 @@ import type {
 export interface AllowedRepo {
   name: string;
   source: string;
+  /** Explicit `--repo` inputs may live outside the code roots and need no evidence. */
+  explicit?: boolean;
 }
+
+/** Repository-relative paths actually retrieved or observed by the scout. */
+export type EvidenceObservation = ReadonlyMap<string, ReadonlySet<string>>;
 
 export interface EvidenceValidationOptions {
   /** Maximum bytes read from a single file while validating evidence. */
   maxFileBytes?: number;
+  /** Files actually retrieved/observed, keyed by canonical repository source. */
+  observed?: EvidenceObservation;
 }
 
 export interface ValidatedRepoSelection {
@@ -27,6 +34,7 @@ export interface ValidatedRepoSelection {
   source: string;
   intent: Intent;
   addedBy: 'scout' | 'user';
+  explicit: boolean;
   reason: string;
   evidence: Evidence[];
 }
@@ -58,13 +66,25 @@ function resolveAllowed(
   return allowed.find((r) => r.source === canonicalRaw);
 }
 
+function assertNoVendorSegments(repoName: string, normalized: string): void {
+  const segments = normalized.split('/').slice(0, -1);
+  const vendorSegment = segments.find((segment) => VENDOR_DIR_NAMES.has(segment));
+  if (vendorSegment) {
+    throw new UsageError(
+      `Evidence for repo '${repoName}' cites path '${normalized}' under vendor/build directory '${vendorSegment}'`
+    );
+  }
+}
+
 /**
  * Validates one piece of scout evidence against the real repository contents.
  *
  * A citation must name a confined repository-relative file, an in-range line
  * selection (when lines are given), and a non-empty quote that actually occurs
- * within that file (and within the cited lines). Anything else is rejected as
- * fictional evidence (repo spec §6.5).
+ * within that file (and within the cited lines). Confinement is enforced with
+ * canonical realpath resolution for every path component, so an intermediate
+ * directory symlink cannot redirect a read outside the repository. Anything
+ * else is rejected as fictional evidence (repo spec §6.5).
  */
 export function validateEvidenceItem(
   repo: AllowedRepo,
@@ -74,12 +94,7 @@ export function validateEvidenceItem(
   const file = item.file;
   assertConfinedRelative(file, `evidence file for repo '${repo.name}'`);
   const normalized = path.posix.normalize(file);
-  const firstSegment = normalized.split('/')[0];
-  if (VENDOR_DIR_NAMES.has(firstSegment)) {
-    throw new UsageError(
-      `Evidence for repo '${repo.name}' cites vendor path '${file}', which is not part of the repository source`
-    );
-  }
+  assertNoVendorSegments(repo.name, normalized);
   if (isSecretFilename(normalized)) {
     throw new UsageError(
       `Evidence for repo '${repo.name}' cites secret-like file '${file}'`
@@ -89,10 +104,27 @@ export function validateEvidenceItem(
     throw new UsageError(`Evidence for repo '${repo.name}' in '${file}' is missing a summary`);
   }
 
-  const abs = path.resolve(repo.source, normalized);
-  const rel = path.relative(repo.source, abs);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new UsageError(`Evidence path '${file}' escapes repository '${repo.name}'`);
+  // Observed-evidence rule: a discovered selection may only cite files that
+  // retrieval or a read-only tool actually observed, never content the model
+  // claims to have seen.
+  if (!repo.explicit && options.observed) {
+    const observedForRepo = options.observed.get(repo.source);
+    if (!observedForRepo || !observedForRepo.has(normalized)) {
+      throw new UsageError(
+        `Evidence for repo '${repo.name}' cites '${file}', which was never retrieved or observed; refusing unseen evidence`
+      );
+    }
+  }
+
+  // Canonical, component-by-component confinement. This rejects an
+  // intermediate directory symlink that escapes the repository.
+  let abs: string;
+  try {
+    abs = resolveInside(repo.source, normalized);
+  } catch (err: unknown) {
+    throw new UsageError(
+      `Evidence path '${file}' for repo '${repo.name}' is not confined to the repository: ${(err as Error).message}`
+    );
   }
 
   let st: fs.Stats;
@@ -173,9 +205,13 @@ export function validateEvidenceItem(
 }
 
 /**
- * Validates a scout selection against the enumerated repository universe:
- * every selected repository must exist, every citation must verify, and
- * explicit repositories are preserved. Returns the validated selection.
+ * Validates a scout selection against the enumerated repository universe plus
+ * any explicit `--repo` inputs:
+ * - explicit repositories are mandatory, may live outside the code roots, and
+ *   do not require evidence;
+ * - every other selected repository must exist under the code roots with
+ *   verified, actually-observed evidence.
+ * Returns the validated selection.
  */
 export function validateScoutSelection(
   selection: ScoutSelection,
@@ -184,25 +220,28 @@ export function validateScoutSelection(
 ): ValidatedSelection {
   const repos: ValidatedRepoSelection[] = [];
   const seen = new Set<string>();
+  const observed = options.observed ?? new Map<string, ReadonlySet<string>>();
 
   for (const input of selection.repos) {
     const resolved = resolveAllowed(input.source, allowed);
     if (!resolved) {
       throw new UsageError(
-        `Scout selected repository '${input.source}', which was not enumerated under the configured code roots`
+        `Scout selected repository '${input.source}', which is neither an explicit --repo input nor enumerated under the configured code roots`
       );
     }
     if (seen.has(resolved.source)) continue;
     seen.add(resolved.source);
 
+    const explicit = resolved.explicit === true;
+    const addedBy: 'scout' | 'user' = explicit ? 'user' : input.addedBy ?? 'scout';
     const intent: Intent = input.intent ?? 'unspecified';
-    const addedBy = input.addedBy ?? 'scout';
+
     const evidence: Evidence[] = [];
     for (const item of input.evidence ?? []) {
-      evidence.push(validateEvidenceItem(resolved, item, options));
+      evidence.push(validateEvidenceItem({ ...resolved, explicit }, item, { ...options, observed }));
     }
 
-    if (addedBy === 'scout' && evidence.length === 0) {
+    if (!explicit && evidence.length === 0) {
       throw new UsageError(
         `Scout selected repository '${resolved.name}' without evidence; every discovered selection requires verified evidence`
       );
@@ -213,7 +252,12 @@ export function validateScoutSelection(
       source: resolved.source,
       intent,
       addedBy,
-      reason: input.reason?.trim() || 'Selected by the local scout from repository evidence.',
+      explicit,
+      reason:
+        input.reason?.trim() ||
+        (explicit
+          ? 'Explicit repository supplied by the user.'
+          : 'Selected by the local scout from repository evidence.'),
       evidence,
     });
   }
@@ -262,4 +306,14 @@ export function canonicalRepoSet(sources: readonly string[]): Map<string, string
 
 export function discoveredToAllowed(repos: readonly DiscoveredRepo[]): AllowedRepo[] {
   return repos.map((r) => ({ name: r.name, source: r.source }));
+}
+
+export function explicitToAllowed(
+  sources: Iterable<string>
+): AllowedRepo[] {
+  const result: AllowedRepo[] = [];
+  for (const source of sources) {
+    result.push({ name: path.basename(source), source, explicit: true });
+  }
+  return result;
 }

@@ -35,11 +35,11 @@ export const EMR_FILES = {
 
 export const EMR_CONTENT = {
   legacy:
-    'export class MedicalRecord {\n  constructor(public patientId: string) {}\n}\n',
+    'export class MedicalRecord {\n  constructor(public patientId: string) {}\n}\n// EMR legacy platform record\n',
   modular:
-    "import type { HealthRecord } from 'shared-health-model';\nexport interface Patient {\n  id: string;\n  record: HealthRecord;\n}\n",
+    "import type { HealthRecord } from 'shared-health-model';\nexport interface Patient {\n  id: string;\n  record: HealthRecord;\n}\n// EMR modular patient target\n",
   shared:
-    'export interface HealthRecord {\n  code: string;\n  value: string;\n}\n',
+    'export interface HealthRecord {\n  code: string;\n  value: string;\n}\n// EMR shared health record\n',
 };
 
 /**

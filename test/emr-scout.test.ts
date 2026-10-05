@@ -335,3 +335,130 @@ test('autonomous --dry-run prints the plan without creating the workspace', asyn
     fixture.cleanup();
   }
 });
+
+test('--repo plus --code-root scouts candidates and includes explicit sources outside the roots', async () => {
+  const fixture = makeEmrFixture();
+  // An explicit repository that lives outside the configured code root.
+  const external = createTestRepo({
+    prefix: 'wsg-m3-external-',
+    files: { 'src/external.ts': 'export const external = 1;\n' },
+  });
+  const selection: ScoutResult = {
+    kind: 'selection',
+    repos: [
+      {
+        source: fixture.names.legacy,
+        intent: 'source',
+        addedBy: 'scout',
+        reason: 'legacy EMR',
+        evidence: [
+          {
+            file: EMR_FILES.legacy,
+            lines: [1, 3],
+            summary: 'MedicalRecord',
+            quote: 'export class MedicalRecord',
+          },
+        ],
+      },
+      {
+        source: fixture.names.modular,
+        intent: 'target',
+        addedBy: 'scout',
+        reason: 'modular target',
+        evidence: [
+          {
+            file: EMR_FILES.modular,
+            lines: [2, 4],
+            summary: 'Patient',
+            quote: 'export interface Patient',
+          },
+        ],
+      },
+    ],
+    docs: [],
+    excluded: [],
+    gaps: [],
+  };
+  try {
+    const code = await runCreate(
+      {
+        request: 'port EMR mono to modular',
+        name: 'combined',
+        root: fixture.workspaceRoot,
+        codeRoots: [fixture.codeRoot],
+        repos: [external.dir],
+        scout: new ScriptedScout(selection),
+        scoutStateDir: path.join(fixture.workspaceRoot, '.scout-combined'),
+      },
+      io()
+    );
+    assert.equal(code, 0);
+
+    const manifest = parseManifest(
+      fs.readFileSync(path.join(fixture.workspaceRoot, 'combined', 'workspace.yaml'), 'utf8')
+    );
+    // Explicit source is always included, without evidence, and is not capped.
+    const explicitEntry = manifest.repos.find((r) => r.source === fs.realpathSync(external.dir));
+    assert.ok(explicitEntry, 'explicit --repo source outside the code roots must be included');
+    assert.equal(explicitEntry.added_by, 'user');
+    assert.deepEqual(explicitEntry.evidence, []);
+    // Discovered selections are validated with evidence.
+    const discovered = manifest.repos.filter((r) => r.added_by === 'scout');
+    assert.equal(discovered.length, 2);
+    assert.ok(discovered.every((r) => r.evidence.length >= 1));
+  } finally {
+    external.cleanup();
+    fixture.cleanup();
+  }
+});
+
+test('evidence that cites a real but never-observed file is rejected', async () => {
+  const codeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-m3-unseen-'));
+  const outRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-m3-unseen-out-'));
+  const repo = createTestRepo({
+    prefix: 'wsg-m3-unseen-repo-',
+    files: { 'src/hidden.ts': 'export const hidden = 1;\n', 'README.md': '# Repo\n' },
+  });
+  fs.symlinkSync(repo.dir, path.join(codeRoot, 'unseen-repo'));
+  const selection: ScoutResult = {
+    kind: 'selection',
+    repos: [
+      {
+        source: 'unseen-repo',
+        intent: 'target',
+        addedBy: 'scout',
+        evidence: [
+          {
+            file: 'src/hidden.ts',
+            lines: [1, 1],
+            summary: 'hidden symbol',
+            quote: 'export const hidden',
+          },
+        ],
+      },
+    ],
+    docs: [],
+  };
+  try {
+    await assert.rejects(
+      () =>
+        runCreate(
+          {
+            request: 'port EMR',
+            name: 'unseen',
+            root: outRoot,
+            codeRoots: [codeRoot],
+            scout: new ScriptedScout(selection),
+            scoutStateDir: path.join(outRoot, '.scout-unseen'),
+          },
+          io()
+        ),
+      (err: unknown) => err instanceof UsageError && /never retrieved or observed/.test(err.message)
+    );
+    assert.equal(fs.existsSync(path.join(outRoot, 'unseen')), false);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(outRoot, { recursive: true, force: true });
+  }
+});

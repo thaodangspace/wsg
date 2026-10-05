@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { canonicalize } from './paths.ts';
+import { isSecretFilename } from './documents.ts';
 import type { DiscoveredRepo } from './discovery.ts';
 
 export const DEFAULT_RETRIEVAL_BUDGET: RetrievalBudget = {
@@ -253,11 +254,17 @@ export async function runRg(
   repoSource: string,
   terms: readonly string[],
   budget: RetrievalBudget,
-  rgPath = 'rg'
+  rgPath = 'rg',
+  maxBytesOverride?: number
 ): Promise<RgOutcome> {
   if (terms.length === 0) {
     return { matches: [], bytes: 0, executed: false, truncated: false };
   }
+
+  const effectiveMaxBytes =
+    maxBytesOverride !== undefined
+      ? Math.max(1, Math.min(budget.maxRgBytes, maxBytesOverride))
+      : budget.maxRgBytes;
 
   const args = [
     '--line-number',
@@ -280,6 +287,30 @@ export async function runRg(
     '!**/build/**',
     '--glob',
     '!**/.git/**',
+    // Shared confinement: search must never surface secret-like material that
+    // reads and citations also refuse.
+    '--glob',
+    '!**/*.pem',
+    '--glob',
+    '!**/*.key',
+    '--glob',
+    '!**/*.p12',
+    '--glob',
+    '!**/*.pfx',
+    '--glob',
+    '!**/*.keystore',
+    '--glob',
+    '!**/id_rsa*',
+    '--glob',
+    '!**/id_dsa*',
+    '--glob',
+    '!**/id_ecdsa*',
+    '--glob',
+    '!**/id_ed25519*',
+    '--glob',
+    '!**/.env*',
+    '--glob',
+    '!**/*.env',
     ...terms.flatMap((term) => ['-e', term]),
     '--',
     '.',
@@ -289,7 +320,7 @@ export async function runRg(
   try {
     result = await execFileAsync(rgPath, args, {
       cwd: repoSource,
-      maxBuffer: budget.maxRgBytes,
+      maxBuffer: effectiveMaxBytes,
       timeoutMs: 20000,
     });
   } catch (err: unknown) {
@@ -313,7 +344,7 @@ export async function runRg(
   for (const line of result.stdout.split('\n')) {
     if (line.length === 0) continue;
     bytes += Buffer.byteLength(line, 'utf8') + 1;
-    if (matches.length >= budget.maxRgMatches || bytes > budget.maxRgBytes) {
+    if (matches.length >= budget.maxRgMatches || bytes > effectiveMaxBytes) {
       truncated = true;
       break;
     }
@@ -321,6 +352,7 @@ export async function runRg(
     if (!m) continue;
     let relPath = m[1];
     if (relPath.startsWith('./')) relPath = relPath.slice(2);
+    if (isSecretFilename(relPath)) continue;
     matches.push({ relPath, line: Number(m[2]), text: m[3] });
   }
 

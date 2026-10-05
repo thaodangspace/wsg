@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { Type } from 'typebox';
 import { UsageError, ConflictError } from './errors.ts';
-import { canonicalize } from './paths.ts';
+import { canonicalize, resolveInside } from './paths.ts';
 import { VENDOR_DIR_NAMES, type DiscoveredRepo } from './discovery.ts';
 import { isSecretFilename } from './documents.ts';
 import {
@@ -23,12 +24,16 @@ const CHORD_CONTEXT: string = '@earendil-works/chord/context';
 
 export const SCOUT_DB_FILENAME = 'runtime.sqlite';
 export const SCOUT_CHECKPOINT_FILENAME = 'selection.json';
+export const SCOUT_META_FILENAME = 'scout-meta.json';
+export const SCOUT_BUDGET_FILENAME = 'scout-budget.json';
 
 /** The complete, read-only tool surface offered to the scout conversation. */
 export const SCOUT_TOOL_NAMES = ['list_repos', 'read_file', 'rg_search', 'submit_selection'] as const;
 
 const MAX_READ_BYTES = 32 * 1024;
 const MAX_TOOL_CALLS = 24;
+const MAX_READ_BYTES_TOTAL = 256 * 1024;
+const MAX_SEARCH_BYTES_TOTAL = 256 * 1024;
 
 export const SCOUT_SYSTEM_PROMPT = `You are the WSG read-only repository scout.
 
@@ -46,11 +51,12 @@ Hard rules:
   repository state. Do not ask for those abilities.
 - Cite only evidence you actually observed: repository-relative file, an
   optional 1-based line range, and an exact quoted snippet. Evidence that does
-  not match the file is rejected.
+  not match an observed file is rejected.
 - Choose at most one target repository. If source or target is genuinely
   ambiguous, set ambiguous=true with a short reason instead of guessing.
 - Use intent: source | target | shared | reference | unspecified.
-- Finish by calling submit_selection.`;
+- Finish by calling submit_selection. Tool, read and search budgets are finite;
+  when they run out the conversation ends without a selection.`;
 
 export interface FauxScoutStep {
   tool: string;
@@ -65,12 +71,61 @@ export interface PiScoutConfig {
   provider: string;
   model?: string;
   maxToolCalls?: number;
+  maxReadBytesTotal?: number;
+  maxSearchBytesTotal?: number;
   /** Deterministic scripted tool calls for the faux provider (tests only). */
   fauxScript?: FauxScoutStep[];
   /** Override the ripgrep binary (tests only). */
   rgPathForTests?: string;
   /** Close the harness after a committed tool result from this tool (crash simulation, tests only). */
   haltAfterTool?: string;
+  /** Reports repository-relative files actually read or matched (durable observation). */
+  onObserve?: (repoSource: string, relPath: string) => void;
+}
+
+interface ScoutBudgetState {
+  toolCalls: number;
+  readBytes: number;
+  searchBytes: number;
+  exhausted?: string;
+}
+
+function loadBudgetState(filePath: string): ScoutBudgetState {
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Partial<ScoutBudgetState>;
+    return {
+      toolCalls: typeof raw.toolCalls === 'number' ? raw.toolCalls : 0,
+      readBytes: typeof raw.readBytes === 'number' ? raw.readBytes : 0,
+      searchBytes: typeof raw.searchBytes === 'number' ? raw.searchBytes : 0,
+      ...(typeof raw.exhausted === 'string' ? { exhausted: raw.exhausted } : {}),
+    };
+  } catch {
+    return { toolCalls: 0, readBytes: 0, searchBytes: 0 };
+  }
+}
+
+function saveBudgetState(filePath: string, state: ScoutBudgetState): void {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  } catch {
+    // Budget accounting is best-effort durable; the conversation still stops.
+  }
+}
+
+function fingerprintScout(
+  options: ScoutOptions,
+  config: PiScoutConfig,
+  repos: readonly DiscoveredRepo[]
+): string {
+  const payload = JSON.stringify({
+    request: options.request,
+    context: options.context ?? [],
+    docs: options.docs ?? [],
+    codeRoots: options.codeRoots ?? [],
+    explicit: config.explicitSources ?? [],
+    discovered: repos.map((r) => r.source).sort(),
+  });
+  return crypto.createHash('sha256').update(payload).digest('hex');
 }
 
 const EvidenceSchema = Type.Object(
@@ -167,38 +222,35 @@ export function confinedRepoFile(
   if (normalized.startsWith('..') || normalized === '.' || normalized === '') {
     throw new Error(`path must point to a file inside the repository: ${relPath}`);
   }
-  const firstSegment = normalized.split('/')[0];
-  if (VENDOR_DIR_NAMES.has(firstSegment)) {
-    throw new Error(`refusing vendor path '${relPath}'`);
+  const vendorSegment = normalized
+    .split('/')
+    .slice(0, -1)
+    .find((segment) => VENDOR_DIR_NAMES.has(segment));
+  if (vendorSegment) {
+    throw new Error(`refusing vendor/build path '${relPath}'`);
   }
   if (isSecretFilename(normalized)) {
     throw new Error(`refusing secret-like file '${relPath}'`);
   }
-  const abs = path.resolve(repo.source, normalized);
-  const rel = path.relative(repo.source, abs);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`refusing path outside repository: ${relPath}`);
-  }
-  let real: string;
+
+  // Component-by-component confinement rejects an intermediate directory
+  // symlink that would otherwise escape the repository.
+  let abs: string;
   try {
-    real = fs.realpathSync(abs);
-  } catch {
-    throw new Error(`file not found: ${relPath}`);
-  }
-  const realRel = path.relative(fs.realpathSync(repo.source), real);
-  if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
-    throw new Error(`refusing path outside repository after resolving symlinks: ${relPath}`);
+    abs = resolveInside(repo.source, normalized);
+  } catch (err: unknown) {
+    throw new Error(`refusing path outside repository: ${(err as Error).message}`);
   }
   let st: fs.Stats;
   try {
-    st = fs.statSync(real);
+    st = fs.lstatSync(abs);
   } catch {
     throw new Error(`file not found: ${relPath}`);
   }
-  if (!st.isFile()) {
+  if (st.isSymbolicLink() || !st.isFile()) {
     throw new Error(`not a regular file: ${relPath}`);
   }
-  return { repo, abs: real };
+  return { repo, abs };
 }
 
 /**
@@ -206,6 +258,10 @@ export function confinedRepoFile(
  * bounded tools and a terminal structured-result tool. The conversation is
  * persisted to SQLite under the workspace runtime state directory so an
  * interrupted scout can resume without re-executing committed tool calls.
+ *
+ * Budgets are durable (`scout-budget.json`) and enforced with a hard stop, so
+ * an uncooperative model cannot run indefinitely and a resumed run continues
+ * the same accounting rather than resetting it.
  */
 export class PiScout implements Scout {
   private readonly config: PiScoutConfig;
@@ -214,10 +270,17 @@ export class PiScout implements Scout {
     this.config = config;
   }
 
-  private statePaths(stateDir: string): { dbPath: string; checkpointPath: string } {
+  private statePaths(stateDir: string): {
+    dbPath: string;
+    checkpointPath: string;
+    metaPath: string;
+    budgetPath: string;
+  } {
     return {
       dbPath: path.join(stateDir, SCOUT_DB_FILENAME),
       checkpointPath: path.join(stateDir, SCOUT_CHECKPOINT_FILENAME),
+      metaPath: path.join(stateDir, SCOUT_META_FILENAME),
+      budgetPath: path.join(stateDir, SCOUT_BUDGET_FILENAME),
     };
   }
 
@@ -233,19 +296,53 @@ export class PiScout implements Scout {
     return null;
   }
 
+  private readFingerprint(metaPath: string): string | null {
+    try {
+      const raw = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as { fingerprint?: unknown };
+      return typeof raw.fingerprint === 'string' ? raw.fingerprint : null;
+    } catch {
+      return null;
+    }
+  }
+
   async scout(options: ScoutOptions): Promise<ScoutResult> {
     const stateDir = options.stateDir;
     if (!stateDir) {
       throw new UsageError('PiScout requires a durable state directory');
     }
 
-    const { dbPath, checkpointPath } = this.statePaths(stateDir);
+    const repos = this.config.discovered;
+    const { dbPath, checkpointPath, metaPath, budgetPath } = this.statePaths(stateDir);
+    const fingerprint = fingerprintScout(options, this.config, repos);
 
     if (options.resume) {
+      const recorded = this.readFingerprint(metaPath);
+      if (recorded === null) {
+        if (fs.existsSync(dbPath) || fs.existsSync(checkpointPath)) {
+          throw new ConflictError(
+            `Scout state at '${stateDir}' predates request identity tracking; refusing to reuse an unverifiable selection.`
+          );
+        }
+      } else if (recorded !== fingerprint) {
+        throw new ConflictError(
+          'Scout resume request does not match the interrupted scout (request, context, documents, code roots, or repositories changed).',
+          ['Start a new workspace name, or rerun the original command with --resume.']
+        );
+      }
+
       const cached = this.readCheckpoint(checkpointPath);
       if (cached) return cached;
+
+      const priorBudget = loadBudgetState(budgetPath);
+      if (priorBudget.exhausted) {
+        return {
+          kind: 'none',
+          reason: `Scout stopped early: ${priorBudget.exhausted}`,
+          gaps: [`scout budget: ${priorBudget.exhausted}`],
+        };
+      }
     } else {
-      // A fresh run must not inherit a previous conversation.
+      // A fresh run must not inherit a previous conversation or budget.
       try {
         fs.rmSync(stateDir, { recursive: true, force: true });
       } catch {
@@ -254,6 +351,40 @@ export class PiScout implements Scout {
     }
 
     fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(metaPath, JSON.stringify({ version: 1, fingerprint }, null, 2) + '\n', {
+      mode: 0o600,
+    });
+
+    const retrieval = this.config.retrieval;
+    const retrievalBudget = DEFAULT_RETRIEVAL_BUDGET;
+    const maxToolCalls = this.config.maxToolCalls ?? MAX_TOOL_CALLS;
+    const maxReadBytesTotal = this.config.maxReadBytesTotal ?? MAX_READ_BYTES_TOTAL;
+    const maxSearchBytesTotal = this.config.maxSearchBytesTotal ?? MAX_SEARCH_BYTES_TOTAL;
+    const rgPath = this.config.rgPathForTests;
+
+    const state = loadBudgetState(budgetPath);
+    let exhaustedReason = state.exhausted;
+    let captured: PiModelSelection | undefined;
+
+    const onProgress = options.onProgress ?? (() => {});
+    const observe = this.config.onObserve ?? (() => {});
+
+    const terminate = (reason: string): any => {
+      exhaustedReason = reason;
+      state.exhausted = reason;
+      saveBudgetState(budgetPath, state);
+      return { content: [{ type: 'text', text: reason }], control: { terminate: true } };
+    };
+
+    const chargeCall = (): string | null => {
+      state.toolCalls++;
+      if (state.toolCalls > maxToolCalls) {
+        const reason = `tool-call budget of ${maxToolCalls} exhausted`;
+        return reason;
+      }
+      saveBudgetState(budgetPath, state);
+      return null;
+    };
 
     let durable: any;
     let sqlite: any;
@@ -267,15 +398,6 @@ export class PiScout implements Scout {
         `Pi Durable scout runtime is unavailable: ${(err as Error).message}. Install the pinned @earendil-works packages or use explicit --repo inputs.`
       );
     }
-
-    const repos = this.config.discovered;
-    const retrieval = this.config.retrieval;
-    const budget = DEFAULT_RETRIEVAL_BUDGET;
-    const maxToolCalls = this.config.maxToolCalls ?? MAX_TOOL_CALLS;
-    let toolCalls = 0;
-    let captured: PiModelSelection | undefined;
-
-    const onProgress = options.onProgress ?? (() => {});
 
     const readFileTool = durable.defineTool({
       name: 'read_file',
@@ -293,23 +415,21 @@ export class PiScout implements Scout {
       replay: 'safe',
       outputLimits: { maxBytes: MAX_READ_BYTES, retain: 'head' },
       async execute(args: any): Promise<any> {
-        toolCalls++;
-        if (toolCalls > maxToolCalls) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Tool budget of ${maxToolCalls} calls exhausted. Call submit_selection now with the evidence you already have.`,
-              },
-            ],
-            isError: true,
-          };
-        }
+        const callReason = chargeCall();
+        if (callReason) return terminate(`read_file refused: ${callReason}`);
+        const remaining = maxReadBytesTotal - state.readBytes;
+        if (remaining <= 0) return terminate('read-byte budget exhausted');
+
         const { repo, abs } = confinedRepoFile(repos, args.repo, args.path);
-        const res = readBoundedFile(abs, budget.maxFileBytes);
+        const cap = Math.max(1, Math.min(retrievalBudget.maxFileBytes, remaining));
+        const res = readBoundedFile(abs, cap);
         if ('error' in res) {
           return { content: [{ type: 'text', text: `Error: ${res.error}` }], isError: true };
         }
+        state.readBytes += Buffer.byteLength(res.content, 'utf8');
+        saveBudgetState(budgetPath, state);
+        observe(repo.source, path.posix.normalize(args.path));
+
         const lines = res.content.split('\n');
         const start = args.startLine ?? 1;
         const end = args.endLine ?? lines.length;
@@ -321,7 +441,7 @@ export class PiScout implements Scout {
           .split('\n')
           .map((line, idx) => `${start + idx}\t${line}`)
           .join('\n');
-        const note = res.truncated ? `\n[truncated at ${budget.maxFileBytes} bytes]` : '';
+        const note = res.truncated ? `\n[truncated at ${cap} bytes]` : '';
         onProgress(`read_file ${repo.name}/${args.path}`);
         return { content: [{ type: 'text', text: numbered + note }] };
       },
@@ -341,18 +461,11 @@ export class PiScout implements Scout {
       replay: 'safe',
       outputLimits: { maxBytes: MAX_READ_BYTES, retain: 'head' },
       async execute(args: any): Promise<any> {
-        toolCalls++;
-        if (toolCalls > maxToolCalls) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Tool budget of ${maxToolCalls} calls exhausted. Call submit_selection now with the evidence you already have.`,
-              },
-            ],
-            isError: true,
-          };
-        }
+        const callReason = chargeCall();
+        if (callReason) return terminate(`rg_search refused: ${callReason}`);
+        const remaining = maxSearchBytesTotal - state.searchBytes;
+        if (remaining <= 0) return terminate('search-byte budget exhausted');
+
         const targets = args.repo
           ? repos.filter((r) => r.name === args.repo || r.source === args.repo)
           : repos;
@@ -361,12 +474,16 @@ export class PiScout implements Scout {
         }
         const outLines: string[] = [];
         for (const repo of targets) {
-          const rg = await runRg(repo.source, [args.query], budget, this.config.rgPathForTests);
+          const perCallBudget = Math.max(1, Math.min(retrievalBudget.maxRgBytes, remaining));
+          const rg = await runRg(repo.source, [args.query], retrievalBudget, rgPath, perCallBudget);
           for (const m of rg.matches) {
             outLines.push(`${repo.name}/${m.relPath}:${m.line}:${m.text}`);
+            observe(repo.source, m.relPath);
           }
+          state.searchBytes += rg.bytes;
           if (rg.error) outLines.push(`[${repo.name}] ${rg.error}`);
         }
+        saveBudgetState(budgetPath, state);
         onProgress(`rg_search ${JSON.stringify(args.query)}`);
         return {
           content: [{ type: 'text', text: outLines.length > 0 ? outLines.join('\n') : '(no matches)' }],
@@ -380,18 +497,8 @@ export class PiScout implements Scout {
       parameters: Type.Object({}, { additionalProperties: false }),
       replay: 'safe',
       async execute(): Promise<any> {
-        toolCalls++;
-        if (toolCalls > maxToolCalls) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Tool budget of ${maxToolCalls} calls exhausted. Call submit_selection now with the evidence you already have.`,
-              },
-            ],
-            isError: true,
-          };
-        }
+        const callReason = chargeCall();
+        if (callReason) return terminate(`list_repos refused: ${callReason}`);
         const text = repos
           .map((r) => `${r.name}\t${r.source}\t${r.gitKind === 'file' ? 'worktree' : 'clone'}`)
           .join('\n');
@@ -519,7 +626,20 @@ export class PiScout implements Scout {
       await submission.wait(context);
 
       const selection = await this.recoverSelection(root, context, captured);
-      const result = this.toScoutResult(selection);
+      let result: ScoutResult;
+      if (selection) {
+        result = this.toScoutResult(selection);
+      } else if (exhaustedReason) {
+        result = {
+          kind: 'none',
+          reason: `Scout stopped early: ${exhaustedReason}`,
+          gaps: [`scout budget: ${exhaustedReason}`],
+        };
+      } else {
+        throw new ConflictError(
+          'Scout conversation ended without a persisted submit_selection result; rerun with --resume'
+        );
+      }
 
       try {
         fs.writeFileSync(checkpointPath, JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
@@ -575,7 +695,7 @@ export class PiScout implements Scout {
     root: any,
     context: unknown,
     captured: PiModelSelection | undefined
-  ): Promise<PiModelSelection> {
+  ): Promise<PiModelSelection | undefined> {
     const convContext = await root.context(context);
     let found: PiModelSelection | undefined;
     for (const entry of convContext.entries) {
@@ -595,11 +715,6 @@ export class PiScout implements Scout {
       }
     }
     if (!found && captured) found = captured;
-    if (!found) {
-      throw new ConflictError(
-        'Scout conversation ended without a persisted submit_selection result; rerun with --resume'
-      );
-    }
     return found;
   }
 
