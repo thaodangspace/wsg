@@ -55,7 +55,7 @@ export const defaultHandlers: CommandHandlers = {
         help: { type: 'boolean', short: 'h' },
       },
       allowPositionals: true,
-      strict: false,
+      strict: true,
     });
     if (values.help) {
       (io.stdout ?? process.stdout).write(`Usage: wsg create <request> [options]\n`);
@@ -70,7 +70,7 @@ export const defaultHandlers: CommandHandlers = {
         help: { type: 'boolean', short: 'h' },
       },
       allowPositionals: true,
-      strict: false,
+      strict: true,
     });
     if (values.help) {
       (io.stdout ?? process.stdout).write(`Usage: wsg explain [repo-name] [options]\n`);

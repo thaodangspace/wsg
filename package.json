@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
     "test": "node --test \"test/**/*.test.ts\""
   },
   "dependencies": {
