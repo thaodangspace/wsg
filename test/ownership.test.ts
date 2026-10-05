@@ -237,6 +237,203 @@ test('mixed batch: fresh, unchanged, and edited in single reconcile call', () =>
   }
 });
 
+test('corrupted operation.json propagates error and is not swallowed', () => {
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-corrupt-'));
+  try {
+    initWsgDir(tmpWs);
+    const opPath = path.join(tmpWs, '.wsg', 'operation.json');
+    fs.writeFileSync(opPath, '{ corrupted json: true,');
+
+    assert.throws(
+      () => reconcileGenerated(tmpWs, { 'README.md': '# Readme' }),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError || err instanceof SyntaxError);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
+test('persists ownership per file and surfaces injected journal write failure', () => {
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-fail-early-'));
+  try {
+    initWsgDir(tmpWs);
+    writeOperation(tmpWs, {
+      version: 1,
+      owned: {},
+      operation: {
+        id: 'op-batch',
+        command: 'create',
+        status: 'running',
+        startedAt: new Date().toISOString(),
+        steps: [],
+      },
+    });
+
+    const files = [
+      { path: 'file1.md', content: 'content 1' },
+      { path: 'file2.md', content: 'content 2' },
+    ];
+
+    let opWrites = 0;
+    const origRename = fs.renameSync;
+    // Intercept fs.renameSync when renaming operation.json on the second file
+    fs.renameSync = function (from: fs.PathLike, to: fs.PathLike): void {
+      if (typeof to === 'string' && to.endsWith('operation.json')) {
+        opWrites++;
+        if (opWrites === 2) {
+          throw new Error('Injected journal write failure on second file');
+        }
+      }
+      return origRename.call(fs, from, to);
+    };
+
+    try {
+      assert.throws(
+        () => reconcileGenerated(tmpWs, files),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          assert.match(err.message, /Injected journal write failure/);
+          return true;
+        }
+      );
+    } finally {
+      fs.renameSync = origRename;
+    }
+
+    // Earlier ownership for file1.md was persisted on disk!
+    const opFinal = readOperation(tmpWs)!;
+    assert.ok(opFinal.owned['file1.md'], 'file1.md must be recorded in journal');
+    assert.equal(opFinal.owned['file2.md'], undefined, 'file2.md must not be recorded');
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
+test('preflight validates all paths before any writes (invalid late entry regression)', () => {
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-preflight-'));
+  try {
+    const files = [
+      { path: 'valid-file.md', content: 'should not be written' },
+      { path: '../outside.md', content: 'evil path traversal' },
+    ];
+
+    assert.throws(
+      () => reconcileGenerated(tmpWs, files),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.match(err.message, /path traversal/);
+        return true;
+      }
+    );
+
+    // Verify valid-file.md was NOT written because preflight aborted before any writes
+    assert.equal(fs.existsSync(path.join(tmpWs, 'valid-file.md')), false);
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
+test('preflight detects duplicate destination aliases in batch', () => {
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-dup-alias-'));
+  try {
+    const files = [
+      { path: 'README.md', content: 'first' },
+      { path: './README.md', content: 'duplicate alias' },
+    ];
+
+    assert.throws(
+      () => reconcileGenerated(tmpWs, files),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.match(err.message, /Duplicate/);
+        return true;
+      }
+    );
+
+    assert.equal(fs.existsSync(path.join(tmpWs, 'README.md')), false);
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
+test('preflight rejects symlink escaping workspace directory', () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-symlink-'));
+  try {
+    const wsDir = path.join(tmpBase, 'ws');
+    const outsideDir = path.join(tmpBase, 'outside');
+    fs.mkdirSync(wsDir);
+    fs.mkdirSync(outsideDir);
+
+    fs.symlinkSync(outsideDir, path.join(wsDir, 'escape-link'));
+
+    assert.throws(
+      () => reconcileGenerated(wsDir, { 'escape-link/target.md': 'malicious' }),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.match(err.message, /escapes workspace root via symlink/);
+        return true;
+      }
+    );
+
+    assert.equal(fs.readdirSync(outsideDir).length, 0);
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test('existing proposal file is preserved and not clobbered', () => {
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-prop-preserve-'));
+  try {
+    // 1. Initial generation
+    const initialFiles = { 'docs/context.md': '# Context v1' };
+    const owned: Record<string, OwnedFileEntry> = {};
+    reconcileGenerated(tmpWs, initialFiles, owned);
+
+    // 2. User edits docs/context.md
+    fs.writeFileSync(path.join(tmpWs, 'docs/context.md'), '# Context user edits');
+
+    // 3. First reconciliation writes docs/context.md.wsg-new
+    reconcileGenerated(tmpWs, { 'docs/context.md': '# Context v2' }, owned);
+    assert.equal(
+      fs.readFileSync(path.join(tmpWs, 'docs/context.md.wsg-new'), 'utf8'),
+      '# Context v2'
+    );
+
+    // 4. User modifies the proposal file docs/context.md.wsg-new
+    const userProposalNotes = '# Context v2 with user comments on proposal';
+    fs.writeFileSync(path.join(tmpWs, 'docs/context.md.wsg-new'), userProposalNotes);
+
+    // 5. Next generation with v3 content
+    const res = reconcileGenerated(tmpWs, { 'docs/context.md': '# Context v3' }, owned);
+
+    assert.equal(res.partial, true);
+    assert.deepEqual(res.proposals, ['docs/context.md.wsg-new-1']);
+
+    // Original user edits to docs/context.md are still intact
+    assert.equal(
+      fs.readFileSync(path.join(tmpWs, 'docs/context.md'), 'utf8'),
+      '# Context user edits'
+    );
+
+    // Existing proposal with user comments is PRESERVED intact!
+    assert.equal(
+      fs.readFileSync(path.join(tmpWs, 'docs/context.md.wsg-new'), 'utf8'),
+      userProposalNotes
+    );
+
+    // New proposal is written to docs/context.md.wsg-new-1
+    assert.equal(
+      fs.readFileSync(path.join(tmpWs, 'docs/context.md.wsg-new-1'), 'utf8'),
+      '# Context v3'
+    );
+  } finally {
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
 test('updates .wsg/operation.json on disk if present', () => {
   const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-owner-journal-'));
   try {

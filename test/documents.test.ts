@@ -157,6 +157,63 @@ test('.env, id_rsa, .md with BEGIN PRIVATE KEY throw exit-1 secret error', () =>
   assert.ok(!containsSecretContent('# Normal markdown file'));
 });
 
+test('secret marker beyond 512 KiB is detected and rejected', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-large-secret-'));
+  try {
+    const largeFile = path.join(tmpDir, 'large-doc.md');
+    // 600 KiB of markdown text padding followed by secret key marker
+    const padding = '# Heading\n' + 'A'.repeat(1024) + '\n';
+    const numRepeats = Math.ceil((600 * 1024) / padding.length);
+    const content = padding.repeat(numRepeats) + '\n-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASC\n';
+    fs.writeFileSync(largeFile, content);
+
+    assert.ok(fs.statSync(largeFile).size > 512 * 1024);
+    assert.throws(
+      () => inspectDoc(largeFile),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.equal(err.exitCode, 1);
+        assert.match(err.message, /private key/);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('protected filenames are rejected before reading content', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-secret-unread-'));
+  try {
+    const secretFile = path.join(tmpDir, '.env');
+    fs.writeFileSync(secretFile, 'SECRET=hidden\n');
+
+    // Make unreadable on POSIX if non-root
+    if (process.platform !== 'win32' && process.getuid && process.getuid() !== 0) {
+      fs.chmodSync(secretFile, 0o000);
+    }
+
+    try {
+      assert.throws(
+        () => inspectDoc(secretFile),
+        (err: unknown) => {
+          assert.ok(err instanceof UsageError);
+          assert.equal(err.exitCode, 1);
+          // Must match secret filename pattern rejection, NOT "unreadable" error
+          assert.match(err.message, /filename matches protected pattern/);
+          return true;
+        }
+      );
+    } finally {
+      if (process.platform !== 'win32' && process.getuid && process.getuid() !== 0) {
+        fs.chmodSync(secretFile, 0o644);
+      }
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('PNG → text: false and text buffer detection', () => {
   const inspected = inspectDoc('test/fixtures/docs/sample.png');
   assert.equal(inspected.kind, 'file');
@@ -238,6 +295,77 @@ test('snapshot entry sha/ISO time/mode/realpath source', () => {
     assert.equal(fs.readFileSync(writtenPath, 'utf8'), content.toString('utf8'));
   } finally {
     fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
+test('snapshotDoc requires destination in docs/ and rejects context.md collisions', () => {
+  const inspected = inspectDoc('test/fixtures/docs/notes.md');
+
+  // Must be in docs/
+  assert.throws(
+    () => snapshotDoc(inspected, 'notes.md'),
+    (err: unknown) => {
+      assert.ok(err instanceof UsageError);
+      assert.match(err.message, /must be inside 'docs\/'/);
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => snapshotDoc(inspected, 'other/notes.md'),
+    (err: unknown) => {
+      assert.ok(err instanceof UsageError);
+      assert.match(err.message, /must be inside 'docs\/'/);
+      return true;
+    }
+  );
+
+  // Must not collide with generated docs/context.md
+  assert.throws(
+    () => snapshotDoc(inspected, 'docs/context.md'),
+    (err: unknown) => {
+      assert.ok(err instanceof UsageError);
+      assert.match(err.message, /conflicts with reserved generated context/);
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => snapshotDoc(inspected, 'docs/Context.md'),
+    (err: unknown) => {
+      assert.ok(err instanceof UsageError);
+      assert.match(err.message, /conflicts with reserved generated context/);
+      return true;
+    }
+  );
+});
+
+test('snapshotDoc refuses writing through symlink escaping workspace', () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-snap-symlink-'));
+  try {
+    const wsDir = path.join(tmpBase, 'workspace');
+    const outsideDir = path.join(tmpBase, 'outside');
+    fs.mkdirSync(wsDir);
+    fs.mkdirSync(outsideDir);
+
+    // Create a symlink wsDir/docs pointing to outsideDir
+    fs.symlinkSync(outsideDir, path.join(wsDir, 'docs'));
+
+    const inspected = inspectDoc('test/fixtures/docs/notes.md');
+
+    assert.throws(
+      () => snapshotDoc(inspected, 'docs/notes.md', { wsDir }),
+      (err: unknown) => {
+        assert.ok(err instanceof UsageError);
+        assert.match(err.message, /escapes workspace root via symlink/);
+        return true;
+      }
+    );
+
+    // Verify no file was written to outsideDir
+    assert.equal(fs.readdirSync(outsideDir).length, 0);
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
   }
 });
 

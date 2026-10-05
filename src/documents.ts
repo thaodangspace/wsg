@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { UsageError } from './errors.ts';
-import { expandHome, canonicalize, assertConfinedRelative } from './paths.ts';
+import { expandHome, canonicalize, assertConfinedRelative, resolveInside } from './paths.ts';
 import { sha256, writeFileAtomic } from './fsx.ts';
 import { suffixForSource } from './slug.ts';
 import type { AddedBy, DocEntry, DocMode } from './manifest.ts';
@@ -46,7 +46,7 @@ export function isSecretFilename(filename: string): boolean {
  * Checks if a buffer contains any secret content pattern (e.g. private keys).
  */
 export function containsSecretContent(content: Buffer | string): boolean {
-  const text = typeof content === 'string' ? content : content.toString('utf8', 0, Math.min(content.length, 512 * 1024));
+  const text = typeof content === 'string' ? content : content.toString('utf8');
   return SECRET_CONTENT_PATTERNS.some((pattern) => pattern.test(text));
 }
 
@@ -145,6 +145,13 @@ export function inspectDoc(input: string): InspectedDoc {
     throw new UsageError(`Document path '${input}' is not a regular file`);
   }
 
+  // Refuse secret-like filename before reading content
+  if (isSecretFilename(input) || isSecretFilename(canonical)) {
+    throw new UsageError(
+      `Refusing to snapshot secret-like file '${input}': filename matches protected pattern`
+    );
+  }
+
   // Check readability and read content
   let content: Buffer;
   try {
@@ -153,14 +160,7 @@ export function inspectDoc(input: string): InspectedDoc {
     throw new UsageError(`Document file '${input}' is unreadable: ${(err as Error).message}`);
   }
 
-  // Refuse secret-like filename
-  if (isSecretFilename(input) || isSecretFilename(canonical)) {
-    throw new UsageError(
-      `Refusing to snapshot secret-like file '${input}': filename matches protected pattern`
-    );
-  }
-
-  // Refuse secret-like content
+  // Refuse secret-like content across all copied bytes
   if (containsSecretContent(content)) {
     throw new UsageError(
       `Refusing to snapshot secret-like file '${input}': file content contains private key`
@@ -209,7 +209,7 @@ export interface SnapshotDocOptions {
  * Creates a snapshot DocEntry for an inspected local file and optionally writes it to the workspace.
  */
 export function snapshotDoc(
-  doc: string | InspectedFileDoc,
+  doc: string | InspectedDoc,
   destPath: string,
   options: SnapshotDocOptions = {}
 ): DocEntry {
@@ -222,12 +222,29 @@ export function snapshotDoc(
           }
           return res;
         })()
-      : doc;
+      : (() => {
+          if (doc.kind !== 'file') {
+            throw new UsageError(`Expected local file for snapshotDoc, got URL '${doc.source}'`);
+          }
+          return doc;
+        })();
 
   assertConfinedRelative(destPath, 'Snapshot doc destination path');
+  const norm = path.posix.normalize(destPath);
+  if (!norm.startsWith('docs/') || norm === 'docs' || norm === 'docs/') {
+    throw new UsageError(
+      `Snapshot doc destination path '${destPath}' must be inside 'docs/'`
+    );
+  }
+
+  if (norm.toLowerCase() === 'docs/context.md') {
+    throw new UsageError(
+      `Snapshot doc destination path '${destPath}' conflicts with reserved generated context 'docs/context.md'`
+    );
+  }
 
   if (options.wsDir) {
-    const fullPath = path.resolve(options.wsDir, destPath);
+    const fullPath = resolveInside(options.wsDir, destPath);
     writeFileAtomic(fullPath, inspected.content);
   }
 
