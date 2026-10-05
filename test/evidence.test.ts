@@ -305,4 +305,3 @@ test('validateScoutSelection accepts explicit repositories outside the roots wit
   assert.equal(validated.repos[0].addedBy, 'user');
   assert.deepEqual(validated.repos[0].evidence, []);
 });
-
