@@ -15,8 +15,9 @@ concurrency:
 jobs:
   test:
     name: Node ${{ matrix.node }}
-    # The repository's Actions runner is self-hosted (Linux, ARM64).
-    runs-on: [self-hosted, Linux]
+    # Prefer GitHub-hosted runners; the repo also has a self-hosted Linux runner
+    # available as a fallback if hosted minutes are exhausted.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
