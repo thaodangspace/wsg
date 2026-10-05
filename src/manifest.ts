@@ -516,6 +516,31 @@ export function validateManifest(manifest: Manifest): Manifest {
 
   const validRepoPaths = new Set(manifest.repos.map((r) => r.path));
 
+  // Generated wrappers are files under scripts/. They must not collide with
+  // attached scripts, document snapshots, other wrappers, or reserved
+  // root/generated/control outputs (case-insensitively after normalization).
+  const copiedScriptPaths = new Set(
+    (manifest.scripts ?? []).map((s) => path.posix.normalize(s.path).toLowerCase())
+  );
+  const documentPaths = new Set(
+    manifest.docs
+      .filter((d) => d.mode === 'snapshot' && typeof d.path === 'string')
+      .map((d) => path.posix.normalize(d.path as string).toLowerCase())
+  );
+  const reservedControlOutputs = new Set([
+    'workspace.yaml',
+    'readme.md',
+    'agents.md',
+    'claude.md',
+    'docs',
+    'docs/context.md',
+    'scripts',
+    '.wsg',
+  ]);
+
+  const seenCommandNames = new Set<string>();
+  const seenCommandWrappers = new Set<string>();
+
   for (let i = 0; i < (manifest.commands ?? []).length; i++) {
     const cmd = manifest.commands[i];
     const cmdLabel = cmd.name || `commands[${i}]`;
@@ -528,8 +553,47 @@ export function validateManifest(manifest: Manifest): Manifest {
       );
     }
 
+    const lowerName = cmd.name.toLowerCase();
+    if (seenCommandNames.has(lowerName)) {
+      throw new UsageError(`duplicate command name '${cmd.name}'`);
+    }
+    seenCommandNames.add(lowerName);
+
     if (cmd.wrapper) {
       assertConfinedRelative(cmd.wrapper, `command '${cmdLabel}' wrapper`);
+      const normalizedWrapper = path.posix.normalize(cmd.wrapper);
+      const lowerWrapper = normalizedWrapper.toLowerCase();
+
+      if (!lowerWrapper.startsWith('scripts/') || lowerWrapper === 'scripts/') {
+        throw new UsageError(
+          `command '${cmdLabel}' wrapper '${cmd.wrapper}' must be a file under 'scripts/'`
+        );
+      }
+      if (!lowerWrapper.endsWith('.sh')) {
+        throw new UsageError(
+          `command '${cmdLabel}' wrapper '${cmd.wrapper}' must end with '.sh'`
+        );
+      }
+      if (seenCommandWrappers.has(lowerWrapper)) {
+        throw new UsageError(`duplicate command wrapper '${cmd.wrapper}'`);
+      }
+      seenCommandWrappers.add(lowerWrapper);
+
+      if (copiedScriptPaths.has(lowerWrapper)) {
+        throw new UsageError(
+          `command '${cmdLabel}' wrapper '${cmd.wrapper}' collides with the attached script at the same path`
+        );
+      }
+      if (documentPaths.has(lowerWrapper)) {
+        throw new UsageError(
+          `command '${cmdLabel}' wrapper '${cmd.wrapper}' collides with a document snapshot at the same path`
+        );
+      }
+      if (reservedControlOutputs.has(lowerWrapper)) {
+        throw new UsageError(
+          `command '${cmdLabel}' wrapper '${cmd.wrapper}' collides with a reserved generated path`
+        );
+      }
     }
   }
 

@@ -8,6 +8,7 @@ import {
   renderAll,
 } from '../src/generate.ts';
 import type { Manifest } from '../src/manifest.ts';
+import { UsageError } from '../src/errors.ts';
 
 const SAMPLE_MANIFEST: Manifest = {
   version: 1,
@@ -201,4 +202,45 @@ test('renderAll renders all planned files into a Map', () => {
   assert.ok(filesNone.has('README.md'));
   assert.ok(!filesNone.has('AGENTS.md'));
   assert.ok(!filesNone.has('CLAUDE.md'));
+});
+
+test('renderAll renders command wrappers and rejects a wrapper that would overwrite a generated file', () => {
+  const withWrapper: Manifest = {
+    ...SAMPLE_MANIFEST,
+    commands: [
+      {
+        name: 'test-billing-api',
+        cwd: 'billing-api',
+        argv: ['npm', 'run', 'test'],
+        evidence: 'package.json scripts.test',
+        wrapper: 'scripts/test-billing-api.sh',
+      },
+    ],
+  };
+  const files = renderAll(withWrapper);
+  assert.ok(files.has('scripts/test-billing-api.sh'));
+  assert.match(files.get('scripts/test-billing-api.sh')!, /^#!\/bin\/sh/);
+  assert.match(files.get('scripts/test-billing-api.sh')!, /exec 'npm' 'run' 'test'/);
+
+  // A wrapper that collides (case-insensitively) with a generated output must
+  // never silently replace the canonical context.
+  const collision: Manifest = {
+    ...SAMPLE_MANIFEST,
+    commands: [
+      {
+        name: 'evil',
+        cwd: 'billing-api',
+        argv: ['npm', 'run', 'test'],
+        wrapper: 'docs/Context.md',
+      },
+    ],
+  };
+  assert.throws(
+    () => renderAll(collision),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /Duplicate generated output/);
+      return true;
+    }
+  );
 });

@@ -12,7 +12,7 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Milestones 1–4 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, the Milestone 3 local scout harness, and the Milestone 4 incremental commands (`wsg add`, `wsg refresh`) are implemented. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Milestones 1–5 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, the Milestone 3 local scout harness, the Milestone 4 incremental commands (`wsg add`, `wsg refresh`), and the Milestone 5 validation-command discovery and wrappers are implemented. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
 # Explicit inputs (no model or credentials required):
@@ -164,6 +164,39 @@ without duplicating work or overwriting edits. Resume compares canonical source
 identities, so the same relative spelling in a different directory is rejected.
 Concurrent `add`/`refresh` calls are serialized by the writer lock and fail
 closed with exit 2.
+
+## Validation Commands and Wrappers (Milestone 5)
+
+WSG discovers concrete validation commands from each repository's `package.json`
+and directly documented README validation instructions at the **recorded base
+commit** (the assembled worktree revision), never from the dirty source checkout.
+It records the command name, working directory, argument vector, and evidence in
+`workspace.yaml` and, for each supported command, generates a thin wrapper under
+`scripts/`:
+
+```bash
+sh scripts/test-new-platform.sh   # works from any directory; propagates exit status
+```
+
+- **Supported sources:** npm `package.json` scripts and directly documented
+  README validation commands (a documented `npm run <name>` must resolve to a
+  non-empty package script; a documented `sh <path>`/`bash <path>` must exist at
+  the recorded commit). Other command sources are added only with fixtures. A
+  missing `test` script — or a documented command with no matching script — is
+  reported as a gap and **no verification wrapper is invented**.
+- **Never executed:** `create`, `add`, `refresh`, and `--resume` never run tests,
+  copied scripts, installs, or project bootstrap. Commands are labelled
+  "discovered, not verified".
+- **Safe wrappers:** wrappers resolve the repository relative to their own
+  location (so they work from any current directory), quote every argument, and
+  `exec` the fixed argv so the child exit status is propagated. Wrapper names and
+  destinations avoid existing wrappers, attached scripts, and untracked files,
+  and user edits to generated wrappers are preserved with a `.wsg-new` proposal.
+- **Summaries and context:** `create`, `add`, and `refresh` print repository
+  roles, discovered commands, unresolved documents, and gaps (including missing
+  tests); `docs/context.md` carries the same information. `AGENTS.md` and
+  `CLAUDE.md` both point at `docs/context.md` and remind the agent that
+  repository-local policies apply.
 
 ## Development
 
