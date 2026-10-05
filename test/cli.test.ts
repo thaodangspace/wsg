@@ -160,9 +160,10 @@ test('non-WsgError with WSG_DEBUG=1 prints stack trace', async () => {
   assert.match(result.stderr, /at /);
 });
 
-test('default create stub exits 0', async () => {
+test('cli create with no request exits 1 and prints usage on stderr', async () => {
   const result = await runMain(['create']);
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /create requires a request description/);
 });
 
 test('default explain stub exits 0', async () => {

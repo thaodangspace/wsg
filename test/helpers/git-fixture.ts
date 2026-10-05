@@ -94,3 +94,22 @@ export function createTestRepo(options: TestRepoOptions = {}): TestRepo {
     cleanup,
   };
 }
+
+/**
+ * Helper to add a submodule entry to an existing test repo's .gitmodules.
+ */
+export function addTestSubmodule(repoDir: string, name: string = 'dep', url: string = 'https://example.com/dep.git'): void {
+  const gitmodulesPath = path.join(repoDir, '.gitmodules');
+  const entry = `[submodule "${name}"]\n\tpath = ${name}\n\turl = ${url}\n`;
+  fs.appendFileSync(gitmodulesPath, entry, 'utf8');
+}
+
+/**
+ * Helper to add a Git LFS filter entry to an existing test repo's .gitattributes.
+ */
+export function addTestLfsFilter(repoDir: string, pattern: string = '*.bin'): void {
+  const gitattributesPath = path.join(repoDir, '.gitattributes');
+  const entry = `${pattern} filter=lfs diff=lfs merge=lfs -text\n`;
+  fs.appendFileSync(gitattributesPath, entry, 'utf8');
+}
+
