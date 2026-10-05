@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { runMain } from './helpers/cli.ts';
 import { ConflictError, PartialError, UsageError, WsgError } from '../src/errors.ts';
 import { VERSION } from '../src/cli.ts';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -166,9 +168,17 @@ test('cli create with no request exits 1 and prints usage on stderr', async () =
   assert.match(result.stderr, /create requires a request description/);
 });
 
-test('default explain stub exits 0', async () => {
-  const result = await runMain(['explain']);
-  assert.equal(result.exitCode, 0);
+test('cli explain with no workspace exits 1 with a hint', async () => {
+  const emptyDir = mkdtempSync(path.join(os.tmpdir(), 'wsg-cli-explain-'));
+  try {
+    const result = await runMain(['explain'], { cwd: emptyDir });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /No workspace\.yaml/);
+    assert.match(result.stderr, /wsg explain --workspace/);
+    assert.equal(result.stdout, '');
+  } finally {
+    rmSync(emptyDir, { recursive: true, force: true });
+  }
 });
 
 test('dist/cli.js --version prints package version in subprocess', async () => {

@@ -12,18 +12,33 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: M1–M2 in progress. Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, and fault-injection recovery are implemented; `explain` is pending. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Milestones 1–2 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, and `wsg explain` are implemented. `add` and `refresh` are planned for Milestone 4. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
 wsg create "port EMR mono to modular for new system" --name port-emr
 cd ~/wsg/port-emr
-wsg add ~/code/emr-importer
-wsg add ~/docs/emr-migration.md
-wsg explain
+wsg explain      # read-only: saved repos, docs, exclusions, gaps, commands
 codex # or claude / pi
+
+# Planned (Milestone 4):
+# wsg add ~/code/emr-importer
+# wsg add ~/docs/emr-migration.md
+# wsg refresh
 ```
 
 Each feature gets an independent directory. There are no nested workspace groups or workspace orchestration in the MVP.
+
+## Inspecting a Workspace
+
+`wsg explain` is a read-only manifest printer. It resolves the nearest ancestor `workspace.yaml` (or accepts `--workspace <dir>`), then prints the request, repositories (intent, reason, and evidence), documents and their modes, exclusions, gaps, and discovered commands.
+
+```bash
+wsg explain                 # from anywhere inside a workspace or worktree
+wsg explain repo-name       # limit the report to one repository
+wsg explain --workspace ~/wsg/port-emr
+```
+
+It makes no model or network call, never invokes Git, and never reads `.wsg/`, so a completed workspace stays inspectable after its runtime storage is removed.
 
 ## Development
 
