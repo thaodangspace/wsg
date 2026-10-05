@@ -8,7 +8,7 @@ export const DEFAULT_FETCH_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 export interface FetchTextOptions {
-  /** Abort and fall back to a reference after this many milliseconds. */
+  /** Abort and fall back to a reference after this many milliseconds of wall time. */
   timeoutMs?: number;
   /** Hard cap on bytes read from the response body. */
   maxBytes?: number;
@@ -80,27 +80,38 @@ const ENTITY_MAP: Record<string, string> = {
 };
 
 function decodeEntities(text: string): string {
-  return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, body: string) => {
+  return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (match, body: string) => {
     const key = body.toLowerCase();
     if (ENTITY_MAP[key] !== undefined) {
       return ENTITY_MAP[key];
     }
+    let code: number | undefined;
     if (key.startsWith('#x')) {
-      const code = parseInt(key.slice(2), 16);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+      code = parseInt(key.slice(2), 16);
+    } else if (key.startsWith('#')) {
+      code = parseInt(key.slice(1), 10);
     }
-    if (key.startsWith('#')) {
-      const code = parseInt(key.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    if (code === undefined || !Number.isInteger(code)) {
+      return match;
     }
-    return match;
+    // Bound to valid Unicode scalar values. Surrogate halves and out-of-range
+    // code points must not reach String.fromCodePoint (which throws RangeError).
+    if (code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
+      return match;
+    }
+    try {
+      return String.fromCodePoint(code);
+    } catch {
+      return match;
+    }
   });
 }
 
 /**
  * Conservative HTML-to-text conversion: drop script/style/comment content,
  * strip remaining tags, decode common entities, and collapse blank runs. This
- * is intentionally lossy and never executes scripts or fetches subresources.
+ * is intentionally lossy, never executes scripts, never fetches subresources,
+ * and never throws.
  */
 export function htmlToText(html: string): string {
   let text = html.replace(/<!--[\s\S]*?-->/g, ' ');
@@ -108,11 +119,22 @@ export function htmlToText(html: string): string {
   text = text.replace(/<br\s*\/?>/gi, '\n');
   text = text.replace(/<\/(p|div|li|tr|h[1-6]|section|article|header|footer)\s*>/gi, '\n');
   text = text.replace(/<[^>]*>/g, ' ');
-  text = decodeEntities(text);
+  try {
+    text = decodeEntities(text);
+  } catch {
+    // Defensive: entity decoding must never abort a whole refresh. Fall back
+    // to the tag-stripped text, which is already safe.
+  }
   text = text.replace(/[ \t\f\v]+/g, ' ');
   text = text.replace(/ *\n */g, '\n');
   text = text.replace(/\n{3,}/g, '\n\n');
   return `${text.trim()}\n`;
+}
+
+function abortError(): Error {
+  const err = new Error('The operation was aborted');
+  err.name = 'AbortError';
+  return err;
 }
 
 function describeError(err: unknown): string {
@@ -125,20 +147,46 @@ function describeError(err: unknown): string {
   return String(err);
 }
 
+async function cancelBody(body: ReadableStream<Uint8Array> | null | undefined): Promise<void> {
+  if (!body) return;
+  try {
+    await body.cancel();
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Reads at most `maxBytes` from the response body. Races each read against the
+ * abort signal so a server that sends headers and then stalls cannot hang the
+ * operation past the overall deadline.
+ */
 async function readBoundedBody(
   body: ReadableStream<Uint8Array> | null,
-  maxBytes: number
+  maxBytes: number,
+  signal: AbortSignal
 ): Promise<{ content: Buffer; truncated: boolean }> {
   if (!body) {
     return { content: Buffer.alloc(0), truncated: false };
   }
+
+  const abortRejection = new Promise<never>((_resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortError());
+      return;
+    }
+    signal.addEventListener('abort', () => reject(abortError()), { once: true });
+  });
+
   const reader = body.getReader();
   const chunks: Buffer[] = [];
   let total = 0;
   let truncated = false;
+
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      if (signal.aborted) throw abortError();
+      const { done, value } = await Promise.race([reader.read(), abortRejection]);
       if (done) break;
       if (!value || value.byteLength === 0) continue;
       const remaining = maxBytes - total;
@@ -167,9 +215,11 @@ async function readBoundedBody(
 
 /**
  * Fetches a public HTTP(S) URL with finite limits and returns either accessible
- * text or an honest reference fallback. Network, timeout, redirect, size, and
- * content-type failures never throw; they return `kind: 'reference'` with a
- * reason. Hostile or malformed URLs are rejected before any network call.
+ * text or an honest reference fallback. A single wall-clock deadline bounds the
+ * entire operation: every redirect, the response headers, and the full body.
+ * Network, timeout, redirect, size, and content-type failures never throw; they
+ * return `kind: 'reference'` with a reason. Hostile or malformed URLs are
+ * rejected before any network call.
  */
 export async function fetchUrlText(
   url: string,
@@ -197,99 +247,131 @@ export async function fetchUrlText(
   }
 
   const source = url.trim();
-  let current = parsed;
+  const controller = new AbortController();
 
-  for (let hop = 0; hop <= maxRedirects; hop++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    try {
-      response = await fetchImpl(current.toString(), {
-        redirect: 'manual',
-        signal: controller.signal,
-        headers: {
-          accept:
-            'text/plain, text/markdown, text/html, application/json, application/xml;q=0.9, */*;q=0.1',
-          'user-agent': 'wsg/0.1 (+workspace-assembler)',
-        },
-      });
-    } catch (err: unknown) {
-      return { kind: 'reference', source, reason: `fetch failed: ${describeError(err)}` };
-    } finally {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(abortError());
+    }, timeoutMs);
+    // Do not keep the Node event loop alive solely for the deadline.
+    if (typeof (timer as { unref?: () => void }).unref === 'function') {
+      (timer as unknown as { unref: () => void }).unref();
+    }
+  });
+  const race = <T>(promise: Promise<T>): Promise<T> =>
+    Promise.race([promise, deadline]);
+
+  try {
+    let current = parsed;
+
+    for (let hop = 0; hop <= maxRedirects; hop++) {
+      let response: Response;
+      try {
+        response = await race(
+          fetchImpl(current.toString(), {
+            redirect: 'manual',
+            signal: controller.signal,
+            headers: {
+              accept:
+                'text/plain, text/markdown, text/html, application/json, application/xml;q=0.9, */*;q=0.1',
+              'user-agent': 'wsg/0.1 (+workspace-assembler)',
+            },
+          })
+        );
+      } catch (err: unknown) {
+        return { kind: 'reference', source, reason: `fetch failed: ${describeError(err)}` };
+      }
+
+      if (REDIRECT_STATUSES.has(response.status)) {
+        await cancelBody(response.body);
+        const location = response.headers.get('location');
+        if (!location) {
+          return { kind: 'reference', source, reason: 'redirect response without a Location header' };
+        }
+        if (hop === maxRedirects) {
+          return {
+            kind: 'reference',
+            source,
+            reason: `too many redirects (limit ${maxRedirects})`,
+          };
+        }
+        let next: URL;
+        try {
+          next = new URL(location, current);
+        } catch {
+          return { kind: 'reference', source, reason: `invalid redirect location '${location}'` };
+        }
+        if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+          return {
+            kind: 'reference',
+            source,
+            reason: `unsupported redirect protocol '${next.protocol}'`,
+          };
+        }
+        current = next;
+        continue;
+      }
+
+      if (!response.ok) {
+        await cancelBody(response.body);
+        return { kind: 'reference', source, reason: `HTTP ${response.status}` };
+      }
+
+      const contentType = response.headers.get('content-type') ?? '';
+      if (!isTextContentType(contentType)) {
+        await cancelBody(response.body);
+        return {
+          kind: 'reference',
+          source,
+          reason: `unsupported content type '${contentType || 'unknown'}'`,
+        };
+      }
+
+      let body: { content: Buffer; truncated: boolean };
+      try {
+        body = await race(readBoundedBody(response.body, maxBytes, controller.signal));
+      } catch (err: unknown) {
+        return {
+          kind: 'reference',
+          source,
+          reason: `failed reading response body: ${describeError(err)}`,
+        };
+      }
+
+      let content = body.content;
+      if (isHtmlContentType(contentType) && content.length > 0) {
+        try {
+          content = Buffer.from(htmlToText(content.toString('utf8')), 'utf8');
+        } catch {
+          // htmlToText is total, but never let conversion abort the update.
+          content = Buffer.from(content.toString('utf8').replace(/<[^>]*>/g, ' '), 'utf8');
+        }
+      }
+
+      if (containsSecretContent(content)) {
+        return {
+          kind: 'reference',
+          source,
+          reason: 'content looked like a private key; not snapshotted',
+        };
+      }
+
+      return {
+        kind: 'text',
+        source,
+        finalUrl: current.toString(),
+        contentType: contentType || 'text/plain',
+        content,
+        truncated: body.truncated,
+      };
+    }
+
+    return { kind: 'reference', source, reason: `too many redirects (limit ${maxRedirects})` };
+  } finally {
+    if (timer !== undefined) {
       clearTimeout(timer);
     }
-
-    if (REDIRECT_STATUSES.has(response.status)) {
-      const location = response.headers.get('location');
-      if (!location) {
-        return { kind: 'reference', source, reason: 'redirect response without a Location header' };
-      }
-      if (hop === maxRedirects) {
-        return {
-          kind: 'reference',
-          source,
-          reason: `too many redirects (limit ${maxRedirects})`,
-        };
-      }
-      let next: URL;
-      try {
-        next = new URL(location, current);
-      } catch {
-        return { kind: 'reference', source, reason: `invalid redirect location '${location}'` };
-      }
-      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
-        return {
-          kind: 'reference',
-          source,
-          reason: `unsupported redirect protocol '${next.protocol}'`,
-        };
-      }
-      current = next;
-      continue;
-    }
-
-    if (!response.ok) {
-      return { kind: 'reference', source, reason: `HTTP ${response.status}` };
-    }
-
-    const contentType = response.headers.get('content-type') ?? '';
-    if (!isTextContentType(contentType)) {
-      return {
-        kind: 'reference',
-        source,
-        reason: `unsupported content type '${contentType || 'unknown'}'`,
-      };
-    }
-
-    let body: { content: Buffer; truncated: boolean };
-    try {
-      body = await readBoundedBody(response.body, maxBytes);
-    } catch (err: unknown) {
-      return { kind: 'reference', source, reason: `failed reading response body: ${describeError(err)}` };
-    }
-
-    let content = body.content;
-    if (isHtmlContentType(contentType) && content.length > 0) {
-      content = Buffer.from(htmlToText(content.toString('utf8')), 'utf8');
-    }
-
-    if (containsSecretContent(content)) {
-      return {
-        kind: 'reference',
-        source,
-        reason: 'content looked like a private key; not snapshotted',
-      };
-    }
-
-    return {
-      kind: 'text',
-      source,
-      finalUrl: current.toString(),
-      contentType: contentType || 'text/plain',
-      content,
-      truncated: body.truncated,
-    };
   }
-
-  return { kind: 'reference', source, reason: `too many redirects (limit ${maxRedirects})` };
 }

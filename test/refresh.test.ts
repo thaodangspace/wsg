@@ -7,8 +7,11 @@ import { runMain } from './helpers/cli.ts';
 import { createTestRepo } from './helpers/git-fixture.ts';
 import { startHttpFixture } from './helpers/http-fixture.ts';
 import { branchCommit, worktreeList } from '../src/git.ts';
-import { parseManifest, type Manifest } from '../src/manifest.ts';
+import { parseManifest, serializeManifest, type Manifest } from '../src/manifest.ts';
 import { sha256 } from '../src/fsx.ts';
+import { runRefresh } from '../src/refresh.ts';
+import { acquireLock, releaseLock } from '../src/operation.ts';
+import { ConflictError } from '../src/errors.ts';
 
 const NO_CONFIG = path.join(os.tmpdir(), `wsg-refresh-noconfig-${process.pid}.yaml`);
 
@@ -349,5 +352,167 @@ test('refresh reports an unknown selector as invalid input', async () => {
     assert.match(result.stderr, /No document matches/);
   } finally {
     fx.cleanup();
+  }
+});
+
+function quietIo(cwd: string) {
+  return {
+    stdout: { write: () => true },
+    stderr: { write: () => true },
+    env: { ...process.env, WSG_CONFIG: NO_CONFIG },
+    cwd,
+  };
+}
+
+test('refresh refuses to publish over a manifest changed during the fetch', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-refresh-race-' });
+  const root = mkTmp('wsg-refresh-race-root-');
+  const wsDir = path.join(root, 'base');
+  const manifestPath = path.join(wsDir, 'workspace.yaml');
+  const server = await startHttpFixture();
+  server.serve('/doc', 'body\n', { 'content-type': 'text/plain' });
+
+  try {
+    await runCli(['create', 'race task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['add', `${server.baseUrl}/doc`, '--as', 'reference', '--workspace', wsDir], { cwd: wsDir });
+
+    await assert.rejects(
+      () =>
+        runRefresh(
+          {
+            selectors: [],
+            workspace: wsDir,
+            fetchImpl: (async () => {
+              const manifest = parseManifest(fs.readFileSync(manifestPath, 'utf8'));
+              manifest.context.push('external edit');
+              fs.writeFileSync(manifestPath, serializeManifest(manifest), 'utf8');
+              return new Response('remote body\n', {
+                status: 200,
+                headers: { 'content-type': 'text/plain' },
+              });
+            }) as unknown as typeof fetch,
+          },
+          quietIo(wsDir)
+        ),
+      (err: unknown) => err instanceof ConflictError
+    );
+
+    const after = readManifest(wsDir);
+    assert.deepEqual(after.context, ['external edit'], 'external manifest edit preserved');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    await server.close();
+  }
+});
+
+test('refresh never overwrites an untracked user file when upgrading a reference', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-refresh-upgrade-collision-' });
+  const root = mkTmp('wsg-refresh-upgrade-collision-root-');
+  const wsDir = path.join(root, 'base');
+  const server = await startHttpFixture();
+  server.serve('/wiki', 'Reference body\n', { 'content-type': 'text/plain' });
+
+  try {
+    await runCli(['create', 'upgrade collision', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['add', `${server.baseUrl}/wiki`, '--as', 'reference', '--workspace', wsDir], { cwd: wsDir });
+
+    const userFile = path.join(wsDir, 'docs', 'wiki.txt');
+    fs.writeFileSync(userFile, 'USER WIKI\n', 'utf8');
+
+    const refreshed = await runCli(['refresh'], { cwd: wsDir });
+    assert.equal(refreshed.exitCode, 0, refreshed.stderr);
+
+    assert.equal(fs.readFileSync(userFile, 'utf8'), 'USER WIKI\n', 'user file untouched');
+    const manifest = readManifest(wsDir);
+    const upgraded = manifest.docs.find((d) => d.source === `${server.baseUrl}/wiki`)!;
+    assert.equal(upgraded.mode, 'snapshot');
+    assert.notEqual(upgraded.path, 'docs/wiki.txt');
+    assert.match(upgraded.path!, /wiki-[0-9a-f]{6}\.txt$/);
+    assert.equal(fs.readFileSync(path.join(wsDir, upgraded.path!), 'utf8'), 'Reference body\n');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    await server.close();
+  }
+});
+
+test('refresh times out a stalled body, retains the snapshot, and releases the lock', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-refresh-stall-' });
+  const root = mkTmp('wsg-refresh-stall-root-');
+  const wsDir = path.join(root, 'base');
+  const server = await startHttpFixture();
+  server.serve('/doc.md', 'remote v1\n', { 'content-type': 'text/markdown' });
+
+  try {
+    await runCli(['create', 'stall task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['add', `${server.baseUrl}/doc.md`, '--workspace', wsDir], { cwd: wsDir });
+
+    const before = readManifest(wsDir);
+    const doc = before.docs.find((d) => d.source === `${server.baseUrl}/doc.md`)!;
+    const snapshotPath = path.join(wsDir, doc.path!);
+
+    // Headers only, then stall forever.
+    server.set('/doc.md', (_req, res) => {
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/markdown');
+      res.write('partial');
+    });
+
+    const code = await runRefresh(
+      { selectors: [], workspace: wsDir, fetchTimeoutMs: 50 },
+      quietIo(wsDir)
+    );
+    assert.equal(code, 3);
+    assert.equal(fs.readFileSync(snapshotPath, 'utf8'), 'remote v1\n', 'snapshot retained');
+
+    // The exact-token lock must have been released.
+    const lock = acquireLock(wsDir, { opId: 'post-stall-check' });
+    releaseLock(wsDir, lock);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    await server.close();
+  }
+});
+
+test('refresh regenerates context and adapters for a workspace with no documents', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-refresh-nodoc-' });
+  const root = mkTmp('wsg-refresh-nodoc-root-');
+  const wsDir = path.join(root, 'base');
+  const repoName = path.basename(fs.realpathSync(repo.dir));
+
+  try {
+    await runCli(['create', 'nodoc task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    assert.equal(readManifest(wsDir).docs.length, 0);
+
+    // Unedited: regeneration is a clean no-op success.
+    const clean = await runCli(['refresh'], { cwd: wsDir });
+    assert.equal(clean.exitCode, 0, clean.stderr);
+    const contextPath = path.join(wsDir, 'docs', 'context.md');
+    const adapterPath = path.join(wsDir, 'AGENTS.md');
+    assert.match(fs.readFileSync(contextPath, 'utf8'), new RegExp(repoName));
+
+    // A change to the saved manifest (context/roles) is reflected by refresh.
+    const manifestPath = path.join(wsDir, 'workspace.yaml');
+    const saved = parseManifest(fs.readFileSync(manifestPath, 'utf8'));
+    saved.context.push('SAVED CONTEXT');
+    fs.writeFileSync(manifestPath, serializeManifest(saved), 'utf8');
+    const reflected = await runCli(['refresh'], { cwd: wsDir });
+    assert.equal(reflected.exitCode, 0, reflected.stderr);
+    assert.match(fs.readFileSync(contextPath, 'utf8'), /SAVED CONTEXT/);
+
+    // Edited generated files are preserved with proposals.
+    fs.writeFileSync(contextPath, '# USER CONTEXT\n', 'utf8');
+    fs.writeFileSync(adapterPath, '# USER ADAPTER\n', 'utf8');
+    const edited = await runCli(['refresh'], { cwd: wsDir });
+    assert.equal(edited.exitCode, 3, edited.stderr);
+    assert.equal(fs.readFileSync(contextPath, 'utf8'), '# USER CONTEXT\n');
+    assert.equal(fs.readFileSync(adapterPath, 'utf8'), '# USER ADAPTER\n');
+    assert.ok(fs.existsSync(`${contextPath}.wsg-new`));
+    assert.ok(fs.existsSync(`${adapterPath}.wsg-new`));
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

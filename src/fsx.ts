@@ -12,6 +12,28 @@ export function ensureDir(dirPath: string, mode?: number): string {
 }
 
 /**
+ * Lists the lowercased entry basenames directly under `dir` (files, directories,
+ * and symlinks). Missing directories yield an empty set. Used to avoid
+ * overwriting untracked user files when allocating new workspace paths.
+ */
+export function listBasenames(dir: string): Set<string> {
+  const names = new Set<string>();
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return names;
+    }
+    throw err;
+  }
+  for (const entry of entries) {
+    names.add(entry.name.toLowerCase());
+  }
+  return names;
+}
+
+/**
  * Computes sha256 hex digest of a string or buffer.
  */
 export function sha256(content: string | NodeJS.ArrayBufferView): string {

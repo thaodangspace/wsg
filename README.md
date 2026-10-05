@@ -126,33 +126,46 @@ wsg add https://internal.example/page --as reference   # reference, no fetch
   pretending the content was read.
 - **Conflicts before mutation:** a pre-existing branch, worktree destination, or
   live writer lock stops the run with exit code 2 before anything is written.
+  Destination allocation also inspects the actual `docs/`/`scripts/` directories,
+  so an untracked user file is never chosen as a target.
+- **Atomic against concurrent writers:** `add` takes the writer lock *before*
+  reading the manifest and planning, and refuses to publish over a
+  `workspace.yaml` that changed during a slow fetch.
 
 `wsg refresh [doc-path-or-url]` re-reads local snapshots and re-fetches URL
 snapshots, updates only the selected documents (or all documents when no
-selector is given), and regenerates `docs/context.md`, the adapters, and
-`README.md`. It never rescouts, prunes attachments, changes Git revisions, or
-replaces working files.
+selector is given), and always regenerates `docs/context.md`, the adapters, and
+`README.md` (even when the workspace has no documents). It never rescouts,
+prunes attachments, changes Git revisions, or replaces working files.
 
 - A changed source with an untouched snapshot is copied in and the manifest
   hash/`fetched_at` are updated.
 - A deleted snapshot is restored from its source.
-- A readable reference is upgraded to a snapshot.
+- A readable reference is upgraded to a snapshot, allocated against the real
+  on-disk `docs/` contents so untracked files are not overwritten.
 - **User edits are never silently overwritten.** If you edited a snapshot and
   its source also changed, WSG keeps your file and writes `<snapshot>.wsg-new`
   with the new source bytes. If you edited a generated file
   (`docs/context.md`, `AGENTS.md`, `CLAUDE.md`, `README.md`), WSG keeps it and
   writes `<file>.wsg-new`. Either case exits 3.
 - **Failed fetches retain the last usable snapshot** and report a partial result
-  (exit 3); the previous manifest hash is preserved.
+  (exit 3); the previous manifest hash is preserved. A single wall-clock deadline
+  bounds the whole fetch, including a stalled response body.
+- `refresh` re-checks the on-disk snapshot immediately before each write and
+  refuses to publish over a `workspace.yaml` that changed during the operation.
 - `workspace.yaml` is published last and atomically, so an interrupted update
   never leaves a half-written manifest.
 
-An interrupted `wsg add` leaves a durable operation journal in `.wsg/`; rerun
-the same command with `--resume` to reconcile new worktrees/snapshots without
-duplicating work or overwriting edits. Concurrent `add`/`refresh` calls are
-serialized by the writer lock and fail closed with exit 2.
+An interrupted `wsg add` leaves a durable operation journal in `.wsg/` and
+stages the recorded document/script bytes under `.wsg/tmp/` before any mutation.
+Rerun the same command with `--resume` to reconcile new worktrees/snapshots from
+those staged bytes — even if the original source later changed or disappeared —
+without duplicating work or overwriting edits. Resume compares canonical source
+identities, so the same relative spelling in a different directory is rejected.
+Concurrent `add`/`refresh` calls are serialized by the writer lock and fail
+closed with exit 2.
 
-
+## Development
 
 Prerequisites:
 - Node `>=24`
@@ -235,6 +248,7 @@ There is no `wsg remove` in the MVP. To reuse a workspace name, tear the workspa
 `WSG_FAULT=<name>[:<n>]` makes WSG exit with code 70 on the `n`th hit of a fault point (default 1). It exists only to test crash recovery with real processes and is not needed for normal use.
 
 - `after-lock` — after the write lock and operation journal are persisted.
+- `after-stage` — after add stages recorded document/script bytes, before any mutation.
 - `after-worktree` — after a worktree is created, before its step is marked done.
 - `after-generate` — after generated files are reconciled, before `workspace.yaml` is published.
 

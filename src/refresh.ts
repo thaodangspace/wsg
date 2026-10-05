@@ -29,7 +29,8 @@ import {
 } from './operation.ts';
 import { reconcileGenerated } from './ownership.ts';
 import { renderAll } from './generate.ts';
-import { writeFileAtomic, ensureDir, sha256 } from './fsx.ts';
+import { writeFileAtomic, ensureDir, sha256, listBasenames } from './fsx.ts';
+import { writeWorkspaceFile } from './staging.ts';
 import { deriveUrlBasename } from './add.ts';
 import { writeSnapshotProposal } from './create.ts';
 import type { CliIO } from './cli.ts';
@@ -71,14 +72,36 @@ export interface RefreshEntryResult {
   detail: string;
 }
 
+export interface RefreshSourceData {
+  doc: DocEntry;
+  /** Successfully read/fetched snapshot bytes. */
+  content?: Buffer;
+  truncated?: boolean;
+  /** Reason a snapshot source could not be read/fetched. */
+  failure?: string;
+  /** A readable reference that can be upgraded to a snapshot. */
+  upgrade?: { content: Buffer; contentType: string; truncated: boolean; finalUrl: string };
+  /** A local reference that is intentionally left as-is. */
+  localReference?: boolean;
+}
+
 export interface RefreshPlan {
-  docs: DocEntry[];
+  selected: DocEntry[];
+  sources: RefreshSourceData[];
+  warnings: string[];
+}
+
+export interface PlannedRefreshWrite {
+  relPath: string;
+  content: Buffer;
+  expectedPriorSha?: string;
+}
+
+export interface RefreshDecision {
+  updatedManifest: Manifest;
   results: RefreshEntryResult[];
-  /** Relative snapshot paths to (re)write. */
-  writes: Map<string, Buffer>;
-  /** Relative proposal paths to write (never clobbering existing proposals). */
-  proposals: Map<string, Buffer>;
-  /** Newly snapshotted docs whose bytes should be removed from disk? (never) */
+  writes: PlannedRefreshWrite[];
+  proposals: Array<{ relPath: string; content: Buffer }>;
   partial: boolean;
   warnings: string[];
 }
@@ -90,8 +113,12 @@ function getCwd(io?: CliIO): string {
   return process.cwd();
 }
 
+function manifestPathFor(wsDir: string): string {
+  return path.join(wsDir, 'workspace.yaml');
+}
+
 function readManifestFrom(wsDir: string): Manifest {
-  const manifestPath = path.join(wsDir, 'workspace.yaml');
+  const manifestPath = manifestPathFor(wsDir);
   let text: string;
   try {
     text = fs.readFileSync(manifestPath, 'utf8');
@@ -116,8 +143,6 @@ function selectorMatches(doc: DocEntry, selector: string, cwd: string): boolean 
     return true;
   }
 
-  // Resolve local selectors against the caller's cwd and compare canonical
-  // sources so `wsg refresh ~/docs/x.md` matches a snapshot.
   if (classifyDocInput(selector) !== 'url') {
     const expanded = expandHome(selector);
     const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
@@ -172,6 +197,96 @@ function readLocalSnapshotSource(doc: DocEntry): InspectedFileDoc | Error {
   }
 }
 
+/**
+ * Read phase for `wsg refresh`: selects documents and gathers fresh source
+ * bytes. Performs no writes. A failed local read or URL fetch is recorded as a
+ * failure so the apply phase can retain the last snapshot and report partial.
+ */
+export async function planRefresh(
+  manifest: Manifest,
+  _wsDir: string,
+  options: RefreshOptions,
+  io: CliIO = {}
+): Promise<RefreshPlan> {
+  const cwd = getCwd(io);
+  const selectors = options.selectors ?? [];
+  const selected = selectDocs(manifest, selectors, cwd);
+  const selectedSources = new Set(selected.map((d) => d.source));
+
+  const sources: RefreshSourceData[] = [];
+  const warnings: string[] = [];
+
+  for (const doc of manifest.docs) {
+    if (!selectedSources.has(doc.source)) continue;
+    const isUrl = classifyDocInput(doc.source) === 'url';
+
+    if (doc.mode === 'snapshot' && doc.path) {
+      if (isUrl) {
+        const outcome = await fetchUrlText(doc.source, {
+          fetchImpl: options.fetchImpl,
+          timeoutMs: options.fetchTimeoutMs,
+          maxBytes: options.fetchMaxBytes,
+        });
+        if (outcome.kind === 'reference') {
+          sources.push({ doc, failure: `fetch failed (${outcome.reason})` });
+          continue;
+        }
+        if (!isTextBuffer(outcome.content)) {
+          sources.push({ doc, failure: 'fetched binary content' });
+          continue;
+        }
+        if (outcome.truncated) {
+          warnings.push(`URL '${doc.source}' was truncated at the fetch byte limit`);
+        }
+        sources.push({ doc, content: outcome.content, truncated: outcome.truncated });
+        continue;
+      }
+
+      const inspected = readLocalSnapshotSource(doc);
+      if (inspected instanceof Error) {
+        sources.push({ doc, failure: `source unreadable (${inspected.message})` });
+        continue;
+      }
+      sources.push({ doc, content: inspected.content });
+      continue;
+    }
+
+    // Reference doc.
+    if (!isUrl) {
+      sources.push({ doc, localReference: true });
+      continue;
+    }
+
+    const outcome = await fetchUrlText(doc.source, {
+      fetchImpl: options.fetchImpl,
+      timeoutMs: options.fetchTimeoutMs,
+      maxBytes: options.fetchMaxBytes,
+    });
+    if (outcome.kind === 'reference') {
+      sources.push({ doc, failure: `fetch failed (${outcome.reason})` });
+      continue;
+    }
+    if (!isTextBuffer(outcome.content)) {
+      sources.push({ doc, failure: 'fetched binary content' });
+      continue;
+    }
+    if (outcome.truncated) {
+      warnings.push(`URL '${doc.source}' was truncated at the fetch byte limit`);
+    }
+    sources.push({
+      doc,
+      upgrade: {
+        content: outcome.content,
+        contentType: outcome.contentType,
+        truncated: outcome.truncated,
+        finalUrl: outcome.finalUrl || doc.source,
+      },
+    });
+  }
+
+  return { selected, sources, warnings };
+}
+
 interface SnapshotDecision {
   outcome: RefreshOutcome;
   detail: string;
@@ -222,7 +337,6 @@ function decideSnapshotUpdate(
 
   // Source changed (or no recorded hash).
   if (diskContent !== null && diskHash === sourceHash) {
-    // A previous run already copied the new bytes (e.g. after a crash).
     return {
       outcome: recordedHash === sourceHash ? 'unchanged' : 'updated',
       detail: 'snapshot already matches new source; reconciled manifest hash',
@@ -252,95 +366,92 @@ function decideSnapshotUpdate(
 }
 
 /**
- * Computes a `wsg refresh` plan. Read-only: it may fetch URLs and read local
- * files, but performs no writes. A failed local read or URL fetch retains the
- * last snapshot and marks the plan partial.
+ * Decision phase for `wsg refresh`. Reads the current on-disk snapshot state
+ * (immediately before the caller writes) and returns the exact writes and
+ * proposals to perform. Never writes. Allocates upgraded-reference paths
+ * against both the manifest and the actual filesystem so untracked user files
+ * are never chosen.
  */
-export async function planRefresh(
+export function computeRefreshDecisions(
   manifest: Manifest,
-  wsDir: string,
-  options: RefreshOptions,
-  io: CliIO = {}
-): Promise<RefreshPlan> {
-  const cwd = getCwd(io);
-  const selectors = options.selectors ?? [];
-  const selected = selectDocs(manifest, selectors, cwd);
-  const selectedSources = new Set(selected.map((d) => d.source));
-
+  plan: RefreshPlan,
+  wsDir: string
+): RefreshDecision {
   const results: RefreshEntryResult[] = [];
-  const writes = new Map<string, Buffer>();
-  const proposals = new Map<string, Buffer>();
-  const warnings: string[] = [];
+  const writes: PlannedRefreshWrite[] = [];
+  const proposals: Array<{ relPath: string; content: Buffer }> = [];
+  const updatedBySource = new Map<string, DocEntry>();
+  const warnings = [...plan.warnings];
   let partial = false;
 
-  // Doc paths already used, so a reference upgraded to a snapshot avoids
-  // collisions with every other document in the workspace.
   const usedDoc = usedDocBasenames(
     manifest.docs.map((d) => d.path ?? '').filter(Boolean)
   );
+  for (const name of listBasenames(path.join(wsDir, 'docs'))) usedDoc.add(name);
 
-  const updatedBySource = new Map<string, DocEntry>();
-
-  for (const doc of manifest.docs) {
-    if (!selectedSources.has(doc.source)) continue;
+  for (const data of plan.sources) {
+    const doc = data.doc;
 
     if (doc.mode === 'snapshot' && doc.path) {
-      if (classifyDocInput(doc.source) === 'url') {
-        const outcome = await fetchUrlText(doc.source, {
-          fetchImpl: options.fetchImpl,
-          timeoutMs: options.fetchTimeoutMs,
-          maxBytes: options.fetchMaxBytes,
-        });
-        if (outcome.kind === 'reference') {
-          partial = true;
-          results.push({
-            source: doc.source,
-            path: doc.path,
-            outcome: 'retained',
-            detail: `fetch failed (${outcome.reason}); kept last snapshot`,
-          });
-          continue;
-        }
-        if (!isTextBuffer(outcome.content)) {
-          partial = true;
-          results.push({
-            source: doc.source,
-            path: doc.path,
-            outcome: 'retained',
-            detail: 'fetched binary content; kept last snapshot',
-          });
-          continue;
-        }
-        if (outcome.truncated) {
-          warnings.push(`URL '${doc.source}' was truncated at the fetch byte limit`);
-        }
-        const decision = decideSnapshotUpdate(doc, wsDir, outcome.content);
-        applyDecision(decision, doc, results, writes, proposals);
-        if (decision.newEntry) updatedBySource.set(doc.source, decision.newEntry);
-        if (decision.outcome === 'proposed') partial = true;
-        continue;
-      }
-
-      const inspected = readLocalSnapshotSource(doc);
-      if (inspected instanceof Error) {
+      if (data.content === undefined) {
         partial = true;
         results.push({
           source: doc.source,
           path: doc.path,
           outcome: 'retained',
-          detail: `source unreadable (${inspected.message}); kept last snapshot`,
+          detail: `${data.failure ?? 'fetch failed'}; kept last snapshot`,
         });
         continue;
       }
-      const decision = decideSnapshotUpdate(doc, wsDir, inspected.content);
-      applyDecision(decision, doc, results, writes, proposals);
-      if (decision.newEntry) updatedBySource.set(doc.source, decision.newEntry);
-      if (decision.outcome === 'proposed') partial = true;
+
+      const decision = decideSnapshotUpdate(doc, wsDir, data.content);
+      if (decision.write) {
+        writes.push({
+          relPath: decision.write.relPath,
+          content: decision.write.content,
+          ...(doc.sha256 ? { expectedPriorSha: doc.sha256 } : {}),
+        });
+      }
+      if (decision.proposal) {
+        proposals.push({ relPath: decision.proposal.relPath, content: decision.proposal.content });
+        partial = true;
+      }
+      if (decision.newEntry) {
+        updatedBySource.set(doc.source, decision.newEntry);
+      }
+      results.push({
+        source: doc.source,
+        path: doc.path,
+        outcome: decision.outcome,
+        detail: decision.detail,
+      });
       continue;
     }
 
-    // Reference doc: upgrade to a snapshot when it becomes readable text.
-    if (classifyDocInput(doc.source) !== 'url') {
+    // Reference doc.
+    if (data.upgrade) {
+      const basename = deriveUrlBasename(data.upgrade.finalUrl, data.upgrade.contentType);
+      const relPath = allocateDocPath(basename, doc.source, usedDoc);
+      const newEntry: DocEntry = {
+        source: doc.source,
+        path: relPath,
+        mode: 'snapshot',
+        added_by: doc.added_by,
+        sha256: sha256(data.upgrade.content),
+        fetched_at: new Date().toISOString(),
+      };
+      updatedBySource.set(doc.source, newEntry);
+      writes.push({ relPath, content: data.upgrade.content });
+      results.push({
+        source: doc.source,
+        path: relPath,
+        outcome: 'upgraded',
+        detail: 'reference upgraded to snapshot',
+      });
+      continue;
+    }
+
+    if (data.localReference) {
       results.push({
         source: doc.source,
         outcome: 'unchanged',
@@ -349,94 +460,38 @@ export async function planRefresh(
       continue;
     }
 
-    const outcome = await fetchUrlText(doc.source, {
-      fetchImpl: options.fetchImpl,
-      timeoutMs: options.fetchTimeoutMs,
-      maxBytes: options.fetchMaxBytes,
-    });
-    if (outcome.kind === 'reference') {
-      const reason = outcome.reason;
-      partial = true;
-      results.push({
-        source: doc.source,
-        outcome: 'retained',
-        detail: `fetch failed (${reason}); kept reference`,
-      });
-      if (doc.reason !== reason) {
-        updatedBySource.set(doc.source, { ...doc, reason });
-      }
-      continue;
-    }
-    if (!isTextBuffer(outcome.content)) {
-      partial = true;
-      results.push({
-        source: doc.source,
-        outcome: 'retained',
-        detail: 'fetched binary content; kept reference',
-      });
-      continue;
-    }
-
-    const basename = deriveUrlBasename(outcome.finalUrl || doc.source, outcome.contentType);
-    const relPath = allocateDocPath(basename, doc.source, usedDoc);
-    const newEntry: DocEntry = {
-      source: doc.source,
-      path: relPath,
-      mode: 'snapshot',
-      added_by: doc.added_by,
-      sha256: sha256(outcome.content),
-      fetched_at: new Date().toISOString(),
-    };
-    updatedBySource.set(doc.source, newEntry);
-    writes.set(relPath, outcome.content);
-    if (outcome.truncated) {
-      warnings.push(`URL '${doc.source}' was truncated at the fetch byte limit`);
-    }
+    // Reference fetch failed: retained; a failed requested refresh is partial.
+    partial = true;
+    const updated: DocEntry = data.failure
+      ? { ...doc, ...(doc.reason !== data.failure ? { reason: data.failure } : {}) }
+      : doc;
+    if (updated !== doc) updatedBySource.set(doc.source, updated);
     results.push({
       source: doc.source,
-      path: relPath,
-      outcome: 'upgraded',
-      detail: 'reference upgraded to snapshot',
+      outcome: 'retained',
+      detail: `${data.failure ?? 'fetch failed'}; kept reference`,
     });
   }
 
-  const docs = manifest.docs.map((doc) => updatedBySource.get(doc.source) ?? doc);
+  const updatedManifest: Manifest = {
+    ...manifest,
+    docs: manifest.docs.map((doc) => updatedBySource.get(doc.source) ?? doc),
+  };
 
-  return { docs, results, writes, proposals, partial, warnings };
+  return { updatedManifest, results, writes, proposals, partial, warnings };
 }
 
-function applyDecision(
-  decision: SnapshotDecision,
-  doc: DocEntry,
-  results: RefreshEntryResult[],
-  writes: Map<string, Buffer>,
-  proposals: Map<string, Buffer>
-): void {
-  if (decision.write) {
-    writes.set(decision.write.relPath, decision.write.content);
+function printResults(writeStdout: (chunk: string) => void, decision: RefreshDecision): void {
+  if (decision.results.length === 0) {
+    writeStdout('No documents to refresh; regenerating workspace context.\n');
+  } else {
+    writeStdout(`Documents refreshed (${decision.results.length}):\n`);
+    for (const result of decision.results) {
+      const location = result.path ? ` ${result.path}` : '';
+      writeStdout(`  - ${result.source}${location}: ${result.outcome} (${result.detail})\n`);
+    }
   }
-  if (decision.proposal) {
-    proposals.set(decision.proposal.relPath, decision.proposal.content);
-  }
-  results.push({
-    source: doc.source,
-    path: doc.path,
-    outcome: decision.outcome,
-    detail: decision.detail,
-  });
-}
-
-function printResults(writeStdout: (chunk: string) => void, plan: RefreshPlan): void {
-  if (plan.results.length === 0) {
-    writeStdout('No documents to refresh.\n');
-    return;
-  }
-  writeStdout(`Documents refreshed (${plan.results.length}):\n`);
-  for (const result of plan.results) {
-    const location = result.path ? ` ${result.path}` : '';
-    writeStdout(`  - ${result.source}${location}: ${result.outcome} (${result.detail})\n`);
-  }
-  for (const warning of plan.warnings) {
+  for (const warning of decision.warnings) {
     writeStdout(`  ! ${warning}\n`);
   }
 }
@@ -496,53 +551,66 @@ export async function runRefresh(
     );
   }
 
-  const manifest = readManifestFrom(wsDir);
-  const plan = await planRefresh(manifest, wsDir, options, io);
-  const updatedManifest: Manifest = { ...manifest, docs: plan.docs };
-  validateManifest(updatedManifest);
-
-  printResults(writeStdout, plan);
-
   if (options.dryRun) {
-    return plan.partial ? 3 : 0;
-  }
-
-  if (plan.results.length === 0 && plan.writes.size === 0 && plan.proposals.size === 0) {
-    // Nothing selected: still safe no-op.
-    return plan.partial ? 3 : 0;
+    const manifest = readManifestFrom(wsDir);
+    const plan = await planRefresh(manifest, wsDir, options, io);
+    const decision = computeRefreshDecisions(manifest, plan, wsDir);
+    validateManifest(decision.updatedManifest);
+    printResults(writeStdout, decision);
+    return decision.partial ? 3 : 0;
   }
 
   initWsgDir(wsDir);
-
-  // Refuse to run alongside an incomplete create/add operation.
-  const existing = readOperation(wsDir);
-  if (existing?.operation && existing.operation.status !== 'complete') {
-    throw new ConflictError(
-      `Workspace '${wsDir}' has an incomplete '${existing.operation.command}' operation. Finish it with --resume before refreshing.`
-    );
-  }
-
   const lock = acquireLock(wsDir, {
     onWarning: (msg) => writeStderr(`${msg}\n`),
   });
   let lockData: LockData | undefined = lock;
 
   try {
+    const existing = readOperation(wsDir);
+    if (existing?.operation && existing.operation.status !== 'complete') {
+      throw new ConflictError(
+        `Workspace '${wsDir}' has an incomplete '${existing.operation.command}' operation. Finish it with --resume before refreshing.`
+      );
+    }
+
+    const manifest = readManifestFrom(wsDir);
+    const baselineManifestSha = sha256(fs.readFileSync(manifestPathFor(wsDir)));
+
+    // Fetch/read under the writer lock so no other WSG writer can change the
+    // manifest or a snapshot while we plan.
+    const plan = await planRefresh(manifest, wsDir, options, io);
+    const decision = computeRefreshDecisions(manifest, plan, wsDir);
+    validateManifest(decision.updatedManifest);
+    printResults(writeStdout, decision);
+
     const tmpDir = resolveInside(wsDir, path.posix.join('.wsg', 'tmp', crypto.randomUUID()));
     ensureDir(tmpDir);
 
-    for (const [relPath, content] of plan.writes) {
-      writeWorkspaceFile(wsDir, tmpDir, relPath, content);
+    for (const write of decision.writes) {
+      writeWorkspaceFile(wsDir, tmpDir, write.relPath, write.content, {
+        expectedPriorSha: write.expectedPriorSha,
+      });
     }
-    for (const [relPath, content] of plan.proposals) {
-      writeSnapshotProposal(wsDir, relPath, content);
+    for (const proposal of decision.proposals) {
+      writeSnapshotProposal(wsDir, proposal.relPath, proposal.content);
     }
 
-    const generatedFiles = renderAll(updatedManifest);
+    // Always regenerate context/adapters/README from the saved manifest, even
+    // when there are no documents.
+    const generatedFiles = renderAll(decision.updatedManifest);
     const journal = readOperation(wsDir);
     const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
 
-    writeFileAtomic(path.join(wsDir, 'workspace.yaml'), serializeManifest(updatedManifest));
+    const currentManifestSha = sha256(fs.readFileSync(manifestPathFor(wsDir)));
+    if (currentManifestSha !== baselineManifestSha) {
+      throw new ConflictError(
+        `workspace.yaml changed while the refresh was running; refusing to overwrite it.`,
+        ['Re-run wsg refresh to plan against the current manifest.']
+      );
+    }
+
+    writeFileAtomic(manifestPathFor(wsDir), serializeManifest(decision.updatedManifest));
 
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -550,7 +618,8 @@ export async function runRefresh(
       // ignore
     }
 
-    const partial = plan.partial || reconcileResult.partial || reconcileResult.proposals.length > 0;
+    const partial =
+      decision.partial || reconcileResult.partial || reconcileResult.proposals.length > 0;
     writeStdout(`\nWorkspace ${manifest.name} refreshed at ${wsDir}\n`);
     if (partial) {
       writeStdout(
@@ -569,13 +638,4 @@ export async function runRefresh(
       lockData = undefined;
     }
   }
-}
-
-function writeWorkspaceFile(wsDir: string, tmpDir: string, relPath: string, content: Buffer): void {
-  const stagingPath = resolveInside(tmpDir, relPath);
-  const finalPath = resolveInside(wsDir, relPath);
-  ensureDir(path.dirname(stagingPath));
-  writeFileAtomic(stagingPath, content, { tmpDir });
-  ensureDir(path.dirname(finalPath));
-  fs.renameSync(stagingPath, finalPath);
 }

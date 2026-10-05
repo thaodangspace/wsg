@@ -9,9 +9,11 @@ import { runMain } from './helpers/cli.ts';
 import { createTestRepo } from './helpers/git-fixture.ts';
 import { startHttpFixture } from './helpers/http-fixture.ts';
 import { runGit, branchExists, branchCommit, worktreeList } from '../src/git.ts';
-import { parseManifest } from '../src/manifest.ts';
+import { parseManifest, serializeManifest } from '../src/manifest.ts';
 import { readOperation } from '../src/operation.ts';
 import { sha256 } from '../src/fsx.ts';
+import { runAdd } from '../src/add.ts';
+import { ConflictError } from '../src/errors.ts';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = path.join(REPO_ROOT, 'src', 'cli.ts');
@@ -528,6 +530,280 @@ test('interrupted add of a document resumes without losing the snapshot', async 
       fs.readFileSync(path.join(wsDir, manifest.docs[0].path!), 'utf8'),
       '# Persisted\n'
     );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('add preserves a manifest change made after the lock is acquired', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-add-race-base-' });
+  const extra = createTestRepo({ prefix: 'wsg-add-race-extra-' });
+  const root = mkTmp('wsg-add-race-root-');
+  const wsDir = path.join(root, 'base');
+
+  try {
+    await runCliInProcess(['create', 'race task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+
+    await runAdd({
+      inputs: [extra.dir],
+      workspace: wsDir,
+      _afterLockAcquired: (dir) => {
+        const manifestPath = path.join(dir, 'workspace.yaml');
+        const manifest = parseManifest(fs.readFileSync(manifestPath, 'utf8'));
+        manifest.context.push('concurrent update');
+        fs.writeFileSync(manifestPath, serializeManifest(manifest), 'utf8');
+      },
+    });
+
+    const manifest = readManifest(wsDir);
+    assert.deepEqual(manifest.context, ['concurrent update'], 'concurrent context update preserved');
+    assert.equal(manifest.repos.length, 2, 'the new repo is attached');
+  } finally {
+    repo.cleanup();
+    extra.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('add never overwrites untracked user files at destination paths', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-add-userfile-' });
+  const root = mkTmp('wsg-add-userfile-root-');
+  const wsDir = path.join(root, 'base');
+  const docDir = mkTmp('wsg-add-userfile-docs-');
+  const docPath = path.join(docDir, 'notes.md');
+  const scriptPath = path.join(docDir, 'run.sh');
+  fs.writeFileSync(docPath, '# source notes\n', 'utf8');
+  fs.writeFileSync(scriptPath, '#!/bin/sh\necho source\n', 'utf8');
+
+  try {
+    await runCliInProcess(['create', 'userfile task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+
+    // Untracked user files that are NOT part of the manifest.
+    const userDoc = path.join(wsDir, 'docs', 'notes.md');
+    fs.writeFileSync(userDoc, 'USER NOTES\n', 'utf8');
+    const scriptsDir = path.join(wsDir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    const userScript = path.join(scriptsDir, 'run.sh');
+    fs.writeFileSync(userScript, '#!/bin/sh\necho USER SCRIPT\n', 'utf8');
+    // A directory named like a document is also a collision.
+    const userDir = path.join(wsDir, 'docs', 'guide.md');
+    fs.mkdirSync(userDir, { recursive: true });
+
+    const docAdd = await runCliInProcess(['add', docPath, '--workspace', wsDir]);
+    assert.equal(docAdd.exitCode, 0, docAdd.stderr);
+    const scriptAdd = await runCliInProcess(['add', scriptPath, '--as', 'script', '--workspace', wsDir]);
+    assert.equal(scriptAdd.exitCode, 0, scriptAdd.stderr);
+    const guideDir = path.join(docDir, 'guide.md');
+    fs.writeFileSync(guideDir, '# guide source\n', 'utf8');
+    const guideAdd = await runCliInProcess(['add', guideDir, '--workspace', wsDir]);
+    assert.equal(guideAdd.exitCode, 0, guideAdd.stderr);
+
+    assert.equal(fs.readFileSync(userDoc, 'utf8'), 'USER NOTES\n', 'user doc untouched');
+    assert.equal(fs.readFileSync(userScript, 'utf8'), '#!/bin/sh\necho USER SCRIPT\n', 'user script untouched');
+    assert.ok(fs.statSync(userDir).isDirectory(), 'user directory untouched');
+
+    const manifest = readManifest(wsDir);
+    const notes = manifest.docs.find((d) => d.source === fs.realpathSync(docPath))!;
+    assert.notEqual(notes.path, 'docs/notes.md');
+    assert.match(notes.path!, /notes-[0-9a-f]{6}\.md$/);
+    const guide = manifest.docs.find((d) => d.source === fs.realpathSync(guideDir))!;
+    assert.notEqual(guide.path, 'docs/guide.md');
+    assert.match(guide.path!, /guide-[0-9a-f]{6}\.md$/);
+    const script = manifest.scripts[0];
+    assert.match(script.path, /run-[0-9a-f]{6}\.sh$/);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('add refuses a branch that appeared after lock acquisition and does no Git mutation', async () => {
+  const baseRepo = createTestRepo({ prefix: 'wsg-add-branch-race-base-' });
+  const newRepo = createTestRepo({ prefix: 'wsg-add-branch-race-new-' });
+  const root = mkTmp('wsg-add-branch-race-root-');
+  const wsDir = path.join(root, 'base');
+
+  try {
+    await runCliInProcess(['create', 'branch race', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+    const entryName = path.basename(fs.realpathSync(newRepo.dir));
+    const expectedBranch = `wsg/base/${entryName}`;
+    const worktreesBefore = worktreeList(newRepo.dir);
+
+    let createdBranch = '';
+    await assert.rejects(
+      () =>
+        runAdd({
+          inputs: [newRepo.dir],
+          workspace: wsDir,
+          _beforeWorktreeStep: (repo) => {
+            createdBranch = repo.branch;
+            runGit(['-C', repo.source, 'branch', repo.branch]);
+          },
+        }),
+      (err: unknown) => err instanceof ConflictError && /appeared/.test((err as Error).message)
+    );
+
+    assert.equal(createdBranch, expectedBranch);
+    assert.ok(branchExists(newRepo.dir, createdBranch));
+    assert.ok(!fs.existsSync(path.join(wsDir, entryName)), 'no worktree may be created');
+    assert.deepEqual(worktreeList(newRepo.dir), worktreesBefore, 'no Git worktree mutation');
+
+    // The interrupted journal must not claim the external branch as ours; resume conflicts.
+    const op = readOperation(wsDir);
+    const step = op?.operation?.steps.find((s) => s.id === `worktree:${entryName}`);
+    assert.ok(!step || step.status === 'planned', 'branch must not be recorded as owned recoverable state');
+
+    const resumed = runCli(['add', newRepo.dir, '--workspace', wsDir, '--resume']);
+    assert.equal(resumed.status, 2, resumed.stderr);
+    assert.ok(!fs.existsSync(path.join(wsDir, entryName)));
+    assert.deepEqual(worktreeList(newRepo.dir), worktreesBefore);
+  } finally {
+    baseRepo.cleanup();
+    newRepo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('resume recovers staged document bytes after the source is removed', async () => {
+  const baseRepo = createTestRepo({ prefix: 'wsg-add-staged-base-' });
+  const newRepo = createTestRepo({ prefix: 'wsg-add-staged-new-' });
+  const root = mkTmp('wsg-add-staged-root-');
+  const wsDir = path.join(root, 'base');
+  const docDir = mkTmp('wsg-add-staged-docs-');
+  const docPath = path.join(docDir, 'notes.md');
+  fs.writeFileSync(docPath, '# Persisted staged\n', 'utf8');
+
+  try {
+    await runCliInProcess(['create', 'staged task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+
+    const interrupted = runCli(
+      ['add', newRepo.dir, docPath, '--workspace', wsDir],
+      { env: { WSG_FAULT: 'after-stage:1' } }
+    );
+    assert.equal(interrupted.status, 70, interrupted.stderr);
+
+    // The document was durably staged before the Git step; remove the original
+    // source AND confirm the destination was not yet committed.
+    fs.rmSync(docPath);
+    assert.ok(!fs.existsSync(path.join(wsDir, 'docs', 'notes.md')), 'staged file must not be committed yet');
+
+    const resumed = runCli(['add', newRepo.dir, docPath, '--workspace', wsDir, '--resume']);
+    assert.equal(resumed.status, 0, resumed.stderr);
+
+    const manifest = readManifest(wsDir);
+    const doc = manifest.docs.find((d) => d.path?.endsWith('notes.md'))!;
+    assert.ok(doc, 'document recorded');
+    assert.equal(
+      fs.readFileSync(path.join(wsDir, doc.path!), 'utf8'),
+      '# Persisted staged\n',
+      'resume recovered staged bytes without the source'
+    );
+    assert.equal(manifest.repos.length, 2);
+  } finally {
+    baseRepo.cleanup();
+    newRepo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('resume adopts an intact script snapshot without its original source', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-add-intact-script-' });
+  const root = mkTmp('wsg-add-intact-script-root-');
+  const wsDir = path.join(root, 'base');
+  const scriptDir = mkTmp('wsg-add-intact-script-src-');
+  const scriptPath = path.join(scriptDir, 'run.sh');
+  fs.writeFileSync(scriptPath, '#!/bin/sh\necho intact\n', 'utf8');
+
+  try {
+    await runCliInProcess(['create', 'intact script', '--name', 'base', '--root', root, '--repo', repo.dir]);
+
+    const interrupted = runCli(
+      ['add', scriptPath, '--as', 'script', '--workspace', wsDir],
+      { env: { WSG_FAULT: 'after-generate:1' } }
+    );
+    assert.equal(interrupted.status, 70, interrupted.stderr);
+
+    fs.rmSync(scriptPath);
+
+    const resumed = runCli(['add', scriptPath, '--as', 'script', '--workspace', wsDir, '--resume']);
+    assert.equal(resumed.status, 0, resumed.stderr);
+    const manifest = readManifest(wsDir);
+    assert.equal(manifest.scripts.length, 1);
+    assert.equal(
+      fs.readFileSync(path.join(wsDir, manifest.scripts[0].path), 'utf8'),
+      '#!/bin/sh\necho intact\n'
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(scriptDir, { recursive: true, force: true });
+  }
+});
+
+test('resume rejects the same relative spelling resolved from a different cwd', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-add-cwd-base-' });
+  const root = mkTmp('wsg-add-cwd-root-');
+  const wsDir = path.join(root, 'base');
+  const dirA = mkTmp('wsg-add-cwd-a-');
+  const dirB = mkTmp('wsg-add-cwd-b-');
+  fs.writeFileSync(path.join(dirA, 'notes.md'), 'A\n', 'utf8');
+  fs.writeFileSync(path.join(dirB, 'notes.md'), 'B\n', 'utf8');
+
+  try {
+    await runCliInProcess(['create', 'cwd task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+
+    const interrupted = runCli(
+      ['add', './notes.md', '--workspace', wsDir],
+      { cwd: dirA, env: { WSG_FAULT: 'after-lock:1' } }
+    );
+    assert.equal(interrupted.status, 70, interrupted.stderr);
+
+    const resumed = runCli(
+      ['add', './notes.md', '--workspace', wsDir, '--resume'],
+      { cwd: dirB }
+    );
+    assert.equal(resumed.status, 2, resumed.stderr);
+    assert.match(resumed.stderr, /do not match|Recorded/);
+
+    const manifest = readManifest(wsDir);
+    assert.equal(manifest.docs.length, 0, 'no document may be attached');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dirA, { recursive: true, force: true });
+    fs.rmSync(dirB, { recursive: true, force: true });
+  }
+});
+
+test('add avoids overwriting a symlink at a destination path', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-add-symlink-' });
+  const root = mkTmp('wsg-add-symlink-root-');
+  const wsDir = path.join(root, 'base');
+  const docDir = mkTmp('wsg-add-symlink-docs-');
+  const docPath = path.join(docDir, 'extra.md');
+  fs.writeFileSync(docPath, '# extra source\n', 'utf8');
+
+  try {
+    await runCliInProcess(['create', 'symlink task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+
+    const target = path.join(wsDir, 'docs', '.keep');
+    fs.writeFileSync(target, 'keep\n', 'utf8');
+    const link = path.join(wsDir, 'docs', 'extra.md');
+    fs.symlinkSync(target, link);
+
+    const added = await runCliInProcess(['add', docPath, '--workspace', wsDir]);
+    assert.equal(added.exitCode, 0, added.stderr);
+
+    assert.ok(fs.lstatSync(link).isSymbolicLink(), 'user symlink preserved');
+    assert.equal(fs.readlinkSync(link), target);
+    const manifest = readManifest(wsDir);
+    const doc = manifest.docs.find((d) => d.source === fs.realpathSync(docPath))!;
+    assert.notEqual(doc.path, 'docs/extra.md');
+    assert.match(doc.path!, /extra-[0-9a-f]{6}\.md$/);
   } finally {
     repo.cleanup();
     fs.rmSync(root, { recursive: true, force: true });

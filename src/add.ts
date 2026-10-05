@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { UsageError, ConflictError } from './errors.ts';
-import { findWorkspaceRoot, expandHome, canonicalize, resolveInside } from './paths.ts';
+import { findWorkspaceRoot, expandHome, canonicalize, canonicalizeExistingPrefix, resolveInside } from './paths.ts';
 import {
   parseManifest,
   serializeManifest,
@@ -42,12 +42,14 @@ import {
 } from './operation.ts';
 import { reconcileGenerated } from './ownership.ts';
 import { renderAll } from './generate.ts';
-import { writeFileAtomic, ensureDir, sha256 } from './fsx.ts';
+import { writeFileAtomic, ensureDir, sha256, listBasenames } from './fsx.ts';
+import { stageFile, commitStagedFile, writeWorkspaceFile } from './staging.ts';
 import { faultPoint } from './faults.ts';
 import {
   inspectWorktreeRecovery,
   resolveStagingDir,
   writeSnapshotProposal,
+  assertSafeOperationId,
   type WorktreeRecoveryDecision,
 } from './create.ts';
 import { fetchUrlText, isHtmlContentType } from './remote.ts';
@@ -120,6 +122,8 @@ export interface AddPlan {
 export interface AddRecordedPlan {
   wsName: string;
   inputs: string[];
+  /** Canonical identities of the inputs at plan time (realpath / trimmed URL). */
+  inputIds: string[];
   as?: AddKind;
   repos: PlannedRepo[];
   docs: Array<DocEntry & { text?: boolean }>;
@@ -137,6 +141,10 @@ function getCwd(io?: CliIO): string {
   return process.cwd();
 }
 
+function manifestPathFor(wsDir: string): string {
+  return path.join(wsDir, 'workspace.yaml');
+}
+
 export function resolveInputPath(input: string, cwd: string): string {
   const expanded = expandHome(input);
   return path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
@@ -147,7 +155,14 @@ export function normalizeAddInput(input: string, cwd: string): string {
   if (classifyDocInput(input) === 'url') {
     return input.trim();
   }
-  return canonicalize(resolveInputPath(input, cwd));
+  return canonicalizeExistingPrefix(resolveInputPath(input, cwd));
+}
+
+function sortedEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((v, i) => v === sb[i]);
 }
 
 function detectKind(input: string, cwd: string, as?: AddKind): AddKind {
@@ -181,7 +196,7 @@ function detectKind(input: string, cwd: string, as?: AddKind): AddKind {
 
 /**
  * Deterministically allocates a `scripts/<basename>` path for a canonical
- * source, avoiding already-used basenames and reserved root names.
+ * source, avoiding already-used basenames.
  */
 export function allocateScriptPath(
   rawBasename: string,
@@ -272,10 +287,17 @@ function repoEntryFromPlan(repo: PlannedRepo): RepoEntry {
   };
 }
 
+/** Used basenames on disk for a workspace subdirectory (lowercased). */
+function diskBasenames(wsDir: string, sub: string): Set<string> {
+  return listBasenames(path.join(wsDir, sub));
+}
+
 /**
  * Plans the attachments for `wsg add`. Performs read-only inspection and
  * bounded URL fetches; it never mutates the workspace. Duplicate canonical
  * sources (within the batch or already present in the manifest) are no-ops.
+ * Destination allocation considers files already present on disk so untracked
+ * user files are never chosen as a target.
  */
 export async function planAdditions(
   manifest: Manifest,
@@ -293,10 +315,18 @@ export async function planAdditions(
   const seenRepoSources = new Set(manifest.repos.map((r) => normalizeSourcePath(r.source)));
   const seenDocSources = new Set(manifest.docs.map((d) => d.source));
   const seenScriptSources = new Set(manifest.scripts.map((s) => s.source));
-  const usedDoc = usedDocBasenames(manifest.docs.map((d) => d.path ?? '').filter(Boolean));
-  const usedScript = usedScriptBasenames(manifest.scripts);
 
-  // --- Repositories (names assigned after all sources are collected).
+  const usedDoc = usedDocBasenames(manifest.docs.map((d) => d.path ?? '').filter(Boolean));
+  for (const name of diskBasenames(wsDir, 'docs')) usedDoc.add(name);
+
+  const usedScript = usedScriptBasenames(manifest.scripts);
+  for (const name of diskBasenames(wsDir, 'scripts')) usedScript.add(name);
+
+  const reservedRepoNames = new Set<string>(
+    manifest.repos.map((r) => r.name.toLowerCase())
+  );
+  for (const name of listBasenames(wsDir)) reservedRepoNames.add(name);
+
   const newRepoCandidates: Array<{ input: string; source: string; info: ReturnType<typeof repoInfo> }> = [];
   const pendingDocs: Array<
     | { kind: 'file'; input: string; inspected: InspectedFileDoc }
@@ -389,11 +419,12 @@ export async function planAdditions(
     pendingDocs.push({ kind: 'file', input, inspected });
   }
 
-  // Assign repo entry names deterministically, avoiding existing names.
+  // Assign repo entry names deterministically, avoiding existing names, disk
+  // entries, and reserved root names.
   if (newRepoCandidates.length > 0) {
     const names = assignEntryNames(
       newRepoCandidates.map((c) => c.source),
-      { reservedNames: manifest.repos.map((r) => r.name) }
+      { reservedNames: [...reservedRepoNames] }
     );
     for (const candidate of newRepoCandidates) {
       const name = names.get(candidate.source);
@@ -519,7 +550,7 @@ function buildUpdatedManifest(manifest: Manifest, plan: AddPlan): Manifest {
   };
 }
 
-function unreadDocsFor(manifest: Manifest, plan: AddPlan): Set<string> {
+function unreadDocsFor(plan: AddPlan): Set<string> {
   const unread = new Set<string>();
   for (const doc of plan.docs) {
     if (doc.entry.path && doc.text === false) {
@@ -529,19 +560,59 @@ function unreadDocsFor(manifest: Manifest, plan: AddPlan): Set<string> {
   return unread;
 }
 
-function writeWorkspaceFile(wsDir: string, tmpDir: string, relPath: string, content: Buffer): void {
-  const stagingPath = resolveInside(tmpDir, relPath);
-  const finalPath = resolveInside(wsDir, relPath);
-  ensureDir(path.dirname(stagingPath));
-  writeFileAtomic(stagingPath, content, { tmpDir });
-  ensureDir(path.dirname(finalPath));
-  fs.renameSync(stagingPath, finalPath);
+/**
+ * Rejects every deterministic destination conflict under the lock and before
+ * any Git mutation: pre-existing branches, worktree destinations, and
+ * doc/script destinations that already hold different content.
+ */
+export function preflightAddPlan(wsDir: string, plan: AddPlan): void {
+  for (const repo of plan.repos) {
+    if (branchExists(repo.source, repo.branch)) {
+      throw new ConflictError(
+        `Branch '${repo.branch}' already exists in repository '${repo.source}'.`,
+        [
+          `To inspect the existing branch: git -C "${repo.source}" log -1 "${repo.branch}"`,
+          `Remove the branch if it is not part of a workspace, then retry.`,
+        ]
+      );
+    }
+    if (fs.existsSync(repo.dest)) {
+      throw new ConflictError(`Worktree destination '${repo.dest}' already exists.`);
+    }
+  }
+
+  for (const doc of plan.docs) {
+    if (doc.entry.mode !== 'snapshot' || !doc.entry.path || !doc.content) continue;
+    const finalPath = resolveInside(wsDir, doc.entry.path);
+    if (!fs.existsSync(finalPath)) continue;
+    if (doc.entry.sha256 && sha256(fs.readFileSync(finalPath)) === doc.entry.sha256) continue;
+    throw new ConflictError(
+      `Refusing to overwrite existing document '${doc.entry.path}': destination already contains different content.`,
+      [`Move or rename the existing file, then retry the add.`]
+    );
+  }
+
+  for (const script of plan.scripts) {
+    const finalPath = resolveInside(wsDir, script.entry.path);
+    if (!fs.existsSync(finalPath)) continue;
+    if (script.entry.sha256 && sha256(fs.readFileSync(finalPath)) === script.entry.sha256) continue;
+    throw new ConflictError(
+      `Refusing to overwrite existing script '${script.entry.path}': destination already contains different content.`,
+      [`Move or rename the existing file, then retry the add.`]
+    );
+  }
 }
 
-function planToRecorded(wsName: string, options: AddOptions, plan: AddPlan): AddRecordedPlan {
+function planToRecorded(
+  wsName: string,
+  options: AddOptions,
+  plan: AddPlan,
+  inputIds: string[]
+): AddRecordedPlan {
   return {
     wsName,
     inputs: [...options.inputs],
+    inputIds: [...inputIds],
     ...(options.as ? { as: options.as } : {}),
     repos: plan.repos.map((r) => ({ ...r })),
     docs: plan.docs.map((d) => ({ ...d.entry, ...(typeof d.text === 'boolean' ? { text: d.text } : {}) })),
@@ -563,6 +634,7 @@ export function extractAddPlan(op: Operation, fallbackName: string): AddRecorded
   return {
     wsName: (raw.wsName as string) ?? fallbackName,
     inputs: Array.isArray(raw.inputs) ? (raw.inputs as string[]) : [],
+    inputIds: Array.isArray(raw.inputIds) ? (raw.inputIds as string[]) : [],
     ...(typeof raw.as === 'string' ? { as: raw.as as AddKind } : {}),
     repos: rawRepos.map((r) => ({
       name: r.name,
@@ -747,25 +819,8 @@ function hasAdditions(plan: AddPlan): boolean {
   return plan.repos.length > 0 || plan.docs.length > 0 || plan.scripts.length > 0;
 }
 
-function preflightNewRepos(plan: AddPlan): void {
-  for (const repo of plan.repos) {
-    if (branchExists(repo.source, repo.branch)) {
-      throw new ConflictError(
-        `Branch '${repo.branch}' already exists in repository '${repo.source}'.`,
-        [
-          `To inspect the existing branch: git -C "${repo.source}" log -1 "${repo.branch}"`,
-          `Remove the branch if it is not part of a workspace, then retry.`,
-        ]
-      );
-    }
-    if (fs.existsSync(repo.dest)) {
-      throw new ConflictError(`Worktree destination '${repo.dest}' already exists.`);
-    }
-  }
-}
-
 function readManifestFrom(wsDir: string): Manifest {
-  const manifestPath = path.join(wsDir, 'workspace.yaml');
+  const manifestPath = manifestPathFor(wsDir);
   let text: string;
   try {
     text = fs.readFileSync(manifestPath, 'utf8');
@@ -781,15 +836,18 @@ function readManifestFrom(wsDir: string): Manifest {
 }
 
 /**
- * Applies a validated add plan under the writer lock and operation journal.
- * Publishes workspace.yaml last; returns 3 when generated files needed
- * `.wsg-new` proposals.
+ * Applies a validated add plan while the caller already holds the writer lock.
+ * Stages all recorded bytes before any Git mutation, rechecks branch/destination
+ * state immediately before each mutation, and publishes workspace.yaml last.
  */
-function applyAdd(
+function applyAddLocked(
   wsDir: string,
+  opId: string,
   baseManifest: Manifest,
+  baselineManifestSha: string,
   plan: AddPlan,
   options: AddOptions,
+  inputIds: string[],
   io: CliIO,
   writeStdout: (chunk: string) => void,
   writeStderr: (chunk: string) => void
@@ -797,127 +855,138 @@ function applyAdd(
   const updatedManifest = buildUpdatedManifest(baseManifest, plan);
   validateManifest(updatedManifest);
 
-  const recordPlan = planToRecorded(baseManifest.name, options, plan);
+  const recordPlan = planToRecorded(baseManifest.name, options, plan, inputIds);
 
-  initWsgDir(wsDir);
-  const opId = crypto.randomUUID();
-  const lock = acquireLock(wsDir, {
-    opId,
-    onWarning: (msg) => writeStderr(`${msg}\n`),
-  });
-  let lockData: LockData | undefined = lock;
+  const steps = buildSteps(plan);
+  const op: Operation = {
+    id: opId,
+    command: 'add',
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    args: {
+      inputs: options.inputs,
+      ...(options.as ? { as: options.as } : {}),
+    },
+    plan: recordPlan as unknown as Record<string, unknown>,
+    steps,
+  };
+  const previous = readOperation(wsDir);
+  if (previous?.operation && previous.operation.status !== 'complete') {
+    throw new ConflictError(
+      `Workspace '${wsDir}' already has a running '${previous.operation.command}' operation. Use --resume to continue it.`
+    );
+  }
+  const opFile: OperationFile = {
+    version: 1,
+    owned: previous?.owned ?? {},
+    operation: op,
+  };
+  writeOperation(wsDir, opFile);
+  faultPoint('after-lock', io.env);
 
-  try {
-    if (options._afterLockAcquired) {
-      options._afterLockAcquired(wsDir);
-    }
-
-    const steps = buildSteps(plan);
-    const op: Operation = {
-      id: opId,
-      command: 'add',
-      status: 'running',
-      startedAt: new Date().toISOString(),
-      args: {
-        inputs: options.inputs,
-        ...(options.as ? { as: options.as } : {}),
-      },
-      plan: recordPlan as unknown as Record<string, unknown>,
-      steps,
-    };
-    const previous = readOperation(wsDir);
-    if (previous?.operation && previous.operation.status !== 'complete') {
-      throw new ConflictError(
-        `Workspace '${wsDir}' already has a running '${previous.operation.command}' operation. Use --resume to continue it.`
-      );
-    }
-    const opFile: OperationFile = {
-      version: 1,
-      owned: previous?.owned ?? {},
-      operation: op,
-    };
-    writeOperation(wsDir, opFile);
-    faultPoint('after-lock', io.env);
-
-    // Repositories: create only new worktrees/branches.
-    for (const repo of plan.repos) {
-      if (options._beforeWorktreeStep) {
-        options._beforeWorktreeStep(repo);
-      }
-      markStep(wsDir, `worktree:${repo.name}`, 'started', {
-        detail: {
-          source: repo.source,
-          dest: repo.dest,
-          branch: repo.branch,
-          base_commit: repo.base_commit,
-          branchExistedBefore: false,
-          destExistedBefore: false,
-        },
-      });
-      worktreeAddNewBranch(repo.source, repo.branch, repo.dest, repo.base_commit);
-      faultPoint('after-worktree', io.env);
-      markStep(wsDir, `worktree:${repo.name}`, 'done');
-    }
-
-    // Docs and scripts via .wsg/tmp/<opId>/ then rename.
-    const tmpDir = resolveStagingDir(wsDir, opId);
-    ensureDir(tmpDir);
-    for (const doc of plan.docs) {
-      if (doc.entry.mode !== 'snapshot' || !doc.entry.path || !doc.content) continue;
-      markStep(wsDir, `snapshot:${doc.entry.path}`, 'started');
-      writeWorkspaceFile(wsDir, tmpDir, doc.entry.path, doc.content);
-      markStep(wsDir, `snapshot:${doc.entry.path}`, 'done');
-    }
-    for (const script of plan.scripts) {
-      markStep(wsDir, `script:${script.entry.path}`, 'started');
-      writeWorkspaceFile(wsDir, tmpDir, script.entry.path, script.content);
-      markStep(wsDir, `script:${script.entry.path}`, 'done');
-    }
-
-    // Regenerate context/adapters/README under ownership rules.
-    markStep(wsDir, 'generate', 'started');
-    const generatedFiles = renderAll(updatedManifest, { unreadDocs: unreadDocsFor(baseManifest, plan) });
-    const journal = readOperation(wsDir);
-    const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
-    markStep(wsDir, 'generate', 'done');
-    faultPoint('after-generate', io.env);
-
-    // Publish manifest last.
-    markStep(wsDir, 'publish-manifest', 'started');
-    const manifestPath = path.join(wsDir, 'workspace.yaml');
-    writeFileAtomic(manifestPath, serializeManifest(updatedManifest));
-    markStep(wsDir, 'publish-manifest', 'done');
-
-    const finished = readOperation(wsDir);
-    if (finished?.operation) {
-      finished.operation.status = 'complete';
-      finished.operation.completedAt = new Date().toISOString();
-      writeOperation(wsDir, finished);
-    }
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-
-    writeStdout(`\nAttached to workspace ${baseManifest.name} at ${wsDir}\n`);
-    if (reconcileResult.partial || reconcileResult.proposals.length > 0) {
-      writeStdout(
-        `Note: Some generated files required reconciliation; preserved edits and wrote .wsg-new proposals.\n`
-      );
-      return 3;
-    }
-    return 0;
-  } finally {
-    if (lockData) {
-      try {
-        releaseLock(wsDir, lockData);
-      } catch {
-        // ignore
-      }
-      lockData = undefined;
+  // Durably stage all recorded doc/script bytes BEFORE any step mutation.
+  const tmpDir = resolveStagingDir(wsDir, opId);
+  ensureDir(tmpDir);
+  for (const doc of plan.docs) {
+    if (doc.entry.mode === 'snapshot' && doc.entry.path && doc.content) {
+      stageFile(tmpDir, doc.entry.path, doc.content);
     }
   }
+  for (const script of plan.scripts) {
+    stageFile(tmpDir, script.entry.path, script.content);
+  }
+  faultPoint('after-stage', io.env);
+
+  // Commit doc/script bytes BEFORE any Git mutation so a destination conflict
+  // can never leave a worktree/branch behind.
+  for (const doc of plan.docs) {
+    if (doc.entry.mode !== 'snapshot' || !doc.entry.path || !doc.content) continue;
+    markStep(wsDir, `snapshot:${doc.entry.path}`, 'started');
+    commitStagedFile(wsDir, tmpDir, doc.entry.path, doc.content);
+    markStep(wsDir, `snapshot:${doc.entry.path}`, 'done');
+  }
+  for (const script of plan.scripts) {
+    markStep(wsDir, `script:${script.entry.path}`, 'started');
+    commitStagedFile(wsDir, tmpDir, script.entry.path, script.content);
+    markStep(wsDir, `script:${script.entry.path}`, 'done');
+  }
+
+  // Repositories: create only new worktrees/branches, rechecking state under
+  // the lock immediately before mutation.
+  for (const repo of plan.repos) {
+    if (options._beforeWorktreeStep) {
+      options._beforeWorktreeStep(repo);
+    }
+
+    const branchAppeared = branchExists(repo.source, repo.branch);
+    const destAppeared = fs.existsSync(repo.dest);
+    if (branchAppeared || destAppeared) {
+      throw new ConflictError(
+        branchAppeared
+          ? `Branch '${repo.branch}' appeared in repository '${repo.source}' after preflight; refusing to mutate.`
+          : `Worktree destination '${repo.dest}' appeared after preflight; refusing to mutate.`,
+        ['Re-run wsg add once the conflicting state is resolved.']
+      );
+    }
+
+    markStep(wsDir, `worktree:${repo.name}`, 'started', {
+      detail: {
+        source: repo.source,
+        dest: repo.dest,
+        branch: repo.branch,
+        base_commit: repo.base_commit,
+        branchExistedBefore: false,
+        destExistedBefore: false,
+      },
+    });
+    worktreeAddNewBranch(repo.source, repo.branch, repo.dest, repo.base_commit);
+    faultPoint('after-worktree', io.env);
+    markStep(wsDir, `worktree:${repo.name}`, 'done');
+  }
+
+  // Regenerate context/adapters/README under ownership rules.
+  markStep(wsDir, 'generate', 'started');
+  const generatedFiles = renderAll(updatedManifest, { unreadDocs: unreadDocsFor(plan) });
+  const journal = readOperation(wsDir);
+  const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
+  markStep(wsDir, 'generate', 'done');
+  faultPoint('after-generate', io.env);
+
+  // Refuse to publish over a manifest that changed since we planned (e.g. a
+  // hand edit during a slow fetch).
+  const currentManifestSha = sha256(fs.readFileSync(manifestPathFor(wsDir)));
+  if (currentManifestSha !== baselineManifestSha) {
+    throw new ConflictError(
+      `workspace.yaml changed while the add was running; refusing to overwrite it.`,
+      ['Re-run wsg add to plan against the current manifest.']
+    );
+  }
+
+  // Publish manifest last.
+  markStep(wsDir, 'publish-manifest', 'started');
+  writeFileAtomic(manifestPathFor(wsDir), serializeManifest(updatedManifest));
+  markStep(wsDir, 'publish-manifest', 'done');
+
+  const finished = readOperation(wsDir);
+  if (finished?.operation) {
+    finished.operation.status = 'complete';
+    finished.operation.completedAt = new Date().toISOString();
+    writeOperation(wsDir, finished);
+  }
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+
+  writeStdout(`\nAttached to workspace ${baseManifest.name} at ${wsDir}\n`);
+  if (reconcileResult.partial || reconcileResult.proposals.length > 0) {
+    writeStdout(
+      `Note: Some generated files required reconciliation; preserved edits and wrote .wsg-new proposals.\n`
+    );
+    return 3;
+  }
+  return 0;
 }
 
 async function executeAddResume(
@@ -927,46 +996,86 @@ async function executeAddResume(
   writeStdout: (chunk: string) => void,
   writeStderr: (chunk: string) => void
 ): Promise<number> {
-  const opFile = readOperation(wsDir);
-  if (!opFile?.operation) {
-    throw new ConflictError(`Workspace '${wsDir}' does not contain an operation journal. Cannot resume.`);
-  }
-  const op = opFile.operation;
-  if (op.command !== 'add') {
-    throw new ConflictError(
-      `Operation journal in '${wsDir}' is for command '${op.command}', not 'add'. Cannot resume.`
-    );
-  }
-  if (op.status === 'complete') {
-    throw new ConflictError(`Add operation in '${wsDir}' is already marked complete.`);
-  }
-
-  const recorded = extractAddPlan(op, path.basename(wsDir));
-
-  // Refuse to resume if the supplied inputs differ from the recorded ones.
   const cwd = getCwd(io);
-  const suppliedNormalized = options.inputs.map((i) => normalizeAddInput(i, cwd)).sort();
-  const recordedNormalized = recorded.inputs.map((i) => normalizeAddInput(i, cwd)).sort();
-  if (
-    suppliedNormalized.length !== recordedNormalized.length ||
-    suppliedNormalized.some((v, idx) => v !== recordedNormalized[idx]) ||
-    options.as !== recorded.as
-  ) {
-    throw new ConflictError('Supplied add inputs do not match the interrupted operation.');
-  }
-
-  const baseManifest = readManifestFrom(wsDir);
-  const updatedManifest = manifestFromRecorded(baseManifest, recorded);
-  validateManifest(updatedManifest);
 
   initWsgDir(wsDir);
   const lock = acquireLock(wsDir, {
-    opId: op.id,
     onWarning: (msg) => writeStderr(`${msg}\n`),
   });
   let lockData: LockData | undefined = lock;
 
   try {
+    // Re-read and revalidate the operation identity under the lock.
+    const opFile = readOperation(wsDir);
+    if (!opFile?.operation) {
+      throw new ConflictError(`Workspace '${wsDir}' does not contain an operation journal. Cannot resume.`);
+    }
+    const op = opFile.operation;
+    if (op.command !== 'add') {
+      throw new ConflictError(
+        `Operation journal in '${wsDir}' is for command '${op.command}', not 'add'. Cannot resume.`
+      );
+    }
+    if (op.status === 'complete') {
+      throw new ConflictError(`Add operation in '${wsDir}' is already marked complete.`);
+    }
+    assertSafeOperationId(op.id);
+
+    const recorded = extractAddPlan(op, path.basename(wsDir));
+
+    // Compare supplied canonical identities (resolved against THIS cwd) with the
+    // canonical identities recorded at plan time. A relative spelling that names
+    // a different source is rejected.
+    const suppliedIds = options.inputs.map((i) => normalizeAddInput(i, cwd));
+    if (recorded.inputIds.length === 0) {
+      throw new ConflictError(
+        `Interrupted add operation in '${wsDir}' has no recorded input identities; start a new add.`
+      );
+    }
+    if (!sortedEqual(suppliedIds, recorded.inputIds) || options.as !== recorded.as) {
+      throw new ConflictError('Supplied add inputs do not match the interrupted operation.', [
+        `Recorded: ${recorded.inputIds.join(', ')}`,
+        `Supplied: ${suppliedIds.join(', ')}`,
+      ]);
+    }
+
+    const baseManifest = readManifestFrom(wsDir);
+    const updatedManifest = manifestFromRecorded(baseManifest, recorded);
+    validateManifest(updatedManifest);
+
+    const tmpDir = resolveStagingDir(wsDir, op.id);
+
+    const stagedBytes = (relPath: string): Buffer | null => {
+      let stagingPath: string;
+      try {
+        stagingPath = resolveInside(tmpDir, relPath);
+      } catch {
+        return null;
+      }
+      try {
+        if (!fs.existsSync(stagingPath)) return null;
+        return fs.readFileSync(stagingPath);
+      } catch {
+        return null;
+      }
+    };
+
+    const sourceBytes = async (source: string): Promise<Buffer | null> => {
+      if (classifyDocInput(source) === 'url') {
+        const outcome = await fetchUrlText(source, {
+          fetchImpl: options.fetchImpl,
+          timeoutMs: options.fetchTimeoutMs,
+          maxBytes: options.fetchMaxBytes,
+        });
+        return outcome.kind === 'text' ? outcome.content : null;
+      }
+      try {
+        return fs.readFileSync(source);
+      } catch {
+        return null;
+      }
+    };
+
     // Preflight worktree recovery for every recorded repo before mutation.
     const decisions: WorktreeRecoveryDecision[] = [];
     for (const repo of recorded.repos) {
@@ -984,13 +1093,37 @@ async function executeAddResume(
       decisions.push(inspectWorktreeRecovery(step, repo));
     }
 
-    // Preflight snapshot/script recovery: reproduce recorded bytes from source.
+    // Preflight snapshot/script recovery. Target-first intact checks mean an
+    // already-written snapshot/script is adopted even if its source is gone.
     type Recovery =
       | { kind: 'intact'; relPath: string; stepId: string }
       | { kind: 'restore'; relPath: string; stepId: string; content: Buffer }
       | { kind: 'proposal'; relPath: string; stepId: string; content: Buffer };
     const recoveries: Recovery[] = [];
     let partial = false;
+
+    const resolveRecordedBytes = async (
+      relPath: string,
+      source: string,
+      sha: string | undefined,
+      label: string
+    ): Promise<Buffer> => {
+      const fromStage = stagedBytes(relPath);
+      if (fromStage && sha && sha256(fromStage) === sha) {
+        return fromStage;
+      }
+      const fromSource = await sourceBytes(source);
+      if (fromSource && sha && sha256(fromSource) === sha) {
+        return fromSource;
+      }
+      throw new ConflictError(
+        `Cannot reproduce recorded ${label} '${relPath}' from staged bytes or source '${source}'; refusing to resume add.`,
+        [
+          `Expected recorded sha256 ${sha ?? '(missing)'}.`,
+          `Restore the original source or start a new attachment.`,
+        ]
+      );
+    };
 
     for (const doc of recorded.docs) {
       if (doc.mode !== 'snapshot' || !doc.path) continue;
@@ -1002,32 +1135,7 @@ async function executeAddResume(
         recoveries.push({ kind: 'intact', relPath, stepId });
         continue;
       }
-      // Re-materialize from source. URLs are re-fetched (read-only) and the
-      // recorded hash must match; a changed source fails closed.
-      let content: Buffer | null = null;
-      if (classifyDocInput(doc.source) === 'url') {
-        const outcome = await fetchUrlText(doc.source, {
-          fetchImpl: options.fetchImpl,
-          timeoutMs: options.fetchTimeoutMs,
-          maxBytes: options.fetchMaxBytes,
-        });
-        if (outcome.kind === 'text') content = outcome.content;
-      } else {
-        try {
-          content = fs.readFileSync(doc.source);
-        } catch {
-          content = null;
-        }
-      }
-      if (!content || !doc.sha256 || sha256(content) !== doc.sha256) {
-        throw new ConflictError(
-          `Cannot reproduce recorded snapshot '${relPath}' from '${doc.source}'; refusing to resume add.`,
-          [
-            `Expected recorded sha256 ${doc.sha256 ?? '(missing)'}.`,
-            `Restore the original source or start a new attachment.`,
-          ]
-        );
-      }
+      const content = await resolveRecordedBytes(relPath, doc.source, doc.sha256, 'snapshot');
       if (exists) {
         recoveries.push({ kind: 'proposal', relPath, stepId, content });
         partial = true;
@@ -1035,25 +1143,18 @@ async function executeAddResume(
         recoveries.push({ kind: 'restore', relPath, stepId, content });
       }
     }
+
     for (const script of recorded.scripts) {
       const relPath = script.path;
       const stepId = `script:${relPath}`;
       const finalPath = resolveInside(wsDir, relPath);
       const exists = fs.existsSync(finalPath);
-      let content: Buffer | null = null;
-      try {
-        content = fs.readFileSync(script.source);
-      } catch {
-        content = null;
-      }
-      if (!content || !script.sha256 || sha256(content) !== script.sha256) {
-        throw new ConflictError(
-          `Cannot reproduce recorded script '${relPath}' from '${script.source}'; refusing to resume add.`
-        );
-      }
-      if (exists && sha256(fs.readFileSync(finalPath)) === script.sha256) {
+      if (exists && script.sha256 && sha256(fs.readFileSync(finalPath)) === script.sha256) {
         recoveries.push({ kind: 'intact', relPath, stepId });
-      } else if (exists) {
+        continue;
+      }
+      const content = await resolveRecordedBytes(relPath, script.source, script.sha256, 'script');
+      if (exists) {
         recoveries.push({ kind: 'proposal', relPath, stepId, content });
         partial = true;
       } else {
@@ -1061,7 +1162,6 @@ async function executeAddResume(
       }
     }
 
-    const tmpDir = resolveStagingDir(wsDir, op.id);
     ensureDir(tmpDir);
 
     for (const decision of decisions) {
@@ -1107,7 +1207,7 @@ async function executeAddResume(
     faultPoint('after-generate', io.env);
 
     markStep(wsDir, 'publish-manifest', 'started');
-    writeFileAtomic(path.join(wsDir, 'workspace.yaml'), serializeManifest(updatedManifest));
+    writeFileAtomic(manifestPathFor(wsDir), serializeManifest(updatedManifest));
     markStep(wsDir, 'publish-manifest', 'done');
 
     const finished = readOperation(wsDir);
@@ -1214,36 +1314,88 @@ export async function runAdd(
     );
   }
 
-  const manifest = readManifestFrom(wsDir);
-
   if (options.resume) {
     return await executeAddResume(wsDir, options, io, writeStdout, writeStderr);
   }
 
-  const plan = await planAdditions(manifest, wsDir, options, io);
+  // Dry run: read-only planning, no lock, no mutation.
+  if (options.dryRun) {
+    const manifest = readManifestFrom(wsDir);
+    const plan = await planAdditions(manifest, wsDir, options, io);
+    if (plan.warnings.length > 0) {
+      for (const warning of plan.warnings) writeStderr(`wsg: warning: ${warning}\n`);
+    }
+    printPlan(writeStdout, manifest, plan);
+    if (!hasAdditions(plan)) {
+      writeStdout(`\nNothing to add; all inputs are already attached to '${manifest.name}'.\n`);
+      return 0;
+    }
+    validateManifest(buildUpdatedManifest(manifest, plan));
+    preflightAddPlan(wsDir, plan);
+    return 0;
+  }
 
-  if (plan.warnings.length > 0) {
-    for (const warning of plan.warnings) {
-      writeStderr(`wsg: warning: ${warning}\n`);
+  // Real run: acquire the writer lock BEFORE reading the manifest and planning
+  // so a concurrent writer can never be silently dropped.
+  initWsgDir(wsDir);
+  const opId = crypto.randomUUID();
+  const lock = acquireLock(wsDir, {
+    opId,
+    onWarning: (msg) => writeStderr(`${msg}\n`),
+  });
+  let lockData: LockData | undefined = lock;
+
+  try {
+    if (options._afterLockAcquired) {
+      options._afterLockAcquired(wsDir);
+    }
+
+    const existing = readOperation(wsDir);
+    if (existing?.operation && existing.operation.status !== 'complete') {
+      throw new ConflictError(
+        `Workspace '${wsDir}' has an incomplete '${existing.operation.command}' operation. Use --resume to continue it.`
+      );
+    }
+
+    const manifest = readManifestFrom(wsDir);
+    const baselineManifestSha = sha256(fs.readFileSync(manifestPathFor(wsDir)));
+
+    const plan = await planAdditions(manifest, wsDir, options, io);
+
+    if (plan.warnings.length > 0) {
+      for (const warning of plan.warnings) writeStderr(`wsg: warning: ${warning}\n`);
+    }
+    printPlan(writeStdout, manifest, plan);
+
+    if (!hasAdditions(plan)) {
+      writeStdout(`\nNothing to add; all inputs are already attached to '${manifest.name}'.\n`);
+      return 0;
+    }
+
+    validateManifest(buildUpdatedManifest(manifest, plan));
+    preflightAddPlan(wsDir, plan);
+
+    const inputIds = options.inputs.map((i) => normalizeAddInput(i, cwd));
+    return applyAddLocked(
+      wsDir,
+      opId,
+      manifest,
+      baselineManifestSha,
+      plan,
+      options,
+      inputIds,
+      io,
+      writeStdout,
+      writeStderr
+    );
+  } finally {
+    if (lockData) {
+      try {
+        releaseLock(wsDir, lockData);
+      } catch {
+        // ignore
+      }
+      lockData = undefined;
     }
   }
-
-  printPlan(writeStdout, manifest, plan);
-
-  if (!hasAdditions(plan)) {
-    writeStdout(`\nNothing to add; all inputs are already attached to '${manifest.name}'.\n`);
-    return 0;
-  }
-
-  // Validate the resulting manifest before any mutation or dry-run output.
-  validateManifest(buildUpdatedManifest(manifest, plan));
-
-  if (options.dryRun) {
-    return 0;
-  }
-
-  // Conflict detection happens before any mutation.
-  preflightNewRepos(plan);
-
-  return applyAdd(wsDir, manifest, plan, options, io, writeStdout, writeStderr);
 }

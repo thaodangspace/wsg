@@ -197,3 +197,32 @@ test('fetchUrlText never returns private-key content as text', async () => {
     await server.close();
   }
 });
+
+test('htmlToText bounds malformed numeric entities without throwing', () => {
+  assert.doesNotThrow(() => htmlToText('<p>&#999999999; &#xD800; &#x110000; &unknown;</p>'));
+  const text = htmlToText('<p>before &#999999999; &#xD800; after</p>');
+  assert.match(text, /before/);
+  assert.match(text, /after/);
+});
+
+test('fetchUrlText times out on a stalled response body after headers', async () => {
+  const server = await startHttpFixture();
+  server.set('/stall-body', (_req, res) => {
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/plain');
+    res.write('partial body');
+    // Never call res.end(): header sent, body stalls forever.
+  });
+  try {
+    const started = Date.now();
+    const outcome = await fetchUrlText(`${server.baseUrl}/stall-body`, { timeoutMs: 50 });
+    const elapsed = Date.now() - started;
+    assert.equal(outcome.kind, 'reference');
+    if (outcome.kind === 'reference') {
+      assert.match(outcome.reason, /timed out/);
+    }
+    assert.ok(elapsed < 1000, `stalled body must be bounded (took ${elapsed}ms)`);
+  } finally {
+    await server.close();
+  }
+});
