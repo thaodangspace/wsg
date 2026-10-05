@@ -90,18 +90,23 @@ test('cli explain with unknown flag exits 1 and prints usage on stderr', async (
   assert.equal(result.stdout, '');
 });
 
-test('cli add exits 1 with not implemented in this version', async () => {
+test('cli add with no input exits 1 with usage', async () => {
   const result = await runMain(['add']);
   assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /not implemented in this version/);
+  assert.match(result.stderr, /add requires at least one path or URL/);
   assert.equal(result.stdout, '');
 });
 
-test('cli refresh exits 1 with not implemented in this version', async () => {
-  const result = await runMain(['refresh']);
-  assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /not implemented in this version/);
-  assert.equal(result.stdout, '');
+test('cli refresh outside a workspace exits 1 with a hint', async () => {
+  const emptyDir = mkdtempSync(path.join(os.tmpdir(), 'wsg-cli-refresh-'));
+  try {
+    const result = await runMain(['refresh'], { cwd: emptyDir });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /No workspace\.yaml/);
+    assert.equal(result.stdout, '');
+  } finally {
+    rmSync(emptyDir, { recursive: true, force: true });
+  }
 });
 
 test('stubbed ConflictError exits 2', async () => {

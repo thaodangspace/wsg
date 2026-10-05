@@ -92,6 +92,14 @@ export function renderContext(
     sections.push('## Documents\n\nNone attached.');
   }
 
+  // Scripts (attached, never executed)
+  if (manifest.scripts && manifest.scripts.length > 0) {
+    const scriptLines = manifest.scripts.map(
+      (script) => `- \`${script.path}\` — source: \`${script.source}\``
+    );
+    sections.push(`## Scripts (attached, not executed)\n\n${scriptLines.join('\n')}`);
+  }
+
   // Gaps and Unresolved Questions
   const gaps = manifest.discovery?.gaps ?? [];
   if (gaps.length > 0) {

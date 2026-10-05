@@ -267,6 +267,71 @@ export interface PlannedDoc extends DocEntry {
 export interface PlanDocsOptions {
   addedBy?: AddedBy;
   fetchedAt?: string;
+  /**
+   * Existing manifest doc paths to treat as already taken. Used by `wsg add` so
+   * a new snapshot never collides with a document already in the workspace.
+   */
+  existingPaths?: readonly string[];
+}
+
+/**
+ * Sanitizes a raw basename into a single path segment that is safe inside the
+ * workspace. Never returns an empty string.
+ */
+export function sanitizeBasename(raw: string): string {
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[._-]+|[._-]+$/g, '');
+  return cleaned.length > 0 ? cleaned : 'attachment';
+}
+
+/**
+ * Deterministically allocates a `docs/<basename>` path for a canonical source,
+ * avoiding reserved names (e.g. `context.md`) and every already-used basename
+ * (case-insensitively). Collisions append a stable `-<6hex>` suffix derived
+ * from the canonical source path, with a numeric fallback.
+ */
+export function allocateDocPath(
+  rawBasename: string,
+  canonicalSource: string,
+  usedLowerBasenames: Set<string>,
+  reserved: ReadonlySet<string> = RESERVED_DOC_BASENAMES
+): string {
+  // Preserve the supplied document's basename (including spaces/unicode); the
+  // manifest path validator rejects separators and traversal separately.
+  const safeBasename = rawBasename.length > 0 ? rawBasename : 'attachment';
+  const ext = path.extname(safeBasename);
+  const baseName = ext.length > 0 ? safeBasename.slice(0, -ext.length) : safeBasename;
+
+  const lowerRaw = safeBasename.toLowerCase();
+  if (!reserved.has(lowerRaw) && !usedLowerBasenames.has(lowerRaw)) {
+    usedLowerBasenames.add(lowerRaw);
+    return `docs/${safeBasename}`;
+  }
+
+  const suffix = suffixForSource(canonicalSource);
+  let candidate = `${baseName}-${suffix}${ext}`;
+  let counter = 1;
+  while (
+    reserved.has(candidate.toLowerCase()) ||
+    usedLowerBasenames.has(candidate.toLowerCase())
+  ) {
+    candidate = `${baseName}-${suffix}-${counter}${ext}`;
+    counter++;
+  }
+  usedLowerBasenames.add(candidate.toLowerCase());
+  return `docs/${candidate}`;
+}
+
+/**
+ * Builds the set of already-used lowercased doc basenames from a list of
+ * workspace-relative doc paths.
+ */
+export function usedDocBasenames(paths: readonly string[]): Set<string> {
+  const used = new Set<string>();
+  for (const docPath of paths) {
+    const base = path.posix.basename(docPath);
+    if (base) used.add(base.toLowerCase());
+  }
+  return used;
 }
 
 /**
@@ -303,7 +368,7 @@ export function planDocs(
 
   // Step 3: Plan doc entries
   const planned: PlannedDoc[] = [];
-  const usedLowerDocBasenames = new Set<string>();
+  const usedLowerDocBasenames = usedDocBasenames(options.existingPaths ?? []);
 
   for (const inspected of deduplicated) {
     if (inspected.kind === 'url') {
@@ -317,32 +382,11 @@ export function planDocs(
     }
 
     // Snapshot file
-    const rawBasename = inspected.basename;
-    const ext = path.extname(rawBasename);
-    const baseName = ext.length > 0 ? rawBasename.slice(0, -ext.length) : rawBasename;
-
-    let targetBasename: string;
-    const lowerRaw = rawBasename.toLowerCase();
-
-    if (!RESERVED_DOC_BASENAMES.has(lowerRaw) && !usedLowerDocBasenames.has(lowerRaw)) {
-      targetBasename = rawBasename;
-    } else {
-      const suffix = suffixForSource(inspected.source);
-      let candidate = `${baseName}-${suffix}${ext}`;
-      let counter = 1;
-      while (
-        RESERVED_DOC_BASENAMES.has(candidate.toLowerCase()) ||
-        usedLowerDocBasenames.has(candidate.toLowerCase())
-      ) {
-        candidate = `${baseName}-${suffix}-${counter}${ext}`;
-        counter++;
-      }
-      targetBasename = candidate;
-    }
-
-    usedLowerDocBasenames.add(targetBasename.toLowerCase());
-
-    const destRelPath = `docs/${targetBasename}`;
+    const destRelPath = allocateDocPath(
+      inspected.basename,
+      inspected.source,
+      usedLowerDocBasenames
+    );
     const snapEntry = snapshotDoc(inspected, destRelPath, { addedBy, fetchedAt });
 
     planned.push({

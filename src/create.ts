@@ -499,7 +499,7 @@ export function validateRecordedDestinations(wsDir: string, plan: RecordedPlan):
  * proposal is preserved; if it already holds the proposed bytes it is reused,
  * otherwise a numbered sibling is written.
  */
-function writeSnapshotProposal(wsDir: string, relPath: string, content: Buffer): string {
+export function writeSnapshotProposal(wsDir: string, relPath: string, content: Buffer): string {
   const baseRel = `${relPath}.wsg-new`;
   let chosenRel = baseRel;
   let chosenFull = resolveInside(wsDir, chosenRel);
