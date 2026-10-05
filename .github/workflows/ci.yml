@@ -15,8 +15,9 @@ concurrency:
 jobs:
   test:
     name: Node ${{ matrix.node }}
-    # Prefer GitHub-hosted runners; the repo also has a self-hosted Linux runner
-    # available as a fallback if hosted minutes are exhausted.
+    # Supported environment: Node >=24, npm, git, and ripgrep. GitHub-hosted
+    # ubuntu-latest is used so checks run without depending on the repo's
+    # self-hosted runner being online.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -28,12 +29,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      - name: Install ripgrep (required by retrieval tests)
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
       - name: Show toolchain versions
         run: |
           node --version
           npm --version
           git --version
-          (rg --version || echo 'ripgrep not installed; retrieval tests will report a bounded gap')
+          rg --version
       - name: Install dependencies
         run: npm ci
       - name: Typecheck
