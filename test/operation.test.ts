@@ -627,14 +627,21 @@ test('multi-process lock contention: only one contender wins and losers receive 
     initWsgDir(wsDir);
 
     const childScript = `
+      import fs from 'node:fs';
       import { acquireLock, releaseLock } from './src/operation.ts';
       import { ConflictError } from './src/errors.ts';
 
-      const wsDir = process.argv[process.argv.length - 1];
+      const wsDir = process.argv[process.argv.length - 2];
+      const goFile = process.argv[process.argv.length - 1];
+      // Wait for the parent's start barrier so all contenders attempt the
+      // acquire at the same moment regardless of process startup jitter.
+      while (!fs.existsSync(goFile)) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
       try {
         const lock = acquireLock(wsDir, { opId: 'child-' + process.pid });
-        // Hold lock for 100ms
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        // Hold lock for 300ms
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
         releaseLock(wsDir, lock);
         process.exit(0);
       } catch (err) {
@@ -645,22 +652,30 @@ test('multi-process lock contention: only one contender wins and losers receive 
       }
     `;
 
+    const goFile = path.join(os.tmpdir(), `wsg-contention-go-${process.pid}-${Date.now()}`);
     // Spawn 4 parallel child processes attempting acquireLock at the same moment
     const procs = Array.from({ length: 4 }, () =>
-      spawn('node', ['--input-type=module', '-e', childScript, '--', wsDir], {
+      spawn('node', ['--input-type=module', '-e', childScript, '--', wsDir, goFile], {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
     );
 
-    const exitCodes = await Promise.all(
-      procs.map((p) => new Promise<number>((resolve) => p.on('exit', (code) => resolve(code ?? 1))))
-    );
+    // Wait for children to be alive, then release the barrier.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    fs.writeFileSync(goFile, 'go');
+    try {
+      const exitCodes = await Promise.all(
+        procs.map((p) => new Promise<number>((resolve) => p.on('exit', (code) => resolve(code ?? 1))))
+      );
 
-    const winCount = exitCodes.filter((code) => code === 0).length;
-    const conflictCount = exitCodes.filter((code) => code === 2).length;
+      const winCount = exitCodes.filter((code) => code === 0).length;
+      const conflictCount = exitCodes.filter((code) => code === 2).length;
 
-    assert.equal(winCount, 1, 'Exactly one contender must acquire the lock and exit 0');
-    assert.equal(conflictCount, 3, 'All other contenders must conflict with exit code 2');
+      assert.equal(winCount, 1, 'Exactly one contender must acquire the lock and exit 0');
+      assert.equal(conflictCount, 3, 'All other contenders must conflict with exit code 2');
+    } finally {
+      fs.rmSync(goFile, { force: true });
+    }
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
