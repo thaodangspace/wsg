@@ -420,3 +420,72 @@ test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom 
   }
 });
 
+test('worktreeAddNewBranch and worktreeAddExisting disable dotted filter drivers and fail closed on config errors', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-dotted-filter-test-'));
+  const repoDir = path.join(tmpRoot, 'dotted-repo');
+  const wsRoot = path.join(tmpRoot, 'ws');
+  fs.mkdirSync(wsRoot);
+
+  const dottedMarker = path.join(tmpRoot, 'dotted-ran.txt');
+
+  try {
+    runGit(['init', '-b', 'main', repoDir]);
+    runGit(['-C', repoDir, 'config', 'user.name', 'WSG Test']);
+    runGit(['-C', repoDir, 'config', 'user.email', 'test@example.com']);
+
+    // Install recording smudge script for dotted filter driver: filter.custom.driver.smudge
+    const dottedScript = path.join(tmpRoot, 'dotted-smudge.sh');
+    fs.writeFileSync(
+      dottedScript,
+      `#!/bin/sh\necho "DOTTED_FILTER_RAN" > "${dottedMarker}"\ncat\n`,
+      { mode: 0o755 }
+    );
+
+    runGit(['-C', repoDir, 'config', 'filter.custom.driver.smudge', dottedScript]);
+    runGit(['-C', repoDir, 'config', 'filter.custom.driver.clean', 'cat']);
+    runGit(['-C', repoDir, 'config', 'filter.custom.driver.required', 'true']);
+
+    fs.writeFileSync(path.join(repoDir, '.gitattributes'), '*.dotted filter=custom.driver\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'example.dotted'), 'dotted content\n', 'utf8');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# Dotted Filter Test\n', 'utf8');
+
+    runGit(['-C', repoDir, 'add', '.']);
+    runGit(['-C', repoDir, 'commit', '-m', 'Add dotted filter file']);
+    const headSha = runGit(['-C', repoDir, 'rev-parse', 'HEAD']).trim();
+
+    // Verify unprotected worktree add would trigger dotted filter
+    const testUnprotected = path.join(tmpRoot, 'unprotected-dotted-wt');
+    runGit(['-C', repoDir, 'worktree', 'add', '-b', 'unprotected-dotted', testUnprotected, headSha]);
+    assert.ok(fs.existsSync(dottedMarker), 'Unprotected worktree add should run dotted filter');
+    fs.unlinkSync(dottedMarker);
+
+    // Form 1: worktreeAddNewBranch must disable dotted filter
+    const dest1 = path.join(wsRoot, 'app-branch');
+    worktreeAddNewBranch(repoDir, 'wsg/ws/dotted-branch', dest1, headSha);
+    assert.ok(fs.existsSync(dest1));
+    assert.ok(fs.existsSync(path.join(dest1, 'example.dotted')));
+    assert.equal(fs.existsSync(dottedMarker), false, 'worktreeAddNewBranch must NOT run dotted filter script');
+
+    // Form 2: worktreeAddExisting must disable dotted filter
+    const dest2 = path.join(wsRoot, 'app-existing');
+    const existingBranch = 'wsg/ws/dotted-existing';
+    runGit(['-C', repoDir, 'branch', existingBranch, headSha]);
+    worktreeAddExisting(repoDir, existingBranch, dest2);
+    assert.ok(fs.existsSync(dest2));
+    assert.ok(fs.existsSync(path.join(dest2, 'example.dotted')));
+    assert.equal(fs.existsSync(dottedMarker), false, 'worktreeAddExisting must NOT run dotted filter script');
+
+    // Fail closed: if config inspection fails for non-existent repo or corrupt config
+    const nonRepoDir = path.join(tmpRoot, 'non-existent-dir');
+    assert.throws(
+      () => worktreeAddNewBranch(nonRepoDir, 'wsg/ws/fail', path.join(wsRoot, 'fail'), headSha),
+      {
+        name: 'UsageError',
+      }
+    );
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+

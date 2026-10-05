@@ -49,27 +49,44 @@ export interface LockData {
   token?: string;
 }
 
+export interface ReclaimGuardData {
+  pid: number;
+  hostname: string;
+  startedAt: string;
+  targetPid: number;
+  token: string;
+}
+
 export interface AcquireLockOptions {
   opId?: string;
   onWarning?: (msg: string) => void;
+  _killFn?: (pid: number, signal: number | string) => boolean | void;
 }
 
-export function isPidAlive(pid: number): boolean {
+// Module-level retained acquisition tokens for backward-compatible releaseLock(dir)
+const activeLocks = new Map<string, LockData>();
+
+/**
+ * Checks whether a process PID is alive.
+ * Only ESRCH proves dead; EPERM or any unknown error is treated as alive/unknown.
+ */
+export function isPidAlive(
+  pid: number,
+  killFn: (pid: number, signal: number | string) => boolean | void = process.kill
+): boolean {
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
     return false;
   }
   try {
-    process.kill(pid, 0);
+    killFn(pid, 0);
     return true;
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ESRCH') {
       return false;
     }
-    if (code === 'EPERM') {
-      return true;
-    }
-    return false;
+    // EPERM or any unknown error must be treated as alive / not demonstrably dead
+    return true;
   }
 }
 
@@ -158,7 +175,7 @@ export function initWsgDir(dir: string): string {
   return wsgDir;
 }
 
-function parseValidLockData(content: string): LockData | null {
+export function parseValidLockData(content: string): LockData | null {
   try {
     const data = JSON.parse(content);
     if (!data || typeof data !== 'object') return null;
@@ -192,11 +209,51 @@ function parseValidLockData(content: string): LockData | null {
   }
 }
 
+function parseValidReclaimGuard(content: string): ReclaimGuardData | null {
+  try {
+    const data = JSON.parse(content);
+    if (!data || typeof data !== 'object') return null;
+
+    const raw = data as Record<string, unknown>;
+    const pid = raw.pid;
+    const hostname = raw.hostname;
+    const startedAt = raw.startedAt;
+    const targetPid = raw.targetPid;
+    const token = raw.token;
+
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+      return null;
+    }
+    if (typeof hostname !== 'string' || hostname.trim().length === 0) {
+      return null;
+    }
+    if (typeof startedAt !== 'string' || startedAt.trim().length === 0) {
+      return null;
+    }
+    if (typeof targetPid !== 'number' || !Number.isInteger(targetPid) || targetPid <= 0) {
+      return null;
+    }
+    if (typeof token !== 'string' || token.trim().length === 0) {
+      return null;
+    }
+
+    return {
+      pid,
+      hostname,
+      startedAt,
+      targetPid,
+      token,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Acquires exclusive workspace lock using O_EXCL.
  * Only reclaims a well-formed lock with matching local hostname and demonstrably dead positive integer PID.
  * Malformed, partial, hostname-missing, or unknown process state conflicts without unlinking.
- * Serializes stale reclamation via reclaim.lock and verifies ownership before atomic replacement.
+ * Serializes stale reclamation via recoverable reclaim.lock guard and verifies ownership before atomic replacement.
  */
 export function acquireLock(
   dir: string,
@@ -205,6 +262,7 @@ export function acquireLock(
 ): LockData {
   let opId: string | undefined;
   let onWarning: ((msg: string) => void) | undefined;
+  let killFn: ((pid: number, signal: number | string) => boolean | void) | undefined;
 
   if (typeof optionsOrOpId === 'string') {
     opId = optionsOrOpId;
@@ -212,13 +270,14 @@ export function acquireLock(
   } else if (optionsOrOpId && typeof optionsOrOpId === 'object') {
     opId = optionsOrOpId.opId;
     onWarning = optionsOrOpId.onWarning ?? legacyOnWarning;
+    killFn = optionsOrOpId._killFn;
   }
 
   const wsgDir = initWsgDir(dir);
   const lockPath = path.join(wsgDir, 'lock');
   const reclaimLockPath = path.join(wsgDir, 'reclaim.lock');
 
-  const maxAttempts = 10;
+  const maxAttempts = 15;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Check if lock file is a symlink
     try {
@@ -255,6 +314,7 @@ export function acquireLock(
       fs.fsyncSync(fd);
       fs.closeSync(fd);
       fd = null;
+      activeLocks.set(wsgDir, myLock);
       return myLock;
     } catch (err: unknown) {
       if (fd !== null) {
@@ -272,7 +332,6 @@ export function acquireLock(
     }
 
     // Lock file exists: read it carefully
-    // Give a concurrent writer a few microsecond turns in case it just opened the file
     let existingContent = '';
     let parsed: LockData | null = null;
     for (let readAttempt = 0; readAttempt < 5; readAttempt++) {
@@ -284,16 +343,14 @@ export function acquireLock(
         }
       } catch (readErr: unknown) {
         if ((readErr as NodeJS.ErrnoException).code === 'ENOENT') {
-          // Lock disappeared concurrently, retry acquisition
           break;
         }
       }
-      // Small sync sleep: 10ms
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
 
     if (!parsed) {
-      // Still malformed, partial, or missing fields: must conflict without unlinking
+      // Malformed, partial, or missing fields: must conflict without unlinking
       throw new ConflictError(
         `Workspace lock file '${lockPath}' is held or unreadable (cannot safely verify holder without conflict risk)`,
         [
@@ -315,8 +372,8 @@ export function acquireLock(
       );
     }
 
-    // On same host: check if PID is alive
-    const alive = isPidAlive(parsed.pid);
+    // On same host: check if PID is alive (only ESRCH proves dead)
+    const alive = isPidAlive(parsed.pid, killFn);
     if (alive) {
       throw new ConflictError(
         `Workspace lock held by active process (pid ${parsed.pid} on ${parsed.hostname})`,
@@ -328,27 +385,132 @@ export function acquireLock(
     }
 
     // Demonstrably dead positive integer PID on same local host:
-    // Serialize stale reclaimers via reclaim.lock to avoid races
+    // Serialize stale reclaimers via recoverable reclaim.lock guard
     let reclaimFd: number | null = null;
-    try {
-      reclaimFd = fs.openSync(reclaimLockPath, flags, 0o600);
-    } catch (reclaimErr: unknown) {
-      const recCode = (reclaimErr as NodeJS.ErrnoException).code;
-      if (recCode === 'EEXIST') {
-        // Another process is currently reclaiming, back off and retry
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-        continue;
-      }
-      throw reclaimErr;
-    }
+    let guardAcquired = false;
+
+    const guardToken = crypto.randomBytes(16).toString('hex');
+    const guardPayload =
+      JSON.stringify(
+        {
+          pid: process.pid,
+          hostname: os.hostname(),
+          startedAt: new Date().toISOString(),
+          targetPid: parsed.pid,
+          token: guardToken,
+        },
+        null,
+        2
+      ) + '\n';
 
     try {
-      // Protected by reclaim.lock: re-read lockPath and verify ownership before mutation
+      reclaimFd = fs.openSync(reclaimLockPath, flags, 0o600);
+      writeAllSync(reclaimFd, Buffer.from(guardPayload, 'utf8'));
+      fs.fsyncSync(reclaimFd);
+      fs.closeSync(reclaimFd);
+      reclaimFd = null;
+      guardAcquired = true;
+    } catch (reclaimErr: unknown) {
+      if (reclaimFd !== null) {
+        try {
+          fs.closeSync(reclaimFd);
+        } catch {}
+        reclaimFd = null;
+      }
+
+      const recCode = (reclaimErr as NodeJS.ErrnoException).code;
+      if (recCode !== 'EEXIST') {
+        throw reclaimErr;
+      }
+
+      // reclaim.lock exists: check whether it was left by a dead reclaimer
+      let existingGuardContent = '';
+      try {
+        existingGuardContent = fs.readFileSync(reclaimLockPath, 'utf8');
+      } catch {
+        existingGuardContent = '';
+      }
+      const existingGuard = parseValidReclaimGuard(existingGuardContent);
+
+      if (
+        existingGuard &&
+        existingGuard.hostname === os.hostname() &&
+        !isPidAlive(existingGuard.pid, killFn)
+      ) {
+        // Reclaimer died: take over stale reclamation guard via atomic swap
+        const staleGuardWarn = `wsg: taking over stale reclamation guard from dead process (pid ${existingGuard.pid} on ${existingGuard.hostname})`;
+        if (onWarning) {
+          onWarning(staleGuardWarn);
+        }
+        process.stderr.write(`${staleGuardWarn}\n`);
+
+        const tempGuardPath = path.join(
+          wsgDir,
+          `.reclaim.${process.pid}.${Date.now()}.${crypto.randomBytes(8).toString('hex')}.tmp`
+        );
+        let tgFd: number | null = null;
+        try {
+          tgFd = fs.openSync(tempGuardPath, flags, 0o600);
+          writeAllSync(tgFd, Buffer.from(guardPayload, 'utf8'));
+          fs.fsyncSync(tgFd);
+          fs.closeSync(tgFd);
+          tgFd = null;
+          fs.renameSync(tempGuardPath, reclaimLockPath);
+          guardAcquired = true;
+        } finally {
+          if (tgFd !== null) {
+            try { fs.closeSync(tgFd); } catch {}
+          }
+          try {
+            if (fs.existsSync(tempGuardPath)) fs.unlinkSync(tempGuardPath);
+          } catch {}
+        }
+      } else if (existingGuard && isPidAlive(existingGuard.pid, killFn)) {
+        // Held by live process: back off
+        if (attempt === maxAttempts - 1) {
+          throw new ConflictError(
+            `Workspace reclamation guard '${reclaimLockPath}' is held by active process (pid ${existingGuard.pid} on ${existingGuard.hostname})`,
+            [
+              `A lock reclamation is currently underway by process ${existingGuard.pid} on host '${existingGuard.hostname}'.`,
+              `Wait for it to finish, or manually remove '${reclaimLockPath}' if that process is no longer running.`,
+            ]
+          );
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        continue;
+      } else {
+        // Unknown or corrupt guard: if at last attempt, conflict with explicit guidance
+        if (attempt === maxAttempts - 1) {
+          throw new ConflictError(
+            `Workspace reclamation guard '${reclaimLockPath}' is held or unreadable`,
+            [
+              `An unverified reclamation guard file exists at '${reclaimLockPath}'.`,
+              `Remove '${reclaimLockPath}' manually if no reclamation process is active.`,
+            ]
+          );
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+        continue;
+      }
+    }
+
+    if (!guardAcquired) {
+      continue;
+    }
+
+    // Protected by reclaim.lock: re-read lockPath and verify ownership before mutation
+    const tempRand = crypto.randomBytes(8).toString('hex');
+    const tempLockPath = path.join(
+      wsgDir,
+      `.lock.${process.pid}.${Date.now()}.${tempRand}.tmp`
+    );
+    let tfd: number | null = null;
+
+    try {
       let verifyContent = '';
       try {
         verifyContent = fs.readFileSync(lockPath, 'utf8');
       } catch {
-        // lock vanished
         verifyContent = '';
       }
       const verified = parseValidLockData(verifyContent);
@@ -360,7 +522,7 @@ export function acquireLock(
         verified.startedAt !== parsed.startedAt ||
         verified.token !== parsed.token
       ) {
-        // Lock changed while we were acquiring reclaim.lock! Back off and re-evaluate
+        // Lock changed while we were acquiring guard! Back off and re-evaluate
         continue;
       }
 
@@ -372,34 +534,35 @@ export function acquireLock(
       process.stderr.write(`${warning}\n`);
 
       // Atomically replace lockPath using tmp file in same directory + rename
-      const tempRand = crypto.randomBytes(8).toString('hex');
-      const tempLockPath = path.join(
-        wsgDir,
-        `.lock.${process.pid}.${Date.now()}.${tempRand}.tmp`
-      );
-
-      const tfd = fs.openSync(tempLockPath, flags, 0o600);
+      tfd = fs.openSync(tempLockPath, flags, 0o600);
       writeAllSync(tfd, Buffer.from(payload, 'utf8'));
       fs.fsyncSync(tfd);
       fs.closeSync(tfd);
+      tfd = null;
 
       fs.renameSync(tempLockPath, lockPath);
+      activeLocks.set(wsgDir, myLock);
       return myLock;
     } finally {
-      if (reclaimFd !== null) {
+      if (tfd !== null) {
         try {
-          fs.closeSync(reclaimFd);
-        } catch {
-          // ignore
-        }
+          fs.closeSync(tfd);
+        } catch {}
       }
       try {
-        if (fs.existsSync(reclaimLockPath)) {
+        if (fs.existsSync(tempLockPath)) {
+          fs.unlinkSync(tempLockPath);
+        }
+      } catch {}
+
+      try {
+        // Check if reclaim.lock still belongs to our guard before unlinking
+        const rc = fs.readFileSync(reclaimLockPath, 'utf8');
+        const rParsed = parseValidReclaimGuard(rc);
+        if (rParsed?.token === guardToken) {
           fs.unlinkSync(reclaimLockPath);
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
     }
   }
 
@@ -407,7 +570,9 @@ export function acquireLock(
 }
 
 /**
- * Releases the workspace lock only if it matches our own acquisition.
+ * Releases the workspace lock only if it matches our exact acquisition token.
+ * Retains acquired tokens locally if releaseLock(dir) is called without arguments.
+ * Never unlinks an unverified replacement or mismatched lock.
  */
 export function releaseLock(
   dir: string,
@@ -418,27 +583,39 @@ export function releaseLock(
 
   try {
     if (!fs.existsSync(lockPath)) {
+      activeLocks.delete(wsgDir);
       return;
     }
 
     const content = fs.readFileSync(lockPath, 'utf8');
     const current = parseValidLockData(content);
-
-    // Verify ownership before unlinking
-    const expectedPid = expectedLock?.pid ?? process.pid;
-    const expectedHost = expectedLock?.hostname ?? os.hostname();
-
-    if (current?.pid !== expectedPid || current?.hostname !== expectedHost) {
-      // Does not belong to this process, refuse to unlink
+    if (!current || !current.token) {
+      // Malformed lock or missing token: never unlink an unverified lock
       return;
     }
 
-    if (expectedLock?.token && current?.token && current.token !== expectedLock.token) {
-      // Token mismatch, refuse to unlink
+    // Determine expected token
+    const expected = expectedLock ?? activeLocks.get(wsgDir);
+    if (!expected || !expected.token) {
+      // No retained acquisition token and no valid expected token: refuse to unlink
+      return;
+    }
+
+    const expectedPid = expected.pid ?? process.pid;
+    const expectedHost = expected.hostname ?? os.hostname();
+
+    // Require EXACT token match, exact PID match, and exact hostname match
+    if (
+      current.token !== expected.token ||
+      current.pid !== expectedPid ||
+      current.hostname !== expectedHost
+    ) {
+      // Token or ownership mismatch (e.g. same-PID replacement, foreign lock)
       return;
     }
 
     fs.unlinkSync(lockPath);
+    activeLocks.delete(wsgDir);
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw err;

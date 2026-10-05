@@ -391,6 +391,8 @@ export function worktreeList(repoPath: string, options: RunGitOptions = {}): Wor
 /**
  * Returns configuration arguments to disable post-checkout hooks, LFS smudge/clean,
  * and custom filters during worktree materialization.
+ * Extracts full subsection driver names including dotted names (e.g. filter.custom.driver.smudge).
+ * Fails closed if configuration inspection fails for reasons other than no matching settings.
  */
 export function getMaterializationConfigArgs(repoPath: string, options: RunGitOptions = {}): string[] {
   const args: string[] = [
@@ -401,28 +403,44 @@ export function getMaterializationConfigArgs(repoPath: string, options: RunGitOp
     '-c', 'filter.lfs.required=false',
   ];
 
+  const canonical = canonicalize(repoPath);
+  let configOut = '';
   try {
-    const canonical = canonicalize(repoPath);
-    const configOut = runGit(['-C', canonical, 'config', '--get-regexp', '^filter\\.'], options);
-    const filterNames = new Set<string>();
-    for (const line of configOut.split('\n')) {
-      const match = line.trim().match(/^filter\.([^.]+)\./);
-      if (match && match[1]) {
-        filterNames.add(match[1]);
-      }
+    configOut = runGit(['-C', canonical, 'config', '--get-regexp', '^filter\\.'], options);
+  } catch (err: unknown) {
+    const status = (err as { status?: number }).status;
+    if (status === 1) {
+      // Exit code 1 in git config --get-regexp indicates no matching settings found
+      configOut = '';
+    } else {
+      // Any other exit code is a real failure: fail closed
+      throw new UsageError(
+        `Failed to inspect repository filter configuration in '${repoPath}': ${(err as Error).message}`
+      );
     }
-    for (const name of filterNames) {
-      if (name !== 'lfs') {
-        args.push(
-          '-c', `filter.${name}.smudge=`,
-          '-c', `filter.${name}.clean=`,
-          '-c', `filter.${name}.process=`,
-          '-c', `filter.${name}.required=false`
-        );
-      }
+  }
+
+  const filterNames = new Set<string>();
+  for (const rawLine of configOut.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const firstSpace = line.indexOf(' ');
+    const key = firstSpace === -1 ? line : line.slice(0, firstSpace);
+    const match = key.match(/^filter\.(.+)\.(smudge|clean|process|required)$/);
+    if (match && match[1]) {
+      filterNames.add(match[1]);
     }
-  } catch {
-    // If config search fails, default overrides suffice
+  }
+
+  for (const name of filterNames) {
+    if (name !== 'lfs') {
+      args.push(
+        '-c', `filter.${name}.smudge=`,
+        '-c', `filter.${name}.clean=`,
+        '-c', `filter.${name}.process=`,
+        '-c', `filter.${name}.required=false`
+      );
+    }
   }
 
   return args;

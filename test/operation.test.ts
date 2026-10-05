@@ -374,32 +374,212 @@ test('acquireLock refuses to unlink malformed, empty, or missing-hostname lock f
   }
 });
 
-test('releaseLock verifies ownership and refuses to unlink another process lock', () => {
+test('isPidAlive treats only ESRCH as dead and unknown errors as alive/conflict', () => {
+  // Test with injected killFn
+  const fakePid = 12345;
+
+  // ESRCH proves dead
+  assert.equal(
+    isPidAlive(fakePid, () => {
+      const err = new Error('No such process');
+      (err as NodeJS.ErrnoException).code = 'ESRCH';
+      throw err;
+    }),
+    false
+  );
+
+  // EPERM proves alive (exists but cannot signal)
+  assert.equal(
+    isPidAlive(fakePid, () => {
+      const err = new Error('Operation not permitted');
+      (err as NodeJS.ErrnoException).code = 'EPERM';
+      throw err;
+    }),
+    true
+  );
+
+  // Unknown error must be treated as alive
+  assert.equal(
+    isPidAlive(fakePid, () => {
+      const err = new Error('Unknown internal error');
+      (err as NodeJS.ErrnoException).code = 'EINVAL';
+      throw err;
+    }),
+    true
+  );
+
+  // acquireLock with unknown kill error must conflict and not reclaim/unlink
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-injected-kill-'));
+  try {
+    initWsgDir(wsDir);
+    const lockPath = path.join(wsDir, '.wsg', 'lock');
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: fakePid,
+        hostname: os.hostname(),
+        startedAt: new Date().toISOString(),
+        token: 'test-token',
+      }) + '\n',
+      'utf8'
+    );
+
+    assert.throws(
+      () =>
+        acquireLock(wsDir, {
+          _killFn: () => {
+            const err = new Error('Random kernel error');
+            (err as NodeJS.ErrnoException).code = 'EIO';
+            throw err;
+          },
+        }),
+      {
+        name: 'ConflictError',
+        message: /Workspace lock held by active process/,
+      }
+    );
+    assert.ok(fs.existsSync(lockPath), 'Lock must not be unlinked on unknown process.kill error');
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test('releaseLock requires exact token match and handles same-PID replacement and missing tokens', () => {
   const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-releaselock-'));
   try {
     initWsgDir(wsDir);
     const lockPath = path.join(wsDir, '.wsg', 'lock');
 
-    // Lock owned by another process PID
-    const otherLock = {
-      pid: 999999,
+    // 1. Acquire lock normally (stores retained token in activeLocks)
+    const acquired = acquireLock(wsDir, { opId: 'test-op' });
+    assert.ok(acquired.token);
+    assert.ok(fs.existsSync(lockPath));
+
+    // 2. Simulate same-PID replacement on disk with a DIFFERENT token
+    const replacementLock = {
+      pid: process.pid,
       hostname: os.hostname(),
       startedAt: new Date().toISOString(),
-      token: 'foreign-token',
+      token: 'different-token-' + Date.now(),
     };
-    fs.writeFileSync(lockPath, JSON.stringify(otherLock, null, 2) + '\n', 'utf8');
+    fs.writeFileSync(lockPath, JSON.stringify(replacementLock, null, 2) + '\n', 'utf8');
 
-    // Calling releaseLock from this process must NOT unlink other process's lock
+    // Calling releaseLock(wsDir) must NOT unlink because token differs
     releaseLock(wsDir);
-    assert.ok(fs.existsSync(lockPath), 'releaseLock must not unlink lock belonging to different PID');
+    assert.ok(fs.existsSync(lockPath), 'releaseLock must refuse to unlink same-PID replacement with different token');
 
-    // Explicit mismatch in token
-    releaseLock(wsDir, { pid: 999999, hostname: os.hostname(), token: 'wrong-token' });
-    assert.ok(fs.existsSync(lockPath), 'releaseLock must not unlink when token mismatches');
+    // 3. Simulate missing / stripped token on disk
+    const strippedLock = {
+      pid: process.pid,
+      hostname: os.hostname(),
+      startedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(lockPath, JSON.stringify(strippedLock, null, 2) + '\n', 'utf8');
 
-    // Matching ownership removes lock
-    releaseLock(wsDir, otherLock);
-    assert.equal(fs.existsSync(lockPath), false, 'releaseLock with matching ownership should unlink');
+    // Calling releaseLock(wsDir) must NOT unlink when token is missing on disk
+    releaseLock(wsDir);
+    assert.ok(fs.existsSync(lockPath), 'releaseLock must refuse to unlink when token is missing on disk');
+
+    // 4. Restore original token: releaseLock(wsDir) should now unlink matching lock
+    fs.writeFileSync(lockPath, JSON.stringify(acquired, null, 2) + '\n', 'utf8');
+    releaseLock(wsDir);
+    assert.equal(fs.existsSync(lockPath), false, 'releaseLock with matching retained token should unlink');
+  } finally {
+    fs.rmSync(wsDir, { recursive: true, force: true });
+  }
+});
+
+test('reclaim.lock guard is recoverable when previous reclaimer dies, and conflicts with actionable guidance when held by live process', () => {
+  const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-reclaim-guard-'));
+  try {
+    initWsgDir(wsDir);
+    const lockPath = path.join(wsDir, '.wsg', 'lock');
+    const reclaimLockPath = path.join(wsDir, '.wsg', 'reclaim.lock');
+
+    // Create dead primary lock
+    const deadChild = spawnSync('node', ['-e', 'process.exit(0)']);
+    const deadPid = deadChild.pid;
+
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: deadPid,
+        hostname: os.hostname(),
+        startedAt: '2026-10-01T00:00:00.000Z',
+        token: 'dead-token',
+      }) + '\n',
+      'utf8'
+    );
+
+    // Scenario A: previous reclaimer died while holding reclaim.lock
+    const deadReclaimerChild = spawnSync('node', ['-e', 'process.exit(0)']);
+    const deadReclaimerPid = deadReclaimerChild.pid;
+
+    fs.writeFileSync(
+      reclaimLockPath,
+      JSON.stringify({
+        pid: deadReclaimerPid,
+        hostname: os.hostname(),
+        startedAt: '2026-10-01T00:00:00.000Z',
+        targetPid: deadPid,
+        token: 'dead-reclaim-token',
+      }) + '\n',
+      'utf8'
+    );
+
+    const warnings: string[] = [];
+    const acquired = acquireLock(wsDir, {
+      opId: 'recovery-op',
+      onWarning: (w) => warnings.push(w),
+    });
+
+    assert.equal(acquired.pid, process.pid);
+    assert.ok(warnings.some((w) => w.includes('stale reclamation guard')));
+    assert.ok(warnings.some((w) => w.includes('stale lock')));
+    assert.equal(fs.existsSync(reclaimLockPath), false, 'reclaim.lock should be cleaned up after reclamation');
+
+    releaseLock(wsDir);
+
+    // Scenario B: reclaim.lock held by a LIVE process produces actionable ConflictError
+    fs.writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: deadPid,
+        hostname: os.hostname(),
+        startedAt: '2026-10-01T00:00:00.000Z',
+        token: 'dead-token',
+      }) + '\n',
+      'utf8'
+    );
+
+    // Write reclaim.lock with our current live PID
+    fs.writeFileSync(
+      reclaimLockPath,
+      JSON.stringify({
+        pid: process.pid,
+        hostname: os.hostname(),
+        startedAt: new Date().toISOString(),
+        targetPid: deadPid,
+        token: 'live-guard-token',
+      }) + '\n',
+      'utf8'
+    );
+
+    // acquireLock from another process or when live guard held must throw ConflictError with actionable guidance
+    assert.throws(
+      () => acquireLock(wsDir, { opId: 'contender' }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConflictError);
+        assert.equal(err.exitCode, 2);
+        assert.ok(err.message.includes('reclamation guard'));
+        assert.ok(err.message.includes(String(process.pid)));
+        assert.ok(err.hints.some((h) => h.includes('manually remove')));
+        return true;
+      }
+    );
+
+    // Clean up
+    fs.unlinkSync(reclaimLockPath);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
   }
