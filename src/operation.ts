@@ -423,7 +423,7 @@ export function acquireLock(
         throw reclaimErr;
       }
 
-      // reclaim.lock exists: check whether it was left by a dead reclaimer
+      // reclaim.lock exists: read holder info for diagnostic/guidance purposes
       let existingGuardContent = '';
       try {
         existingGuardContent = fs.readFileSync(reclaimLockPath, 'utf8');
@@ -432,66 +432,42 @@ export function acquireLock(
       }
       const existingGuard = parseValidReclaimGuard(existingGuardContent);
 
-      if (
-        existingGuard &&
-        existingGuard.hostname === os.hostname() &&
-        !isPidAlive(existingGuard.pid, killFn)
-      ) {
-        // Reclaimer died: take over stale reclamation guard via atomic swap
-        const staleGuardWarn = `wsg: taking over stale reclamation guard from dead process (pid ${existingGuard.pid} on ${existingGuard.hostname})`;
-        if (onWarning) {
-          onWarning(staleGuardWarn);
+      // If an active process holds the guard, back off briefly to allow it to finish
+      if (existingGuard && isPidAlive(existingGuard.pid, killFn)) {
+        if (attempt < maxAttempts - 1) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+          continue;
         }
-        process.stderr.write(`${staleGuardWarn}\n`);
-
-        const tempGuardPath = path.join(
-          wsgDir,
-          `.reclaim.${process.pid}.${Date.now()}.${crypto.randomBytes(8).toString('hex')}.tmp`
+        throw new ConflictError(
+          `Workspace reclamation guard '${reclaimLockPath}' is held by active process (pid ${existingGuard.pid} on ${existingGuard.hostname})`,
+          [
+            `A lock reclamation is currently underway by process ${existingGuard.pid} on host '${existingGuard.hostname}'.`,
+            `Wait for it to finish, or manually remove '${reclaimLockPath}' if that process is no longer running.`,
+          ]
         );
-        let tgFd: number | null = null;
-        try {
-          tgFd = fs.openSync(tempGuardPath, flags, 0o600);
-          writeAllSync(tgFd, Buffer.from(guardPayload, 'utf8'));
-          fs.fsyncSync(tgFd);
-          fs.closeSync(tgFd);
-          tgFd = null;
-          fs.renameSync(tempGuardPath, reclaimLockPath);
-          guardAcquired = true;
-        } finally {
-          if (tgFd !== null) {
-            try { fs.closeSync(tgFd); } catch {}
-          }
-          try {
-            if (fs.existsSync(tempGuardPath)) fs.unlinkSync(tempGuardPath);
-          } catch {}
-        }
-      } else if (existingGuard && isPidAlive(existingGuard.pid, killFn)) {
-        // Held by live process: back off
-        if (attempt === maxAttempts - 1) {
-          throw new ConflictError(
-            `Workspace reclamation guard '${reclaimLockPath}' is held by active process (pid ${existingGuard.pid} on ${existingGuard.hostname})`,
-            [
-              `A lock reclamation is currently underway by process ${existingGuard.pid} on host '${existingGuard.hostname}'.`,
-              `Wait for it to finish, or manually remove '${reclaimLockPath}' if that process is no longer running.`,
-            ]
-          );
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-        continue;
-      } else {
-        // Unknown or corrupt guard: if at last attempt, conflict with explicit guidance
-        if (attempt === maxAttempts - 1) {
-          throw new ConflictError(
-            `Workspace reclamation guard '${reclaimLockPath}' is held or unreadable`,
-            [
-              `An unverified reclamation guard file exists at '${reclaimLockPath}'.`,
-              `Remove '${reclaimLockPath}' manually if no reclamation process is active.`,
-            ]
-          );
-        }
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-        continue;
       }
+
+      // If held by a dead process, unknown process, or unverified guard:
+      // Fail closed immediately without unlinking or overwriting to prevent reclaimer races!
+      if (existingGuard) {
+        throw new ConflictError(
+          `Workspace reclamation guard '${reclaimLockPath}' is held by process ${existingGuard.pid} on ${existingGuard.hostname}`,
+          [
+            `A previous lock reclamation was attempted by process ${existingGuard.pid} on host '${existingGuard.hostname}'.`,
+            `To prevent concurrent reclaimer races, WSG does not automatically overwrite an abandoned reclamation guard.`,
+            `Verify no other wsg processes are running, then manually remove '${reclaimLockPath}' to proceed.`,
+          ]
+        );
+      }
+
+      throw new ConflictError(
+        `Workspace reclamation guard '${reclaimLockPath}' exists and is unverified`,
+        [
+          `An unverified reclamation guard file exists at '${reclaimLockPath}'.`,
+          `To prevent concurrent reclaimer races, WSG does not automatically overwrite an abandoned reclamation guard.`,
+          `Verify no other wsg processes are running, then manually remove '${reclaimLockPath}' to proceed.`,
+        ]
+      );
     }
 
     if (!guardAcquired) {

@@ -489,7 +489,7 @@ test('releaseLock requires exact token match and handles same-PID replacement an
   }
 });
 
-test('reclaim.lock guard is recoverable when previous reclaimer dies, and conflicts with actionable guidance when held by live process', () => {
+test('reclaim.lock guard fails closed with actionable recovery guidance on abandoned guard, and normal takeover succeeds after manual removal', () => {
   const wsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-reclaim-guard-'));
   try {
     initWsgDir(wsDir);
@@ -511,7 +511,7 @@ test('reclaim.lock guard is recoverable when previous reclaimer dies, and confli
       'utf8'
     );
 
-    // Scenario A: previous reclaimer died while holding reclaim.lock
+    // Scenario A: previous reclaimer died while holding reclaim.lock (abandoned guard)
     const deadReclaimerChild = spawnSync('node', ['-e', 'process.exit(0)']);
     const deadReclaimerPid = deadReclaimerChild.pid;
 
@@ -527,6 +527,27 @@ test('reclaim.lock guard is recoverable when previous reclaimer dies, and confli
       'utf8'
     );
 
+    // Must fail closed with ConflictError and actionable guidance
+    assert.throws(
+      () => acquireLock(wsDir, { opId: 'recovery-op' }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConflictError);
+        assert.equal(err.exitCode, 2);
+        assert.ok(err.message.includes('reclamation guard'));
+        assert.ok(err.message.includes(String(deadReclaimerPid)));
+        assert.ok(err.hints.some((h) => h.includes('manually remove')));
+        return true;
+      }
+    );
+
+    // Guard and primary lock remain intact
+    assert.ok(fs.existsSync(reclaimLockPath));
+    assert.ok(fs.existsSync(lockPath));
+
+    // Manually remove abandoned reclamation guard
+    fs.unlinkSync(reclaimLockPath);
+
+    // Subsequent acquireLock performs normal stale main-lock takeover
     const warnings: string[] = [];
     const acquired = acquireLock(wsDir, {
       opId: 'recovery-op',
@@ -534,9 +555,8 @@ test('reclaim.lock guard is recoverable when previous reclaimer dies, and confli
     });
 
     assert.equal(acquired.pid, process.pid);
-    assert.ok(warnings.some((w) => w.includes('stale reclamation guard')));
     assert.ok(warnings.some((w) => w.includes('stale lock')));
-    assert.equal(fs.existsSync(reclaimLockPath), false, 'reclaim.lock should be cleaned up after reclamation');
+    assert.equal(fs.existsSync(reclaimLockPath), false, 'reclaim.lock must be cleaned up');
 
     releaseLock(wsDir);
 
@@ -552,7 +572,6 @@ test('reclaim.lock guard is recoverable when previous reclaimer dies, and confli
       'utf8'
     );
 
-    // Write reclaim.lock with our current live PID
     fs.writeFileSync(
       reclaimLockPath,
       JSON.stringify({
@@ -565,7 +584,6 @@ test('reclaim.lock guard is recoverable when previous reclaimer dies, and confli
       'utf8'
     );
 
-    // acquireLock from another process or when live guard held must throw ConflictError with actionable guidance
     assert.throws(
       () => acquireLock(wsDir, { opId: 'contender' }),
       (err: unknown) => {
@@ -578,7 +596,6 @@ test('reclaim.lock guard is recoverable when previous reclaimer dies, and confli
       }
     );
 
-    // Clean up
     fs.unlinkSync(reclaimLockPath);
   } finally {
     fs.rmSync(wsDir, { recursive: true, force: true });
