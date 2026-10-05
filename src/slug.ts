@@ -92,7 +92,7 @@ export function assignEntryNames(
 ): Map<string, string> {
   const result = new Map<string, string>();
   const canonicalToEntry = new Map<string, string>();
-  const usedNames = new Set<string>();
+  const usedLowerNames = new Set<string>();
 
   for (const source of sources) {
     const canonical = canonicalize(source);
@@ -107,7 +107,7 @@ export function assignEntryNames(
 
     let entryName: string;
     if (
-      !usedNames.has(base) &&
+      !usedLowerNames.has(base.toLowerCase()) &&
       !isReservedRootName(base) &&
       validateSlug(base)
     ) {
@@ -121,7 +121,7 @@ export function assignEntryNames(
 
       let counter = 1;
       while (
-        usedNames.has(candidate) ||
+        usedLowerNames.has(candidate.toLowerCase()) ||
         isReservedRootName(candidate) ||
         !validateSlug(candidate)
       ) {
@@ -135,7 +135,7 @@ export function assignEntryNames(
       entryName = candidate;
     }
 
-    usedNames.add(entryName);
+    usedLowerNames.add(entryName.toLowerCase());
     canonicalToEntry.set(canonical, entryName);
     result.set(source, entryName);
   }

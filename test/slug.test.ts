@@ -285,3 +285,17 @@ test('assignEntryNames protects reserved root names case-insensitively', () => {
     assert.notEqual(name.toLowerCase(), 'workspace.yaml');
   }
 });
+
+test('assignEntryNames prevents case-insensitive collisions (e.g. app vs App)', () => {
+  const sources = ['/p1/app', '/p2/App'];
+  const assigned = assignEntryNames(sources);
+
+  const name1 = assigned.get('/p1/app')!;
+  const name2 = assigned.get('/p2/App')!;
+
+  assert.equal(name1, 'app');
+  assert.match(name2, /^App-[0-9a-f]{6}$/);
+  assert.notEqual(name1.toLowerCase(), name2.toLowerCase());
+  assert(validateSlug(name1));
+  assert(validateSlug(name2));
+});
