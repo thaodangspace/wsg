@@ -10,6 +10,7 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 
 - [MVP specification](docs/spec.md): behavior, CLI, manifest, discovery, worktrees, and context updates.
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
+- [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
 Status: specification only; the commands below describe the planned interface.
 
