@@ -7,7 +7,7 @@ import { runMain } from './helpers/cli.ts';
 import { createTestRepo } from './helpers/git-fixture.ts';
 import { runGit, branchCommit, branchExists, worktreeList } from '../src/git.ts';
 import { parseManifest } from '../src/manifest.ts';
-import { readOperation } from '../src/operation.ts';
+import { readOperation, acquireLock, releaseLock } from '../src/operation.ts';
 import { sha256 } from '../src/fsx.ts';
 import { ExplicitScout } from '../src/scout.ts';
 import { ConflictError } from '../src/errors.ts';
@@ -1111,6 +1111,47 @@ test('Snapshot failure ordering: journal marked started before write, manifest n
     assert.ok(snapStep);
     assert.equal(snapStep.status, 'started', 'Step must have been marked started in journal before mutation');
     assert.notEqual(journal?.operation?.status, 'complete');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Injected error after lock acquisition releases lock cleanly without leaving live lock', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-lock-rel-fail-' });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+  const wsDir = path.join(tmpRoot, 'lock-fail-ws');
+
+  try {
+    await assert.rejects(
+      async () => {
+        await runCreate(
+          {
+            request: 'lock release test',
+            name: 'lock-fail-ws',
+            root: tmpRoot,
+            repos: [repo.dir],
+            _afterLockAcquired: () => {
+              throw new Error('injected error right after lock acquisition');
+            },
+          },
+          { cwd: tmpRoot }
+        );
+      },
+      (err: unknown) => {
+        assert.match((err as Error).message, /injected error right after lock acquisition/);
+        return true;
+      }
+    );
+
+    // .wsg/lock must NOT exist on disk (guaranteed release by finally block)
+    const lockPath = path.join(wsDir, '.wsg', 'lock');
+    assert.equal(fs.existsSync(lockPath), false, 'Lock must be released on post-acquisition error');
+
+    // Subsequent lock acquisition on the same directory must succeed immediately without conflict
+    const testLock = acquireLock(wsDir, { opId: 'verify-no-conflict' });
+    assert.ok(testLock);
+    releaseLock(wsDir, testLock);
   } finally {
     repo.cleanup();
     fs.rmSync(tmpRoot, { recursive: true, force: true });

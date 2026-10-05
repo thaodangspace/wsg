@@ -78,6 +78,7 @@ export interface CreateOptions {
   resume?: boolean;
   allowDirtyEvidence?: boolean;
   scout?: Scout;
+  _afterLockAcquired?: (wsDir: string) => void;
   _beforeWorktreeStep?: (repo: RepoPlan) => void;
   _beforeSnapshotWrite?: (doc: PlannedDoc) => void;
 }
@@ -451,20 +452,23 @@ async function executeCreate(
 
   let lockData: LockData | undefined = lock;
 
-  // Re-verify destination is still pristine before writing operation journal
-  if (fs.existsSync(path.join(wsDir, 'workspace.yaml'))) {
-    throw new ConflictError(
-      `Workspace directory '${wsDir}' already contains a completed workspace.`
-    );
-  }
-  const existingOp = readOperation(wsDir);
-  if (existingOp?.operation) {
-    throw new ConflictError(
-      `Workspace directory '${wsDir}' already contains an active operation journal.`
-    );
-  }
-
   try {
+    if (options._afterLockAcquired) {
+      options._afterLockAcquired(wsDir);
+    }
+
+    // Re-verify destination is still pristine before writing operation journal
+    if (fs.existsSync(path.join(wsDir, 'workspace.yaml'))) {
+      throw new ConflictError(
+        `Workspace directory '${wsDir}' already contains a completed workspace.`
+      );
+    }
+    const existingOp = readOperation(wsDir);
+    if (existingOp?.operation) {
+      throw new ConflictError(
+        `Workspace directory '${wsDir}' already contains an active operation journal.`
+      );
+    }
     const steps: Step[] = [];
     for (const r of repos) {
       steps.push({
@@ -640,9 +644,6 @@ async function executeCreate(
       // ignore tmp cleanup failure
     }
 
-    releaseLock(wsDir, lockData);
-    lockData = undefined;
-
     // (j) Summary; exit 3 if proposals
     writeStdout(`\nWorkspace created at ${wsDir}\n`);
     if (reconcileResult.partial || reconcileResult.proposals.length > 0) {
@@ -651,15 +652,15 @@ async function executeCreate(
     }
 
     return 0;
-  } catch (err: unknown) {
+  } finally {
     if (lockData) {
       try {
         releaseLock(wsDir, lockData);
       } catch {
         // ignore lock release error on error path
       }
+      lockData = undefined;
     }
-    throw err;
   }
 }
 
