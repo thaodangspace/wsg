@@ -1,0 +1,26 @@
+{
+  "name": "wsg",
+  "version": "0.1.0",
+  "description": "Workspace assembler for coding agents",
+  "type": "module",
+  "bin": {
+    "wsg": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "typebox": "1.3.27",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  }
+}

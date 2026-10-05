@@ -6,7 +6,7 @@ Status: planned work. This plan implements [the MVP specification](spec.md); no 
 
 Build one CLI package and ship a vertical slice early. First assemble a workspace from explicit repos and docs, then add autonomous scouting. Keep Git/filesystem operations deterministic and separate from model judgment.
 
-Proposed baseline: TypeScript, Node 24, npm, Git, and `rg`. Confirm Pi Durable and SQLite compatibility in the first milestone before fixing the runtime requirement. Use one model provider for initial integration behind a small scout interface; do not build a provider/plugin framework.
+Proposed baseline: TypeScript, Node >=24, npm, Git, and `rg`. Confirm Pi Durable and SQLite compatibility in the first milestone before fixing the runtime requirement. Use one model provider for initial integration behind a small scout interface; do not build a provider/plugin framework.
 
 Suggested source layout:
 
@@ -48,6 +48,7 @@ Acceptance:
 Deliver:
 
 - `wsg create` using `--repo`, `--doc`, and `--context` without autonomous discovery yet.
+- `wsg explain` (moved into M2 as a manifest printer: inspects saved manifest data, evidence, exclusions, and gaps without model calls).
 - Worktree creation from recorded source commits and collision handling.
 - Local document snapshots, reference-only URLs, manifest, README, context, and optional agent adapters.
 - A writer lock, operation journal, generated-file hashes, and `--dry-run` / `--resume`.
@@ -71,7 +72,7 @@ Deliver:
 - One Pi Durable scout conversation with read-only tools and structured output.
 - Selection evidence validation, explicit repo inclusion, default discovered-repo cap, and saved exclusions/gaps.
 - Evidence-based source/target inference; focused ambiguity handling.
-- `wsg explain` from saved manifest data, without a model dependency.
+- Wire scout evidence into `wsg explain` (introduced in M2 as manifest printer).
 
 Acceptance:
 
