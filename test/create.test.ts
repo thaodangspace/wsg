@@ -10,6 +10,8 @@ import { parseManifest } from '../src/manifest.ts';
 import { readOperation } from '../src/operation.ts';
 import { sha256 } from '../src/fsx.ts';
 import { ExplicitScout } from '../src/scout.ts';
+import { ConflictError } from '../src/errors.ts';
+import { runCreate } from '../src/create.ts';
 
 test('ExplicitScout returns selection when repos are provided', async () => {
   const scout = new ExplicitScout();
@@ -843,4 +845,274 @@ test('--resume placeholder exits 1 UsageError', async () => {
   const result = await runMain(['create', 'resume test', '--resume']);
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /--resume is not implemented in this version/);
+});
+
+test('runMain respects io.cwd for relative --root, --repo, and --doc', async () => {
+  const fakeCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-fake-cwd-'));
+  const repo = createTestRepo({ prefix: 'wsg-rel-repo-' });
+  const repoRelName = 'local-repo';
+  // Symlink repo inside fakeCwd
+  fs.symlinkSync(repo.dir, path.join(fakeCwd, repoRelName));
+  const docRelName = 'notes.md';
+  fs.writeFileSync(path.join(fakeCwd, docRelName), 'relative doc\n');
+
+  try {
+    const result = await runMain(
+      [
+        'create',
+        'relative paths test',
+        '--name',
+        'rel-ws',
+        '--root',
+        './output-root',
+        '--repo',
+        `./${repoRelName}`,
+        '--doc',
+        `./${docRelName}`,
+      ],
+      { cwd: fakeCwd }
+    );
+
+    assert.equal(result.exitCode, 0, result.stderr);
+    const expectedWsDir = path.join(fakeCwd, 'output-root', 'rel-ws');
+    assert.ok(fs.existsSync(expectedWsDir), 'Workspace must be created under fakeCwd/output-root/rel-ws');
+    assert.ok(fs.existsSync(path.join(expectedWsDir, 'workspace.yaml')));
+    // Must NOT have created anything under process.cwd()/output-root
+    assert.equal(fs.existsSync(path.resolve(process.cwd(), 'output-root')), false);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(fakeCwd, { recursive: true, force: true });
+    try {
+      fs.rmSync(path.resolve(process.cwd(), 'output-root'), { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+test('Empty destination directory is rejected with ConflictError and preserved', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-empty-dest-' });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+  const wsDir = path.join(tmpRoot, 'empty-dest-ws');
+  fs.mkdirSync(wsDir);
+
+  try {
+    const result = await runMain([
+      'create',
+      'empty dest test',
+      '--name',
+      'empty-dest-ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+    ]);
+
+    assert.equal(result.exitCode, 2);
+    assert.match(result.stderr, /already exists/);
+
+    // Empty directory must be preserved and not modified (no .wsg, no files)
+    assert.ok(fs.existsSync(wsDir));
+    assert.equal(fs.readdirSync(wsDir).length, 0);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Symlink destination to external directory is rejected with ConflictError and preserved', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-symlink-dest-' });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+  const extDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-external-'));
+  const wsDir = path.join(tmpRoot, 'symlink-dest-ws');
+  fs.symlinkSync(extDir, wsDir);
+
+  try {
+    const result = await runMain([
+      'create',
+      'symlink dest test',
+      '--name',
+      'symlink-dest-ws',
+      '--root',
+      tmpRoot,
+      '--repo',
+      repo.dir,
+    ]);
+
+    assert.equal(result.exitCode, 2);
+    assert.match(result.stderr, /existing symbolic link/);
+
+    // Destination must remain a symlink and external target untouched
+    assert.ok(fs.lstatSync(wsDir).isSymbolicLink());
+    assert.equal(fs.readdirSync(extDir).length, 0);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.rmSync(extDir, { recursive: true, force: true });
+  }
+});
+
+test('Two concurrent creates targeting same destination: one wins, one conflicts, winning manifest intact', async () => {
+  const repo1 = createTestRepo({ prefix: 'wsg-race1-' });
+  const repo2 = createTestRepo({ prefix: 'wsg-race2-' });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+
+  try {
+    const [res1, res2] = await Promise.all([
+      runMain([
+        'create',
+        'race request 1',
+        '--name',
+        'race-ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo1.dir,
+      ]),
+      runMain([
+        'create',
+        'race request 2',
+        '--name',
+        'race-ws',
+        '--root',
+        tmpRoot,
+        '--repo',
+        repo2.dir,
+      ]),
+    ]);
+
+    const exitCodes = [res1.exitCode, res2.exitCode].sort();
+    assert.deepEqual(exitCodes, [0, 2], 'One create must succeed (0) and one must conflict (2)');
+
+    const wsDir = path.join(tmpRoot, 'race-ws');
+    assert.ok(fs.existsSync(path.join(wsDir, 'workspace.yaml')));
+    const manifest = parseManifest(fs.readFileSync(path.join(wsDir, 'workspace.yaml'), 'utf8'));
+    assert.equal(manifest.name, 'race-ws');
+
+    const op = readOperation(wsDir);
+    assert.equal(op?.operation?.status, 'complete');
+  } finally {
+    repo1.cleanup();
+    repo2.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Injected concurrent branch/dest conflict between preflight and step execution', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-concurrent-wt-' });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+  const repoBase = path.basename(repo.dir);
+  const branchName = `wsg/inj-ws/${repoBase}`;
+
+  try {
+    // 1. Injected branch conflict
+    await assert.rejects(
+      async () => {
+        await runCreate(
+          {
+            request: 'injected branch conflict',
+            name: 'inj-ws',
+            root: tmpRoot,
+            repos: [repo.dir],
+            _beforeWorktreeStep: (r) => {
+              // Pre-create the branch right before the worktree step
+              runGit(['-C', r.source, 'branch', r.branch, r.base_commit]);
+            },
+          },
+          { cwd: tmpRoot }
+        );
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ConflictError);
+        assert.match((err as Error).message, new RegExp(`Branch '${branchName}' already exists`));
+        return true;
+      }
+    );
+
+    // Journal must show the step was NOT started with false ownership
+    const wsDir = path.join(tmpRoot, 'inj-ws');
+    const journal = readOperation(wsDir);
+    const wtStep = journal?.operation?.steps.find((s) => s.id === `worktree:${repoBase}`);
+    assert.ok(wtStep);
+    assert.equal(wtStep.status, 'planned', 'Step must still be in planned status, not started');
+
+    // Clean up branch for second test
+    runGit(['-C', repo.dir, 'branch', '-D', branchName]);
+    fs.rmSync(wsDir, { recursive: true, force: true });
+
+    // 2. Injected dest conflict
+    await assert.rejects(
+      async () => {
+        await runCreate(
+          {
+            request: 'injected dest conflict',
+            name: 'inj-ws',
+            root: tmpRoot,
+            repos: [repo.dir],
+            _beforeWorktreeStep: (r) => {
+              // Pre-create destination directory right before the worktree step
+              fs.mkdirSync(r.dest, { recursive: true });
+            },
+          },
+          { cwd: tmpRoot }
+        );
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof ConflictError);
+        assert.match((err as Error).message, /Worktree destination .* already exists/);
+        return true;
+      }
+    );
+
+    const journal2 = readOperation(wsDir);
+    const wtStep2 = journal2?.operation?.steps.find((s) => s.id === `worktree:${repoBase}`);
+    assert.ok(wtStep2);
+    assert.equal(wtStep2.status, 'planned', 'Step must still be in planned status, not started');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('Snapshot failure ordering: journal marked started before write, manifest never published on error', async () => {
+  const repo = createTestRepo({ prefix: 'wsg-snap-fail-' });
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+  const docFile = path.join(tmpRoot, 'sample.md');
+  fs.writeFileSync(docFile, 'sample content\n');
+
+  try {
+    await assert.rejects(
+      async () => {
+        await runCreate(
+          {
+            request: 'snapshot failure test',
+            name: 'snap-fail-ws',
+            root: tmpRoot,
+            repos: [repo.dir],
+            docs: [docFile],
+            _beforeSnapshotWrite: () => {
+              throw new Error('injected snapshot write failure');
+            },
+          },
+          { cwd: tmpRoot }
+        );
+      },
+      (err: unknown) => {
+        assert.match((err as Error).message, /injected snapshot write failure/);
+        return true;
+      }
+    );
+
+    const wsDir = path.join(tmpRoot, 'snap-fail-ws');
+    // Workspace directory was created, but workspace.yaml was NEVER published
+    assert.equal(fs.existsSync(path.join(wsDir, 'workspace.yaml')), false, 'Manifest must not be published on error');
+
+    // Journal shows snapshot step was marked 'started' before the mutation failed
+    const journal = readOperation(wsDir);
+    const snapStep = journal?.operation?.steps.find((s) => s.type === 'snapshot');
+    assert.ok(snapStep);
+    assert.equal(snapStep.status, 'started', 'Step must have been marked started in journal before mutation');
+    assert.notEqual(journal?.operation?.status, 'complete');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });

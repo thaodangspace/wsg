@@ -45,7 +45,7 @@ import {
 } from './operation.ts';
 import { reconcileGenerated, type ReconcileResult } from './ownership.ts';
 import { renderAll } from './generate.ts';
-import { writeFileAtomic } from './fsx.ts';
+import { writeFileAtomic, ensureDir } from './fsx.ts';
 import { ExplicitScout, type Scout, type ScoutResult } from './scout.ts';
 import type { CliIO } from './cli.ts';
 
@@ -78,6 +78,8 @@ export interface CreateOptions {
   resume?: boolean;
   allowDirtyEvidence?: boolean;
   scout?: Scout;
+  _beforeWorktreeStep?: (repo: RepoPlan) => void;
+  _beforeSnapshotWrite?: (doc: PlannedDoc) => void;
 }
 
 export interface RepoPlan {
@@ -159,7 +161,11 @@ async function executeCreate(
     for: options.for,
     code_root: options.codeRoots,
   });
-  const wsDir = path.resolve(settings.workspace_root, wsName);
+  const expandedRoot = expandHome(settings.workspace_root);
+  const resolvedRoot = path.isAbsolute(expandedRoot)
+    ? expandedRoot
+    : path.resolve(cwd, expandedRoot);
+  const wsDir = path.resolve(resolvedRoot, wsName);
   const adapters = settings.adapters as ManifestAdapter[];
 
   // 6. Scout seam invocation (defaults to ExplicitScout)
@@ -300,7 +306,25 @@ async function executeCreate(
   validateManifest(draftManifest);
 
   // (c) Preflight target, branches, destination conflicts
-  if (fs.existsSync(wsDir)) {
+  let wsDirExists = false;
+  let wsDirIsSymlink = false;
+  try {
+    const st = fs.lstatSync(wsDir);
+    wsDirExists = true;
+    wsDirIsSymlink = st.isSymbolicLink();
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  if (wsDirExists) {
+    if (wsDirIsSymlink) {
+      throw new ConflictError(
+        `Workspace destination '${wsDir}' is an existing symbolic link. Refusing to overwrite.`
+      );
+    }
+
     const manifestFile = path.join(wsDir, 'workspace.yaml');
     if (fs.existsSync(manifestFile)) {
       throw new ConflictError(
@@ -323,12 +347,22 @@ async function executeCreate(
       }
     }
 
-    const dirEntries = fs.readdirSync(wsDir);
+    let dirEntries: string[] = [];
+    try {
+      dirEntries = fs.readdirSync(wsDir);
+    } catch {
+      // ignore
+    }
+
     if (dirEntries.length > 0) {
       throw new ConflictError(
         `Workspace directory '${wsDir}' already exists with an incomplete workspace. Use --resume to continue the existing operation or remove the directory to start over.`
       );
     }
+
+    throw new ConflictError(
+      `Workspace directory '${wsDir}' already exists. Choose a different name or inspect the existing workspace.`
+    );
   }
 
   for (const r of repos) {
@@ -396,13 +430,39 @@ async function executeCreate(
     return 0;
   }
 
-  // (e) Begin mutation: mkdir, initWsgDir, lock, journal running
-  fs.mkdirSync(wsDir, { recursive: true });
+  // (e) Begin mutation: exclusively reserve directory, initWsgDir, lock, journal running
+  const parentDir = path.dirname(wsDir);
+  fs.mkdirSync(parentDir, { recursive: true });
+
+  try {
+    fs.mkdirSync(wsDir);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new ConflictError(
+        `Workspace directory '${wsDir}' already exists or was reserved by another process.`
+      );
+    }
+    throw err;
+  }
+
   initWsgDir(wsDir);
   const opId = crypto.randomUUID();
   const lock = acquireLock(wsDir, { opId });
 
   let lockData: LockData | undefined = lock;
+
+  // Re-verify destination is still pristine before writing operation journal
+  if (fs.existsSync(path.join(wsDir, 'workspace.yaml'))) {
+    throw new ConflictError(
+      `Workspace directory '${wsDir}' already contains a completed workspace.`
+    );
+  }
+  const existingOp = readOperation(wsDir);
+  if (existingOp?.operation) {
+    throw new ConflictError(
+      `Workspace directory '${wsDir}' already contains an active operation journal.`
+    );
+  }
 
   try {
     const steps: Step[] = [];
@@ -468,6 +528,28 @@ async function executeCreate(
 
     // (f) Worktree steps
     for (const r of repos) {
+      if (options._beforeWorktreeStep) {
+        options._beforeWorktreeStep(r);
+      }
+
+      // Recheck actual existence immediately before marking step started
+      const branchExisted = branchExists(r.source, r.branch);
+      const destExisted = fs.existsSync(r.dest);
+
+      if (branchExisted || destExisted) {
+        if (branchExisted) {
+          throw new ConflictError(
+            `Branch '${r.branch}' already exists in repository '${r.source}'.`,
+            [
+              `To inspect the existing branch: git -C "${r.source}" log -1 "${r.branch}"`,
+              `To remove the branch if no longer needed: git -C "${r.source}" branch -D "${r.branch}"`,
+              `Or choose a different workspace name using --name <name>.`,
+            ]
+          );
+        }
+        throw new ConflictError(`Worktree destination '${r.dest}' already exists.`);
+      }
+
       const stepId = `worktree:${r.name}`;
       markStep(wsDir, stepId, 'started', {
         detail: {
@@ -485,20 +567,41 @@ async function executeCreate(
 
     // (g) Snapshots via .wsg/tmp/<opId>/ then rename
     const tmpDir = path.join(wsDir, '.wsg', 'tmp', opId);
+    ensureDir(tmpDir);
+
     for (const d of plannedDocs) {
       if (d.mode === 'snapshot' && d.path) {
         const stepId = `snapshot:${d.path}`;
         markStep(wsDir, stepId, 'started');
-        const stagingPath = path.join(tmpDir, d.path);
-        const finalPath = resolveInside(wsDir, d.path);
 
-        fs.mkdirSync(path.dirname(stagingPath), { recursive: true });
-        if (d.inspected.kind === 'file') {
-          fs.writeFileSync(stagingPath, d.inspected.content);
+        if (options._beforeSnapshotWrite) {
+          options._beforeSnapshotWrite(d);
         }
 
-        fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+        const stagingPath = path.join(tmpDir, d.path);
+        const finalPath = resolveInside(wsDir, d.path);
+        const stagingDir = path.dirname(stagingPath);
+        const finalDir = path.dirname(finalPath);
+
+        ensureDir(stagingDir);
+        if (d.inspected.kind === 'file') {
+          writeFileAtomic(stagingPath, d.inspected.content, { tmpDir });
+        }
+
+        ensureDir(finalDir);
         fs.renameSync(stagingPath, finalPath);
+
+        try {
+          const dirFd = fs.openSync(finalDir, fs.constants.O_RDONLY);
+          try {
+            fs.fsyncSync(dirFd);
+          } finally {
+            fs.closeSync(dirFd);
+          }
+        } catch {
+          // ignore if dir fsync not supported on OS
+        }
+
         markStep(wsDir, stepId, 'done');
       }
     }
