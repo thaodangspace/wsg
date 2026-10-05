@@ -15,11 +15,22 @@ export const RESERVED_ROOT_NAMES: ReadonlySet<string> = new Set([
   '.wsg',
 ]);
 
+const LOWER_RESERVED_ROOT_NAMES: ReadonlySet<string> = new Set(
+  Array.from(RESERVED_ROOT_NAMES).map((s) => s.toLowerCase())
+);
+
+export function isReservedRootName(name: string): boolean {
+  return (
+    RESERVED_ROOT_NAMES.has(name) ||
+    LOWER_RESERVED_ROOT_NAMES.has(name.toLowerCase())
+  );
+}
+
 export function validateSlug(slug: string): boolean {
   if (typeof slug !== 'string') return false;
   if (!SLUG_RE.test(slug)) return false;
   if (slug === '.' || slug === '..') return false;
-  if (RESERVED_ROOT_NAMES.has(slug)) return false;
+  if (isReservedRootName(slug)) return false;
   return true;
 }
 
@@ -45,7 +56,7 @@ export function deriveSlug(request: string): string {
     slug = 'workspace';
   }
 
-  if (RESERVED_ROOT_NAMES.has(slug)) {
+  if (isReservedRootName(slug)) {
     slug = `${slug}-ws`;
     if (slug.length > 64) {
       slug = slug.slice(0, 64);
@@ -57,6 +68,23 @@ export function deriveSlug(request: string): string {
 
 export function suffixForSource(canonicalPath: string): string {
   return createHash('sha256').update(canonicalPath).digest('hex').slice(0, 6);
+}
+
+function normalizeBase(rawBase: string): string {
+  let normalized = rawBase
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '');
+
+  if (normalized.length > 64) {
+    normalized = normalized.slice(0, 64).replace(/[._-]+$/, '');
+  }
+
+  if (!normalized) {
+    normalized = 'repo';
+  }
+
+  return normalized;
 }
 
 export function assignEntryNames(
@@ -73,25 +101,36 @@ export function assignEntryNames(
       continue;
     }
 
-    const cleanPath = source.replace(/[/\\]+$/, '');
-    let base = path.basename(cleanPath);
-    if (!base || base === '.' || base === '..') {
-      base = 'repo';
-    }
+    const cleanCanonical = canonical.replace(/[/\\]+$/, '');
+    const rawBase = path.basename(cleanCanonical);
+    const base = normalizeBase(rawBase);
 
     let entryName: string;
     if (
       !usedNames.has(base) &&
-      !RESERVED_ROOT_NAMES.has(base) &&
+      !isReservedRootName(base) &&
       validateSlug(base)
     ) {
       entryName = base;
     } else {
       const suffix = suffixForSource(canonical);
-      let candidate = `${base}-${suffix}`;
-      if (usedNames.has(candidate)) {
-        const fullHash = createHash('sha256').update(canonical).digest('hex');
-        candidate = `${base}-${fullHash.slice(0, 8)}`;
+      const maxBaseLen = 64 - suffix.length - 1;
+      const truncatedBase =
+        base.slice(0, maxBaseLen).replace(/[._-]+$/, '') || 'repo';
+      let candidate = `${truncatedBase}-${suffix}`;
+
+      let counter = 1;
+      while (
+        usedNames.has(candidate) ||
+        isReservedRootName(candidate) ||
+        !validateSlug(candidate)
+      ) {
+        const counterSuffix = `-${counter}`;
+        const maxLen = 64 - suffix.length - 1 - counterSuffix.length;
+        const tBase =
+          base.slice(0, Math.max(1, maxLen)).replace(/[._-]+$/, '') || 'repo';
+        candidate = `${tBase}-${suffix}${counterSuffix}`;
+        counter++;
       }
       entryName = candidate;
     }

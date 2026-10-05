@@ -1,6 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
-import { realpathSync, statSync, existsSync } from 'node:fs';
+import { realpathSync, statSync, lstatSync, existsSync } from 'node:fs';
 import { UsageError } from './errors.ts';
 
 export function expandHome(filepath: string, homeDir?: string): string {
@@ -74,30 +74,94 @@ export function assertConfinedRelative(
   return relPath;
 }
 
+function isInside(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  if (rel === '' || rel === '.') return false;
+  const relSegments = rel.split(/[/\\]/);
+  return !relSegments.includes('..') && !path.isAbsolute(rel);
+}
+
 export function resolveInside(rootDir: string, relPath: string): string {
   assertConfinedRelative(relPath);
   const rootCanonical = canonicalize(rootDir);
-  const resolved = path.resolve(rootCanonical, relPath);
 
-  const relative = path.relative(rootCanonical, resolved);
-  if (
-    relative.startsWith('..') ||
-    path.isAbsolute(relative) ||
-    relative === ''
-  ) {
-    // If relative === '', it's the root itself, but confined relative must refer inside root
-    if (relative === '') {
-      throw new UsageError(
-        `Path '${relPath}' must refer to an entry inside '${rootDir}'`
-      );
+  const segments = path.posix.normalize(relPath).split('/').filter(Boolean);
+  if (segments.length === 0) {
+    throw new UsageError(
+      `Path '${relPath}' must refer to an entry inside '${rootDir}'`
+    );
+  }
+
+  let current = rootCanonical;
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const candidate = path.join(current, seg);
+
+    let exists = false;
+    let isSymlink = false;
+    try {
+      const lstat = lstatSync(candidate);
+      exists = true;
+      isSymlink = lstat.isSymbolicLink();
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new UsageError(
+          `Cannot access path '${candidate}': ${(err as Error).message}`
+        );
+      }
     }
+
+    if (exists) {
+      if (isSymlink) {
+        let real: string;
+        try {
+          real = realpathSync(candidate);
+        } catch {
+          throw new UsageError(
+            `Path '${relPath}' contains broken symlink '${candidate}'`
+          );
+        }
+
+        if (!isInside(rootCanonical, real)) {
+          throw new UsageError(
+            `Path '${relPath}' escapes workspace root via symlink '${candidate}' -> '${real}'`
+          );
+        }
+        current = real;
+      } else {
+        current = candidate;
+      }
+
+      if (i < segments.length - 1) {
+        let stat;
+        try {
+          stat = statSync(current);
+        } catch {
+          throw new UsageError(`Cannot access path '${current}'`);
+        }
+        if (!stat.isDirectory()) {
+          throw new UsageError(
+            `Path component '${candidate}' is not a directory`
+          );
+        }
+      }
+    } else {
+      const remaining = segments.slice(i);
+      current = path.join(current, ...remaining);
+      break;
+    }
+  }
+
+  if (!isInside(rootCanonical, current)) {
     throw new UsageError(
       `Path '${relPath}' escapes workspace root '${rootDir}'`
     );
   }
 
-  return resolved;
+  return current;
 }
+
 
 export interface FindWorkspaceOptions {
   startDir?: string;

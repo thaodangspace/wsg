@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   SLUG_RE,
   RESERVED_ROOT_NAMES,
@@ -20,11 +23,20 @@ test('slug accept/reject table', () => {
     '-',
     '--flag',
     'workspace.yaml',
+    'Workspace.YAML',
+    'workspace.YAML',
     'README.md',
+    'readme.md',
+    'README.MD',
     'AGENTS.md',
+    'agents.md',
     'CLAUDE.md',
+    'claude.md',
     'docs',
+    'DOCS',
+    'Docs',
     'scripts',
+    'SCRIPTS',
     '.wsg',
     '',
     'has space',
@@ -109,11 +121,21 @@ test('deriveSlug is deterministic, lowercase, and <= 64 characters', () => {
   assert(validateSlug(longSlug));
   assert(!longSlug.endsWith('-'));
 
-  // Reserved names avoided
+  // Reserved names avoided case-insensitively
   const reservedRequest = 'docs';
   const derivedReserved = deriveSlug(reservedRequest);
   assert(!RESERVED_ROOT_NAMES.has(derivedReserved));
   assert(validateSlug(derivedReserved));
+  assert.equal(derivedReserved, 'docs-ws');
+
+  const readmeRequest = 'README.md';
+  const derivedReadme = deriveSlug(readmeRequest);
+  assert.equal(derivedReadme, 'readme.md-ws');
+  assert(validateSlug(derivedReadme));
+
+  const upperDocs = deriveSlug('DOCS');
+  assert.equal(upperDocs, 'docs-ws');
+  assert(validateSlug(upperDocs));
 
   // Non-alphanumeric input falls back to valid slug
   const emptySlug = deriveSlug('   !@#$%^&*()   ');
@@ -169,4 +191,97 @@ test('assignEntryNames assigns a and a-<6hex>, stable across runs', () => {
   const reservedName = reservedResult.get('/code/docs');
   assert.notEqual(reservedName, 'docs');
   assert.match(reservedName!, /^docs-[0-9a-f]{6}$/);
+  assert(validateSlug(reservedName!));
+});
+
+test('assignEntryNames handles spaces and unicode in source basenames', () => {
+  const sources = [
+    '/code/repo with spaces',
+    '/code/projet-élicitation',
+    '/code/another   spaced   repo',
+  ];
+  const assigned = assignEntryNames(sources);
+
+  const name1 = assigned.get('/code/repo with spaces')!;
+  assert.equal(name1, 'repo-with-spaces');
+  assert(validateSlug(name1));
+
+  const name2 = assigned.get('/code/projet-élicitation')!;
+  assert.equal(name2, 'projet-licitation');
+  assert(validateSlug(name2));
+
+  const name3 = assigned.get('/code/another   spaced   repo')!;
+  assert.equal(name3, 'another-spaced-repo');
+  assert(validateSlug(name3));
+});
+
+test('assignEntryNames safely truncates colliding 64-character basenames <= 64 chars', () => {
+  const longBase = 'a'.repeat(64);
+  const sources = [`/path1/${longBase}`, `/path2/${longBase}`];
+
+  const assigned = assignEntryNames(sources);
+  const name1 = assigned.get(sources[0])!;
+  const name2 = assigned.get(sources[1])!;
+
+  // Both names must be <= 64 characters and valid slugs
+  assert.equal(name1.length, 64);
+  assert(validateSlug(name1));
+
+  assert.equal(name2.length, 64);
+  assert(validateSlug(name2));
+
+  assert.notEqual(name1, name2);
+  assert.match(name2, /^a+-[0-9a-f]{6}$/);
+});
+
+test('assignEntryNames guarantees unique valid names with already-suffixed collisions', () => {
+  // First assign /p1/app and /p2/app to see the collision suffix
+  const baseMap = assignEntryNames(['/p1/app', '/p2/app']);
+  const s2Name = baseMap.get('/p2/app')!; // e.g. app-<6hex>
+
+  // Now create a third source whose basename is already that exact suffixed name
+  const s3Path = `/p3/${s2Name}`;
+  const assigned = assignEntryNames(['/p1/app', '/p2/app', s3Path]);
+
+  const names = Array.from(assigned.values());
+  assert.equal(new Set(names).size, 3);
+  for (const name of names) {
+    assert(validateSlug(name), `Expected '${name}' to be a valid slug`);
+    assert(name.length <= 64);
+  }
+});
+
+test('assignEntryNames maps canonical symlink aliases to the same entry name', () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-symlink-alias-'));
+  try {
+    const realRepo = path.join(tmpBase, 'real-repo');
+    fs.mkdirSync(realRepo);
+
+    const symlinkRepo = path.join(tmpBase, 'symlink-repo');
+    fs.symlinkSync(realRepo, symlinkRepo);
+
+    const assigned = assignEntryNames([realRepo, symlinkRepo]);
+    assert.equal(assigned.get(realRepo), 'real-repo');
+    assert.equal(assigned.get(symlinkRepo), 'real-repo');
+  } finally {
+    fs.rmSync(tmpBase, { recursive: true, force: true });
+  }
+});
+
+test('assignEntryNames protects reserved root names case-insensitively', () => {
+  const sources = [
+    '/code/README.md',
+    '/code/readme.md',
+    '/code/DOCS',
+    '/code/workspace.yaml',
+  ];
+  const assigned = assignEntryNames(sources);
+
+  for (const src of sources) {
+    const name = assigned.get(src)!;
+    assert(validateSlug(name), `Expected '${name}' to be a valid slug`);
+    assert.notEqual(name.toLowerCase(), 'readme.md');
+    assert.notEqual(name.toLowerCase(), 'docs');
+    assert.notEqual(name.toLowerCase(), 'workspace.yaml');
+  }
 });

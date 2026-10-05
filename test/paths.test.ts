@@ -108,6 +108,91 @@ test('resolveInside safely confines paths within root directory', () => {
   }
 });
 
+test('resolveInside accepts ..cache/x and does not treat filename prefix as traversal', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-test-cache-'));
+  try {
+    const rootCanonical = canonicalize(tmpDir);
+    const resolved = resolveInside(tmpDir, '..cache/x');
+    assert.equal(resolved, path.join(rootCanonical, '..cache', 'x'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('resolveInside rejects escaping symlinks, broken symlinks, and non-directory components', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-test-symlink-'));
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-test-outside-'));
+
+  try {
+    const root = path.join(tmpDir, 'workspace');
+    fs.mkdirSync(root, { recursive: true });
+
+    // 1. Escaping symlink pointing outside workspace
+    fs.symlinkSync(outsideDir, path.join(root, 'docs'));
+
+    // Non-existent leaf under escaping symlink must be rejected
+    assert.throws(
+      () => resolveInside(root, 'docs/new.md'),
+      (err: unknown) => {
+        assert(err instanceof UsageError);
+        assert.match(err.message, /escapes workspace root/i);
+        return true;
+      }
+    );
+
+    // Escaping symlink itself
+    assert.throws(
+      () => resolveInside(root, 'docs'),
+      (err: unknown) => {
+        assert(err instanceof UsageError);
+        assert.match(err.message, /escapes workspace root/i);
+        return true;
+      }
+    );
+
+    // 2. Broken symlink
+    fs.symlinkSync(path.join(tmpDir, 'does-not-exist'), path.join(root, 'broken-link'));
+    assert.throws(
+      () => resolveInside(root, 'broken-link/sub/leaf.md'),
+      (err: unknown) => {
+        assert(err instanceof UsageError);
+        assert.match(err.message, /broken symlink/i);
+        return true;
+      }
+    );
+    assert.throws(
+      () => resolveInside(root, 'broken-link'),
+      (err: unknown) => {
+        assert(err instanceof UsageError);
+        assert.match(err.message, /broken symlink/i);
+        return true;
+      }
+    );
+
+    // 3. Non-directory path component
+    fs.writeFileSync(path.join(root, 'regular-file.txt'), 'hello');
+    assert.throws(
+      () => resolveInside(root, 'regular-file.txt/child.md'),
+      (err: unknown) => {
+        assert(err instanceof UsageError);
+        assert.match(err.message, /not a directory/i);
+        return true;
+      }
+    );
+
+    // 4. Confined symlink pointing inside workspace is allowed
+    const internalDir = path.join(root, 'real-sub');
+    fs.mkdirSync(internalDir);
+    fs.symlinkSync(internalDir, path.join(root, 'internal-link'));
+
+    const internalRes = resolveInside(root, 'internal-link/new.md');
+    assert.equal(internalRes, path.join(canonicalize(internalDir), 'new.md'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test('expandHome and canonicalize expand ~ and resolve paths', () => {
   assert.equal(expandHome('~'), os.homedir());
   assert.equal(expandHome('~/docs'), path.join(os.homedir(), 'docs'));
