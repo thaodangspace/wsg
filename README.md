@@ -12,7 +12,7 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: specification only; the commands below describe the planned interface.
+Status: M1–M2 in progress. Package scaffold, CLI skeleton, and specification patches implemented; see [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
 wsg create "port EMR mono to modular for new system" --name port-emr
@@ -24,6 +24,44 @@ codex # or claude / pi
 ```
 
 Each feature gets an independent directory. There are no nested workspace groups or workspace orchestration in the MVP.
+
+## Development
+
+Prerequisites:
+- Node `>=24`
+- npm
+- Git
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Typecheck:
+
+```bash
+npm run typecheck
+```
+
+Build:
+
+```bash
+npm run build
+```
+
+Run tests:
+
+```bash
+npm test
+```
+
+Run CLI:
+
+```bash
+node dist/cli.js --help
+node dist/cli.js --version
+```
 
 ## Inspiration
 
