@@ -4,6 +4,7 @@ import { UsageError } from './errors.ts';
 import { assertConfinedRelative, canonicalize, resolveInside } from './paths.ts';
 import { VENDOR_DIR_NAMES, type DiscoveredRepo } from './discovery.ts';
 import { isSecretFilename } from './documents.ts';
+import { ObservedEvidenceStore } from './observed.ts';
 import type { Evidence, Intent } from './manifest.ts';
 import type {
   ScoutEvidence,
@@ -20,13 +21,13 @@ export interface AllowedRepo {
 }
 
 /** Repository-relative paths actually retrieved or observed by the scout. */
-export type EvidenceObservation = ReadonlyMap<string, ReadonlySet<string>>;
+export type EvidenceObservation = ObservedEvidenceStore;
 
 export interface EvidenceValidationOptions {
-  /** Maximum bytes read from a single file while validating evidence. */
+  /** Maximum bytes read from a single file while validating explicit evidence. */
   maxFileBytes?: number;
   /** Files actually retrieved/observed, keyed by canonical repository source. */
-  observed?: EvidenceObservation;
+  observed?: ObservedEvidenceStore;
 }
 
 export interface ValidatedRepoSelection {
@@ -77,14 +78,15 @@ function assertNoVendorSegments(repoName: string, normalized: string): void {
 }
 
 /**
- * Validates one piece of scout evidence against the real repository contents.
+ * Validates one piece of scout evidence.
  *
- * A citation must name a confined repository-relative file, an in-range line
- * selection (when lines are given), and a non-empty quote that actually occurs
- * within that file (and within the cited lines). Confinement is enforced with
- * canonical realpath resolution for every path component, so an intermediate
- * directory symlink cannot redirect a read outside the repository. Anything
- * else is rejected as fictional evidence (repo spec §6.5).
+ * Discovered selections are validated against the exact lines actually observed
+ * by retrieval or a read-only tool: the cited file must have been observed,
+ * every cited line must be present in the observation record, and the quote
+ * must occur within a single contiguous observed run (and within the cited
+ * lines when lines are given). This rejects quotes taken from parts of a file
+ * the model never saw. Explicit `--repo` evidence is validated against the
+ * confined live file because explicit inputs need no observation.
  */
 export function validateEvidenceItem(
   repo: AllowedRepo,
@@ -103,21 +105,64 @@ export function validateEvidenceItem(
   if (!item.summary || item.summary.trim().length === 0) {
     throw new UsageError(`Evidence for repo '${repo.name}' in '${file}' is missing a summary`);
   }
+  if (!item.quote || normalize(item.quote ?? '').length < 3) {
+    throw new UsageError(
+      `Evidence for repo '${repo.name}' in '${file}' must include a quoted snippet that can be verified`
+    );
+  }
 
-  // Observed-evidence rule: a discovered selection may only cite files that
-  // retrieval or a read-only tool actually observed, never content the model
-  // claims to have seen.
-  if (!repo.explicit && options.observed) {
-    const observedForRepo = options.observed.get(repo.source);
-    if (!observedForRepo || !observedForRepo.has(normalized)) {
+  let lines: [number, number] | undefined;
+  if (item.lines) {
+    const [start, end] = item.lines;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+      throw new UsageError(
+        `Evidence for repo '${repo.name}' in '${file}' has an invalid line range [${start}, ${end}]`
+      );
+    }
+    lines = [start, end];
+  }
+
+  const store = options.observed;
+  if (!repo.explicit && store) {
+    const observed = store.getFile(repo.source, normalized);
+    if (!observed || observed.size === 0) {
       throw new UsageError(
         `Evidence for repo '${repo.name}' cites '${file}', which was never retrieved or observed; refusing unseen evidence`
       );
     }
+    if (lines) {
+      for (let n = lines[0]; n <= lines[1]; n++) {
+        if (!observed.has(n)) {
+          throw new UsageError(
+            `Evidence for repo '${repo.name}' in '${file}' cites lines ${lines[0]}-${lines[1]}, which were not observed by any read or search`
+          );
+        }
+      }
+      const haystack = normalize(
+        Array.from(
+          { length: lines[1] - lines[0] + 1 },
+          (_value, index) => observed.get(lines[0] + index) ?? ''
+        ).join('\n')
+      );
+      if (!haystack.includes(normalize(item.quote ?? ''))) {
+        throw new UsageError(
+          `Evidence for repo '${repo.name}' in '${file}' lines ${lines[0]}-${lines[1]} does not contain the quoted snippet; refusing unverifiable evidence`
+        );
+      }
+    } else if (
+      !store
+        .runs(repo.source, normalized)
+        .some((run) => normalize(run).includes(normalize(item.quote ?? '')))
+    ) {
+      throw new UsageError(
+        `Evidence for repo '${repo.name}' in '${file}' does not contain the quoted snippet in any observed slice; refusing unverifiable evidence`
+      );
+    }
+    return { file: normalized, ...(lines ? { lines } : {}), summary: item.summary };
   }
 
-  // Canonical, component-by-component confinement. This rejects an
-  // intermediate directory symlink that escapes the repository.
+  // Explicit repositories (or callers without an observation store): validate
+  // against the confined live file.
   let abs: string;
   try {
     abs = resolveInside(repo.source, normalized);
@@ -126,7 +171,6 @@ export function validateEvidenceItem(
       `Evidence path '${file}' for repo '${repo.name}' is not confined to the repository: ${(err as Error).message}`
     );
   }
-
   let st: fs.Stats;
   try {
     st = fs.lstatSync(abs);
@@ -140,7 +184,6 @@ export function validateEvidenceItem(
       `Evidence for repo '${repo.name}' cites non-regular file '${file}'`
     );
   }
-
   const maxBytes = options.maxFileBytes ?? 1024 * 1024;
   let content: string;
   try {
@@ -157,52 +200,23 @@ export function validateEvidenceItem(
       `Evidence for repo '${repo.name}' could not read '${file}': ${(err as Error).message}`
     );
   }
-
   const fileLines = content.split('\n');
-
-  let lines: [number, number] | undefined;
-  if (item.lines) {
-    const [start, end] = item.lines;
-    if (
-      !Number.isInteger(start) ||
-      !Number.isInteger(end) ||
-      start < 1 ||
-      end < start
-    ) {
-      throw new UsageError(
-        `Evidence for repo '${repo.name}' in '${file}' has an invalid line range [${start}, ${end}]`
-      );
-    }
-    if (end > fileLines.length) {
-      throw new UsageError(
-        `Evidence for repo '${repo.name}' in '${file}' cites lines [${start}, ${end}] but the file has only ${fileLines.length} lines`
-      );
-    }
-    lines = [start, end];
-  }
-
-  if (!item.quote || normalize(item.quote).length < 3) {
+  if (lines && lines[1] > fileLines.length) {
     throw new UsageError(
-      `Evidence for repo '${repo.name}' in '${file}' must include a quoted snippet that can be verified`
+      `Evidence for repo '${repo.name}' in '${file}' cites lines [${lines[0]}, ${lines[1]}] but the file has only ${fileLines.length} lines`
     );
   }
-
   const haystack = lines
     ? normalize(fileLines.slice(lines[0] - 1, lines[1]).join('\n'))
     : normalize(content);
-  if (!haystack.includes(normalize(item.quote))) {
+  if (!haystack.includes(normalize(item.quote ?? ''))) {
     throw new UsageError(
       `Evidence for repo '${repo.name}' in '${file}'${lines ? ` lines ${lines[0]}-${lines[1]}` : ''} does not contain the quoted snippet; refusing unverifiable (fictional) evidence`
     );
   }
-
-  const evidence: Evidence = {
-    file: normalized,
-    ...(lines ? { lines } : {}),
-    summary: item.summary,
-  };
-  return evidence;
+  return { file: normalized, ...(lines ? { lines } : {}), summary: item.summary };
 }
+
 
 /**
  * Validates a scout selection against the enumerated repository universe plus
@@ -220,7 +234,7 @@ export function validateScoutSelection(
 ): ValidatedSelection {
   const repos: ValidatedRepoSelection[] = [];
   const seen = new Set<string>();
-  const observed = options.observed ?? new Map<string, ReadonlySet<string>>();
+  const observed = options.observed ?? new ObservedEvidenceStore();
 
   for (const input of selection.repos) {
     const resolved = resolveAllowed(input.source, allowed);

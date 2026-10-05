@@ -79,6 +79,32 @@ test('reports an rg-unavailable gap without throwing', async () => {
   }
 });
 
+test('supplied document bytes count against the retrieval byte budget', async () => {
+  const codeRoot = tmp('wsg-ret-docbudget-');
+  const repo = createTestRepo({ prefix: 'wsg-ret-docbudget-src-' });
+  fs.symlinkSync(repo.dir, path.join(codeRoot, 'repo'));
+  const docDir = tmp('wsg-ret-docbudget-doc-');
+  const docPath = path.join(docDir, 'big.md');
+  fs.writeFileSync(docPath, `# Big\n${'x'.repeat(5000)}\n`);
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const result = await retrieveEvidence('task', [], discovery.repos, {
+      codeRoots: [codeRoot],
+      suppliedDocs: [docPath],
+      budget: { maxBytes: 200, maxFileBytes: 1000, maxRgMatches: 0 },
+    });
+    assert.ok(result.stats.bytesRead <= 200, `bytesRead ${result.stats.bytesRead} must be bounded`);
+    assert.ok(
+      result.gaps.some((g) => /maximum of|byte budget/i.test(g)),
+      `expected a byte-budget gap, got ${JSON.stringify(result.gaps)}`
+    );
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
 test('byte and match budgets produce truncation gaps', async () => {
   const codeRoot = tmp('wsg-ret-budget-');
   const repo = createTestRepo({

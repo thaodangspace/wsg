@@ -1,5 +1,6 @@
 import { UsageError } from './errors.ts';
 import type { Intent } from './manifest.ts';
+import type { ObservedEvidenceStore } from './observed.ts';
 
 export interface ScoutEvidence {
   /** Repository-relative file path. */
@@ -62,6 +63,8 @@ export interface ScoutOptions {
   codeRoots?: string[];
   /** Durable state directory used for checkpointing and resume. */
   stateDir?: string;
+  /** Durable observed-evidence store shared with the caller. */
+  observations?: ObservedEvidenceStore;
   /** Maximum number of automatically discovered repositories. */
   maxDiscoveredRepos?: number;
   /** When true, resume an interrupted scout conversation instead of starting over. */

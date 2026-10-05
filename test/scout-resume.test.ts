@@ -5,10 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { makeEmrFixture } from './helpers/emr-fixture.ts';
 import { enumerateRepos } from '../src/discovery.ts';
-import { PiScout, SCOUT_DB_FILENAME, SCOUT_TOOL_NAMES } from '../src/pi-scout.ts';
+import { PiScout, SCOUT_DB_FILENAME, SCOUT_TOOL_NAMES, SCOUT_OBSERVED_FILENAME } from '../src/pi-scout.ts';
 import { runCreate } from '../src/create.ts';
 import { parseManifest } from '../src/manifest.ts';
 import { ConflictError } from '../src/errors.ts';
+import { createTestRepo } from './helpers/git-fixture.ts';
 
 let piAvailable = true;
 try {
@@ -133,6 +134,99 @@ test('the scout toolset is read-only and never exposes write or shell tools', ()
   assert.deepEqual(SCOUT_TOOL_NAMES, ['list_repos', 'read_file', 'rg_search', 'submit_selection']);
   for (const name of SCOUT_TOOL_NAMES) {
     assert.doesNotMatch(name, /write|edit|shell|exec|run|install|delete|remove|git/i);
+  }
+});
+
+test('read observations persist across a crash and are used when resuming through create', { skip }, async () => {
+  const codeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-obs-crash-'));
+  const outRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-obs-out-'));
+  const repo = createTestRepo({
+    prefix: 'wsg-obs-repo-',
+    files: { 'src/only.ts': 'export const onlyMarker = 42;\n' },
+  });
+  fs.symlinkSync(repo.dir, path.join(codeRoot, 'only-repo'));
+  const wsDir = path.join(outRoot, 'obs-ws');
+  const stateDir = path.join(outRoot, '.wsg-scout', 'obs-ws');
+  const submit = {
+    tool: 'submit_selection',
+    args: {
+      repos: [
+        {
+          source: 'only-repo',
+          intent: 'target',
+          reason: 'only candidate',
+          evidence: [
+            {
+              file: 'src/only.ts',
+              lines: [1, 1],
+              summary: 'onlyMarker',
+              quote: 'export const onlyMarker',
+            },
+          ],
+        },
+      ],
+      exclusions: [],
+      gaps: [],
+      context: [],
+    },
+  };
+  const script = [
+    { tool: 'read_file', args: { repo: 'only-repo', path: 'src/only.ts' } },
+    submit,
+  ];
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const crashing = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: script,
+      haltAfterTool: 'read_file',
+    });
+    await assert.rejects(
+      () =>
+        runCreate(
+          {
+            request: 'port unknown service',
+            name: 'obs-ws',
+            root: outRoot,
+            codeRoots: [codeRoot],
+            scout: crashing,
+          },
+          io
+        ),
+      'the interrupted scout must reject before materialization'
+    );
+    assert.ok(
+      fs.existsSync(path.join(stateDir, SCOUT_OBSERVED_FILENAME)),
+      'observed lines must be persisted before the crash'
+    );
+    assert.equal(fs.existsSync(wsDir), false);
+
+    const resumed = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: script,
+    });
+    const code = await runCreate(
+      {
+        request: 'port unknown service',
+        name: 'obs-ws',
+        root: outRoot,
+        codeRoots: [codeRoot],
+        scout: resumed,
+        resume: true,
+      },
+      io
+    );
+    assert.equal(code, 0);
+    const manifest = parseManifest(fs.readFileSync(path.join(wsDir, 'workspace.yaml'), 'utf8'));
+    assert.equal(manifest.repos.length, 1);
+    assert.equal(manifest.repos[0].evidence.length, 1);
+    assert.equal(manifest.repos[0].evidence[0].file, 'src/only.ts');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(outRoot, { recursive: true, force: true });
   }
 });
 

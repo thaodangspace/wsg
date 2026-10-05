@@ -49,8 +49,11 @@ than authority.
 
 Selection is evidence-based: every automatically discovered repository must
 cite a repository-relative file that retrieval or a read/search tool actually
-observed, with a quoted snippet verified against the file. Unseen or fictional
-evidence stops the run with an actionable error. The scout selects at most
+observed, with a quoted snippet verified against the exact observed lines rather
+than the current file, so unseen content cannot be cited. Unseen or fictional
+evidence stops the run with an actionable error. Supplied documents and one-hop
+resolved local documents are exposed to the scout as bounded, untrusted context
+and can be planned into the workspace. The scout selects at most
 `max_discovered_repos` (default 5) automatically discovered repositories;
 explicit `--repo` inputs are always included, are not counted against the cap,
 and need no evidence. Selections that name more than one target are reported as

@@ -13,6 +13,7 @@ import {
   SCOUT_BUDGET_FILENAME,
 } from '../src/pi-scout.ts';
 import { UsageError, ConflictError } from '../src/errors.ts';
+import { ObservedEvidenceStore } from '../src/observed.ts';
 
 let piAvailable = true;
 try {
@@ -93,11 +94,11 @@ test('rg_search returns matching files through the real harness tool', { skip },
   const stateDir = path.join(tmp('wsg-pi-rg-'), 'scout');
   try {
     const discovery = enumerateRepos([codeRoot]);
-    const observed: string[] = [];
+    const observations = new ObservedEvidenceStore();
     const scout = new PiScout({
       discovered: discovery.repos,
       provider: 'faux',
-      onObserve: (_source, relPath) => observed.push(relPath),
+      observations,
       fauxScript: [
         { tool: 'rg_search', args: { query: 'Widget', repo: 'widget-repo' } },
         { tool: 'submit_selection', args: selectionPayload },
@@ -106,12 +107,13 @@ test('rg_search returns matching files through the real harness tool', { skip },
 
     const result = await scout.scout({ request: 'find widget', codeRoots: [codeRoot], stateDir });
     assert.equal(result.kind, 'selection');
+    const widgetSource = fs.realpathSync(repo.dir);
     assert.ok(
-      observed.some((p) => p === 'src/Widget.ts'),
-      `rg_search must report the matching source file, observed=${JSON.stringify(observed)}`
+      observations.has(widgetSource, 'src/Widget.ts'),
+      `rg_search must record the matching source file, observed=${JSON.stringify(observations.pathsFor(widgetSource))}`
     );
     assert.ok(
-      !observed.some((p) => p.endsWith('.pem')),
+      !observations.pathsFor(widgetSource).some((p) => p.endsWith('.pem')),
       'rg_search must not surface secret-like files'
     );
   } finally {
@@ -304,11 +306,11 @@ test('a resumed scout past an exhausted budget performs no further work', { skip
     // kept the durable budget accounting.
     fs.rmSync(path.join(stateDir, SCOUT_CHECKPOINT_FILENAME), { force: true });
 
-    const observed: string[] = [];
+    const observed = new ObservedEvidenceStore();
     const resumed = new PiScout({
       discovered: discovery.repos,
       provider: 'faux',
-      onObserve: (_s, p) => observed.push(p),
+      observations: observed,
       // Would submit if the harness ran; the exhausted budget must prevent that.
       fauxScript: [{ tool: 'submit_selection', args: selectionPayload }],
     });
@@ -320,7 +322,7 @@ test('a resumed scout past an exhausted budget performs no further work', { skip
     });
     assert.equal(result.kind, 'none');
     assert.match(result.kind === 'none' ? result.reason : '', /budget/);
-    assert.deepEqual(observed, [], 'no tools may run when the durable budget is exhausted');
+    assert.equal(observed.lineCount(), 0, 'no tools may run when the durable budget is exhausted');
   } finally {
     repo.cleanup();
     fs.rmSync(codeRoot, { recursive: true, force: true });
@@ -370,6 +372,69 @@ test('read tool confinement refuses traversal, absolute paths, symlink escapes, 
     repo.cleanup();
     if (outside) fs.rmSync(outside, { recursive: true, force: true });
     fs.rmSync(codeRoot, { recursive: true, force: true });
+  }
+});
+
+test('search budget is enforced cumulatively across repositories', { skip }, async () => {
+  const codeRoot = tmp('wsg-pi-srch-');
+  const repos = ['a', 'b', 'c'].map((name) =>
+    createTestRepo({
+      prefix: `wsg-pi-srch-${name}-`,
+      files: { 'src/needle.ts': 'needle content line here for the search budget\n' },
+    })
+  );
+  repos.forEach((r, index) => fs.symlinkSync(r.dir, path.join(codeRoot, `repo-${index}`)));
+  const stateDir = path.join(tmp('wsg-pi-srch-state-'), 'scout');
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const observations = new ObservedEvidenceStore();
+    const scout = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      maxSearchBytesTotal: 1,
+      observations,
+      fauxScript: [
+        { tool: 'rg_search', args: { query: 'needle' } },
+        { tool: 'submit_selection', args: selectionPayload },
+      ],
+    });
+    const result = await scout.scout({ request: 'find needle', codeRoots: [codeRoot], stateDir });
+    assert.equal(result.kind, 'none');
+    if (result.kind === 'none') assert.match(result.reason, /search-byte budget/);
+
+    const budget = JSON.parse(fs.readFileSync(path.join(stateDir, SCOUT_BUDGET_FILENAME), 'utf8'));
+    assert.ok(budget.searchBytes >= 1, 'search bytes must be accounted');
+    const searched = discovery.repos.filter((r) => observations.pathsFor(r.source).length > 0);
+    assert.ok(
+      searched.length <= 1,
+      `at most one repository may be searched after the budget is hit, got ${searched.length}`
+    );
+  } finally {
+    repos.forEach((r) => r.cleanup());
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
+  }
+});
+
+test('turn budget bounds repeated invalid tool arguments that never execute', { skip }, async () => {
+  const { codeRoot, repo } = setupRepo();
+  const stateDir = path.join(tmp('wsg-pi-turns-'), 'scout');
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const scout = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      maxTurns: 1,
+      // Invalid arguments: execute() is never called for these calls.
+      fauxScript: [{ tool: 'read_file', args: { notAValidField: true } }],
+    });
+    const result = await scout.scout({ request: 'invalid args', codeRoots: [codeRoot], stateDir });
+    assert.equal(result.kind, 'none');
+    if (result.kind === 'none') assert.match(result.reason, /turn/);
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
   }
 });
 

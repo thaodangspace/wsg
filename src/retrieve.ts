@@ -511,10 +511,26 @@ export async function retrieveEvidence(
   const stats: RetrievalStats = { filesRead: 0, bytesRead: 0, rgMatches: 0, rgBytes: 0, rgExecuted: false };
 
   const suppliedDocs = options.suppliedDocs ?? [];
+  // Supplied documents count against the same cumulative retrieval byte budget
+  // as repository reads, so documents cannot bypass the coverage bound.
+  const docReads: Array<{ path: string; content: string }> = [];
   const docTexts: string[] = [];
   for (const doc of suppliedDocs) {
-    const res = readBoundedFile(doc, budget.maxFileBytes);
-    if (!('error' in res)) docTexts.push(res.content);
+    const remainingBytes = budget.maxBytes - counters.bytesRead;
+    if (remainingBytes <= 0) {
+      gaps.push(
+        `Supplied document reads reached the ${Math.round(budget.maxBytes / 1024)} KiB retrieval byte budget`
+      );
+      break;
+    }
+    const cap = Math.max(1, Math.min(budget.maxFileBytes, remainingBytes));
+    const res = readBoundedFile(doc, cap);
+    if (!('error' in res)) {
+      docReads.push({ path: doc, content: res.content });
+      docTexts.push(res.content);
+      counters.filesRead++;
+      counters.bytesRead += Buffer.byteLength(res.content, 'utf8');
+    }
   }
 
   const queryTerms = extractQueryTerms(request, context, docTexts);
@@ -570,17 +586,15 @@ export async function retrieveEvidence(
     }
   }
 
-  for (const doc of suppliedDocs) {
-    const res = readBoundedFile(doc, budget.maxFileBytes);
-    if ('error' in res) continue;
-    const docDir = path.dirname(doc);
+  for (const doc of docReads) {
+    const docDir = path.dirname(doc.path);
     const roots = mentionRoots.length > 0 ? [...mentionRoots, docDir] : [docDir];
-    const resolved = resolveLocalDocMentions(res.content, docDir, repos, roots);
+    const resolved = resolveLocalDocMentions(doc.content, docDir, repos, roots);
     for (const mention of resolved.repoMentions) {
-      docMentions.push({ ...mention, document: doc });
+      docMentions.push({ ...mention, document: doc.path });
     }
     for (const ref of resolved.referencedDocs) {
-      referencedDocs.push({ ...ref, from: doc });
+      referencedDocs.push({ ...ref, from: doc.path });
     }
   }
 

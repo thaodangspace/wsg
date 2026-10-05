@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { makeEmrFixture, EMR_FILES, EMR_CONTENT } from './helpers/emr-fixture.ts';
 import { createTestRepo } from './helpers/git-fixture.ts';
-import { runCreate } from '../src/create.ts';
+import { runCreate, buildScoutDocumentContext } from '../src/create.ts';
 import { runMain } from './helpers/cli.ts';
 import { ScriptedScout, type ScoutResult } from '../src/scout.ts';
 import { parseManifest } from '../src/manifest.ts';
@@ -409,6 +409,96 @@ test('--repo plus --code-root scouts candidates and includes explicit sources ou
   } finally {
     external.cleanup();
     fixture.cleanup();
+  }
+});
+
+test('scout context is merged into the manifest and generated context', async () => {
+  const fixture = makeEmrFixture();
+  const selection = cloneSelection(fixture.selection);
+  if (selection.kind === 'selection') {
+    selection.context = ['Target uses patient-service module boundaries'];
+  }
+  try {
+    const code = await runCreate(
+      {
+        request: 'port EMR to modular',
+        name: 'ctx-merge',
+        root: fixture.workspaceRoot,
+        codeRoots: [fixture.codeRoot],
+        scout: new ScriptedScout(selection),
+        scoutStateDir: path.join(fixture.workspaceRoot, '.scout-ctx'),
+      },
+      io()
+    );
+    assert.equal(code, 0);
+    const wsDir = path.join(fixture.workspaceRoot, 'ctx-merge');
+    const manifest = parseManifest(fs.readFileSync(path.join(wsDir, 'workspace.yaml'), 'utf8'));
+    assert.ok(
+      manifest.context.includes('Target uses patient-service module boundaries'),
+      'scout context must be merged into the manifest'
+    );
+    const contextMd = fs.readFileSync(path.join(wsDir, 'docs', 'context.md'), 'utf8');
+    assert.match(contextMd, /patient-service module boundaries/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('scout-selected documents and one-hop resolved local docs are planned', async () => {
+  const fixture = makeEmrFixture();
+  const notesDir = path.join(fixture.codeRoot, 'notes');
+  fs.mkdirSync(notesDir, { recursive: true });
+  const referenced = path.join(notesDir, 'referenced.md');
+  fs.writeFileSync(referenced, '# Referenced\nImportant migration context.\n');
+  const docDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-m3-doc-'));
+  const supplied = path.join(docDir, 'migration.md');
+  fs.writeFileSync(supplied, `# Migration\nSee \`${referenced}\` for details.\n`);
+
+  const selection = cloneSelection(fixture.selection);
+  if (selection.kind === 'selection') {
+    selection.repos = selection.repos.slice(0, 2);
+  }
+  try {
+    const code = await runCreate(
+      {
+        request: 'port EMR to modular',
+        name: 'docs-merge',
+        root: fixture.workspaceRoot,
+        codeRoots: [fixture.codeRoot],
+        docs: [supplied],
+        scout: new ScriptedScout(selection),
+        scoutStateDir: path.join(fixture.workspaceRoot, '.scout-docs'),
+      },
+      io()
+    );
+    assert.equal(code, 0);
+    const manifest = parseManifest(
+      fs.readFileSync(path.join(fixture.workspaceRoot, 'docs-merge', 'workspace.yaml'), 'utf8')
+    );
+    const userDoc = manifest.docs.find((d) => d.source === fs.realpathSync(supplied));
+    assert.ok(userDoc, 'supplied document must be planned');
+    assert.equal(userDoc.added_by, 'user');
+
+    const resolvedDoc = manifest.docs.find((d) => d.source === fs.realpathSync(referenced));
+    assert.ok(resolvedDoc, 'one-hop resolved local document must be planned');
+    assert.equal(resolvedDoc.added_by, 'scout');
+  } finally {
+    fixture.cleanup();
+    fs.rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('buildScoutDocumentContext includes bounded untrusted document content', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-m3-docctx-'));
+  const doc = path.join(dir, 'context.md');
+  fs.writeFileSync(doc, '# Migration\nTarget uses patient-service boundaries.\n');
+  try {
+    const text = buildScoutDocumentContext([doc], []);
+    assert.match(text, /patient-service boundaries/);
+    assert.ok(text.includes(doc), 'the document path must be labelled');
+    assert.equal(buildScoutDocumentContext([], []), '');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

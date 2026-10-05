@@ -63,7 +63,8 @@ import {
 } from './scout.ts';
 import type { CliIO } from './cli.ts';
 import { enumerateRepos, type DiscoveredRepo } from './discovery.ts';
-import { retrieveEvidence } from './retrieve.ts';
+import { retrieveEvidence, readBoundedFile } from './retrieve.ts';
+import { ObservedEvidenceStore } from './observed.ts';
 import {
   validateScoutSelection,
   findTargetAmbiguity,
@@ -74,6 +75,7 @@ import {
   PiScout,
   SCOUT_META_FILENAME,
   SCOUT_BUDGET_FILENAME,
+  SCOUT_OBSERVED_FILENAME,
   SCOUT_CHECKPOINT_FILENAME,
   SCOUT_DB_FILENAME,
 } from './pi-scout.ts';
@@ -153,6 +155,7 @@ export interface CreateAssembly {
   wsDir: string;
   request: string;
   context: string[];
+  scoutContext: string[];
   adapters: ManifestAdapter[];
   repos: AssemblyRepo[];
   docs: PlannedDoc[];
@@ -358,6 +361,7 @@ export interface RecordedPlan {
   name: string;
   request: string;
   context: string[];
+  scoutContext?: string[];
   adapters: ManifestAdapter[];
   repos: AssemblyRepo[];
   docs: RecordedPlanDoc[];
@@ -549,6 +553,9 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
       name: (rawPlan.name as string) ?? (op.args?.name as string) ?? fallbackName,
       request: (rawPlan.request as string) ?? (op.args?.request as string) ?? '',
       context: Array.isArray(rawPlan.context) ? (rawPlan.context as string[]) : [],
+      scoutContext: Array.isArray(rawPlan.scoutContext)
+        ? (rawPlan.scoutContext as string[])
+        : [],
       adapters:
         Array.isArray(rawPlan.adapters) && (rawPlan.adapters as unknown[]).length > 0
           ? (rawPlan.adapters as ManifestAdapter[])
@@ -917,7 +924,7 @@ async function executeResume(
     version: 1,
     name: plan.name,
     request: plan.request,
-    context: plan.context,
+    context: [...plan.context, ...(plan.scoutContext ?? [])],
     adapters: plan.adapters,
     repos: plan.repos.map((r) => ({
       name: r.name,
@@ -1249,6 +1256,7 @@ async function runAssembly(
     wsDir,
     request,
     context,
+    scoutContext,
     adapters,
     repos,
     docs: plannedDocs,
@@ -1261,7 +1269,7 @@ async function runAssembly(
     version: 1,
     name: wsName,
     request,
-    context,
+    context: [...context, ...scoutContext],
     adapters,
     repos: repos.map((r) => ({
       name: r.name,
@@ -1511,6 +1519,7 @@ async function runAssembly(
       name: wsName,
       request,
       context,
+      scoutContext,
       adapters,
       repos: repos.map((r) => ({ ...r })),
       docs: plannedDocs.map((d) => ({
@@ -1853,6 +1862,7 @@ async function executeCreate(
     wsDir,
     request,
     context: options.context ?? [],
+    scoutContext: scoutResult.context ?? [],
     adapters,
     repos,
     docs: plannedDocs,
@@ -1868,6 +1878,41 @@ async function executeCreate(
  */
 export function scoutStateDirFor(root: string, name: string): string {
   return path.join(root, '.wsg-scout', name);
+}
+
+const MAX_DOCUMENT_CONTEXT_BYTES = 32 * 1024;
+
+/**
+ * Builds a bounded, untrusted document context block from supplied documents
+ * and one-hop resolved local documents so the scout can reason about material
+ * that lives outside the repositories. Returns an empty string when there is
+ * nothing readable.
+ */
+export function buildScoutDocumentContext(
+  suppliedDocs: readonly string[],
+  resolvedDocs: readonly string[],
+  maxBytes: number = MAX_DOCUMENT_CONTEXT_BYTES
+): string {
+  const sources: string[] = [];
+  const seen = new Set<string>();
+  for (const source of [...suppliedDocs, ...resolvedDocs]) {
+    if (!source || seen.has(source)) continue;
+    seen.add(source);
+    sources.push(source);
+  }
+
+  const parts: string[] = [];
+  let bytes = 0;
+  for (const source of sources) {
+    const remaining = maxBytes - bytes;
+    if (remaining <= 0) break;
+    const res = readBoundedFile(source, Math.min(remaining, 16 * 1024));
+    if ('error' in res) continue;
+    const body = res.content;
+    parts.push(`### ${source}\n${body}${res.truncated ? '\n[truncated]' : ''}`);
+    bytes += Buffer.byteLength(body, 'utf8');
+  }
+  return parts.join('\n\n');
 }
 
 /**
@@ -1942,21 +1987,33 @@ async function executeAutonomousCreate(
     }
   }
 
-  // Durable observed-evidence tracking: retrieval files/matches plus anything
-  // a read-only tool actually read or matched.
-  const observed = new Map<string, Set<string>>();
-  const recordObserved = (source: string, relPath: string) => {
-    let set = observed.get(source);
-    if (!set) {
-      set = new Set();
-      observed.set(source, set);
+  // Durable observed-evidence tracking: retrieval files/matches plus anything a
+  // read-only tool actually reads or matches. Persisted so observations survive
+  // a crash and are available when the scout resumes.
+  const observedPath = path.join(stateDir, SCOUT_OBSERVED_FILENAME);
+  if (!options.resume) {
+    try {
+      fs.rmSync(observedPath, { force: true });
+    } catch {
+      // ignore
     }
-    set.add(path.posix.normalize(relPath));
-  };
-  for (const corpus of retrieval.repos.values()) {
-    for (const relPath of corpus.files.keys()) recordObserved(corpus.source, relPath);
-    for (const match of corpus.matches) recordObserved(corpus.source, match.relPath);
   }
+  const observed = new ObservedEvidenceStore(observedPath);
+  for (const corpus of retrieval.repos.values()) {
+    for (const [relPath, file] of corpus.files) {
+      observed.observe(corpus.source, relPath, 1, file.content.split('\n'));
+    }
+    for (const match of corpus.matches) {
+      observed.observeLine(corpus.source, match.relPath, match.line, match.text);
+    }
+  }
+
+  // Bounded, untrusted supplied and one-hop resolved document content so the
+  // scout can reason about documents that live outside the repositories.
+  const documentContext = buildScoutDocumentContext(
+    suppliedDocs,
+    retrieval.referencedDocs.map((ref) => ref.resolved).filter((p): p is string => !!p)
+  );
 
   // Explicit allowed entries come first so an explicit source wins over the
   // same auto-discovered repository when resolving a selection.
@@ -1975,6 +2032,7 @@ async function executeAutonomousCreate(
     context: options.context,
     codeRoots,
     stateDir,
+    observations: observed,
     maxDiscoveredRepos: settings.max_discovered_repos,
     resume: options.resume,
     env: io.env,
@@ -1999,7 +2057,8 @@ async function executeAutonomousCreate(
       model: settings.scout.model,
       maxToolCalls: options.maxScoutToolCalls,
       rgPathForTests: options.rgPath,
-      onObserve: recordObserved,
+      observations: observed,
+      documentContext,
     });
     stderr.write(
       `wsg: scouting ${discovery.repos.length} repositor${discovery.repos.length === 1 ? 'y' : 'ies'} under ${codeRoots.join(', ')}\n`
@@ -2140,25 +2199,52 @@ async function executeAutonomousCreate(
     }
   }
 
-  // Documents: same explicit-input handling as M2.
-  const inspectedDocs: InspectedDoc[] = [];
+  // Documents: explicit --doc inputs are user-owned and fail hard; scout-chosen
+  // and one-hop resolved local documents are scout-owned and degrade to gaps
+  // rather than inventing or failing attachments.
+  const inspectedList: InspectedDoc[] = [];
+  const userDocSources = new Set<string>();
+  const inspectInput = (input: string): InspectedDoc => {
+    if (classifyDocInput(input) === 'url') return inspectDoc(input);
+    const expanded = expandHome(input);
+    const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
+    return inspectDoc(resolved);
+  };
+
   for (const input of options.docs ?? []) {
-    const kind = classifyDocInput(input);
-    if (kind === 'url') {
-      inspectedDocs.push(inspectDoc(input));
-    } else {
-      const expanded = expandHome(input);
-      const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded);
-      inspectedDocs.push(inspectDoc(resolved));
+    const inspected = inspectInput(input);
+    inspectedList.push(inspected);
+    userDocSources.add(inspected.source);
+  }
+  for (const doc of validated.docs) {
+    try {
+      inspectedList.push(inspectInput(doc.input));
+    } catch (err: unknown) {
+      allGaps.push(
+        `Scout-selected document '${doc.input}' could not be attached: ${(err as Error).message}`
+      );
     }
   }
-  const plannedDocs = planDocs(inspectedDocs, { addedBy: 'user' });
+  for (const ref of retrieval.referencedDocs) {
+    if (!ref.resolved || ref.reason !== 'resolved local document mention') continue;
+    try {
+      inspectedList.push(inspectDoc(ref.resolved));
+    } catch (err: unknown) {
+      allGaps.push(
+        `Resolved document '${ref.resolved}' could not be attached: ${(err as Error).message}`
+      );
+    }
+  }
+  const plannedDocs = planDocs(inspectedList, { addedBy: 'user' }).map((d) =>
+    userDocSources.has(d.source) ? d : { ...d, added_by: 'scout' as AddedBy }
+  );
 
   const assembly: CreateAssembly = {
     wsName: ctx.wsName,
     wsDir: ctx.wsDir,
     request: ctx.request,
     context: options.context ?? [],
+    scoutContext: validated.context,
     adapters: ctx.adapters,
     repos,
     docs: plannedDocs,
@@ -2178,6 +2264,7 @@ async function executeAutonomousCreate(
         [path.join(stateDir, SCOUT_CHECKPOINT_FILENAME), 'scout.json'],
         [path.join(stateDir, SCOUT_META_FILENAME), 'scout-meta.json'],
         [path.join(stateDir, SCOUT_BUDGET_FILENAME), 'scout-budget.json'],
+        [path.join(stateDir, SCOUT_OBSERVED_FILENAME), 'scout-observed.json'],
       ];
       for (const [from, to] of copies) {
         if (fs.existsSync(from)) {
