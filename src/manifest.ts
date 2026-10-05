@@ -1,8 +1,11 @@
 import { Type, type Static } from 'typebox';
+import { Value } from 'typebox/value';
 import * as YAML from 'yaml';
+import { realpathSync } from 'node:fs';
+import path from 'node:path';
 import { parseYamlStrict, type ParseYamlOptions } from './yamlio.ts';
 import { UsageError } from './errors.ts';
-import { assertConfinedRelative, canonicalize } from './paths.ts';
+import { assertConfinedRelative } from './paths.ts';
 import { assertValidSlug, isReservedRootName } from './slug.ts';
 import { checkBranchName } from './git.ts';
 
@@ -276,9 +279,84 @@ export function parseManifest(
   return manifest;
 }
 
+export function normalizeSourcePath(sourcePath: string): string {
+  if (typeof sourcePath !== 'string' || sourcePath.length === 0) {
+    throw new UsageError('repo source must not be empty');
+  }
+  if (!path.isAbsolute(sourcePath)) {
+    throw new UsageError(`repo source '${sourcePath}' must be an absolute path`);
+  }
+  if (sourcePath.includes('\0')) {
+    throw new UsageError(`repo source '${sourcePath}' contains NUL byte`);
+  }
+  try {
+    return realpathSync(sourcePath);
+  } catch {
+    return path.resolve(sourcePath);
+  }
+}
+
+function formatPath(segments: string[]): string {
+  let result = '';
+  for (const seg of segments) {
+    if (/^\d+$/.test(seg)) {
+      result += `[${seg}]`;
+    } else {
+      result = result ? `${result}.${seg}` : seg;
+    }
+  }
+  return result;
+}
+
+type SchemaError = ReturnType<typeof Value.Errors> extends Iterable<infer E>
+  ? E
+  : never;
+
+function formatSchemaErrors(errors: SchemaError[]): string[] {
+  const formatted: string[] = [];
+  for (const err of errors) {
+    if (err.keyword === 'additionalProperties') {
+      continue;
+    }
+    if (err.keyword === 'const' && err.schemaPath.includes('/anyOf/')) {
+      continue;
+    }
+    const isUnknownKey =
+      err.keyword === 'boolean' &&
+      err.schemaPath.endsWith('/additionalProperties');
+    const segments = err.instancePath.split('/').filter(Boolean);
+    const pathStr = formatPath(segments);
+    const msg = isUnknownKey
+      ? `unknown key '${pathStr}'`
+      : pathStr
+        ? `${pathStr}: ${err.message}`
+        : err.message;
+    formatted.push(msg);
+  }
+  if (formatted.length === 0) {
+    for (const err of errors) {
+      formatted.push(err.message);
+    }
+  }
+  return formatted;
+}
+
 export function validateManifest(manifest: Manifest): Manifest {
-  if (manifest.version !== MANIFEST_VERSION) {
-    throw new UsageError(`Unsupported workspace.yaml version ${manifest.version}`);
+  if (
+    manifest &&
+    typeof manifest === 'object' &&
+    'version' in manifest &&
+    (manifest as unknown as Record<string, unknown>).version !== MANIFEST_VERSION
+  ) {
+    throw new UsageError(`Unsupported workspace.yaml version ${(manifest as unknown as Record<string, unknown>).version}`);
+  }
+
+  // Strict schema validation using TypeBox
+  const rawErrors = [...Value.Errors(ManifestSchema, manifest)];
+  if (rawErrors.length > 0) {
+    const formatted = formatSchemaErrors(rawErrors);
+    const [first, ...rest] = formatted;
+    throw new UsageError(first, rest);
   }
 
   assertValidSlug(manifest.name, 'Workspace name');
@@ -290,6 +368,7 @@ export function validateManifest(manifest: Manifest): Manifest {
   const seenRepoNames = new Set<string>();
   const seenRepoPaths = new Set<string>();
   const seenRepoSources = new Set<string>();
+  const normalizedRepoEntries: Array<{ name: string; path: string; lowerPath: string }> = [];
 
   for (let i = 0; i < manifest.repos.length; i++) {
     const repo = manifest.repos[i];
@@ -303,22 +382,55 @@ export function validateManifest(manifest: Manifest): Manifest {
     }
     seenRepoNames.add(lowerName);
 
-    assertConfinedRelative(repo.path, `repo '${repoLabel}' path`);
-    if (isReservedRootName(repo.path)) {
+    // Source must be an absolute path per spec §5
+    if (!path.isAbsolute(repo.source)) {
       throw new UsageError(
-        `repo '${repoLabel}' path '${repo.path}' must not be a reserved root name`
+        `repo '${repoLabel}' source '${repo.source}' must be an absolute path`
       );
     }
-    if (seenRepoPaths.has(repo.path)) {
-      throw new UsageError(`duplicate repo path '${repo.path}'`);
-    }
-    seenRepoPaths.add(repo.path);
-
-    const canonicalSource = canonicalize(repo.source);
-    if (seenRepoSources.has(canonicalSource)) {
+    const canonicalSource = normalizeSourcePath(repo.source);
+    const lowerSource = canonicalSource.toLowerCase();
+    if (seenRepoSources.has(lowerSource)) {
       throw new UsageError(`duplicate repo source '${repo.source}'`);
     }
-    seenRepoSources.add(canonicalSource);
+    seenRepoSources.add(lowerSource);
+
+    // Relative confined path validation
+    assertConfinedRelative(repo.path, `repo '${repoLabel}' path`);
+
+    // Normalize path for collision and overlap detection
+    const normalizedPath = path.posix.normalize(repo.path).replace(/\/+$/, '');
+
+    // Reserved root name or subtree check (case-insensitive)
+    const firstSegment = normalizedPath.split('/')[0];
+    if (isReservedRootName(firstSegment)) {
+      throw new UsageError(
+        `repo '${repoLabel}' path '${repo.path}' must not occupy reserved root name or subtree '${firstSegment}'`
+      );
+    }
+
+    const lowerPath = normalizedPath.toLowerCase();
+    if (seenRepoPaths.has(lowerPath)) {
+      throw new UsageError(`duplicate repo path '${repo.path}'`);
+    }
+    seenRepoPaths.add(lowerPath);
+
+    // Overlapping repo destinations check
+    for (const existing of normalizedRepoEntries) {
+      if (
+        lowerPath.startsWith(`${existing.lowerPath}/`) ||
+        existing.lowerPath.startsWith(`${lowerPath}/`)
+      ) {
+        throw new UsageError(
+          `overlapping repo paths: repo '${repo.name}' path '${repo.path}' and repo '${existing.name}' path '${existing.path}' overlap`
+        );
+      }
+    }
+    normalizedRepoEntries.push({
+      name: repo.name,
+      path: repo.path,
+      lowerPath,
+    });
 
     if (!/^[0-9a-fA-F]{40}$/.test(repo.base_commit)) {
       throw new UsageError(
@@ -402,13 +514,21 @@ export function validateManifest(manifest: Manifest): Manifest {
     }
   }
 
-  const validRepoPaths = new Set(manifest.repos.map((r) => r.path));
+  const validRepoPaths = new Set(
+    manifest.repos.map((r) =>
+      path.posix.normalize(r.path).replace(/\/+$/, '').toLowerCase()
+    )
+  );
 
   for (let i = 0; i < (manifest.commands ?? []).length; i++) {
     const cmd = manifest.commands[i];
     const cmdLabel = cmd.name || `commands[${i}]`;
+    const normalizedCmdCwd = path.posix
+      .normalize(cmd.cwd)
+      .replace(/\/+$/, '')
+      .toLowerCase();
 
-    if (!validRepoPaths.has(cmd.cwd)) {
+    if (!validRepoPaths.has(normalizedCmdCwd)) {
       throw new UsageError(
         `command '${cmdLabel}' cwd '${cmd.cwd}' does not match any repo path in the workspace`
       );

@@ -454,6 +454,197 @@ test('validateManifest rejects snapshot doc with non-64-hex sha256', () => {
   );
 });
 
+test('validateManifest and serializeManifest enforce ManifestSchema on programmatic drafts (intent, unknown fields)', () => {
+  const base = parseManifest(readFixture('spec-section-5.yaml'));
+
+  // 1. Programmatic modification of intent to bogus
+  const bogusIntentManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  (bogusIntentManifest.repos[0] as Record<string, unknown>).intent = 'bogus';
+
+  assert.throws(
+    () => validateManifest(bogusIntentManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /repos\[0\]\.intent/);
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => serializeManifest(bogusIntentManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /repos\[0\]\.intent/);
+      return true;
+    }
+  );
+
+  // 2. Programmatic injection of unknown field into repos[0]
+  const unknownRepoFieldManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  (unknownRepoFieldManifest.repos[0] as Record<string, unknown>).extra_prop = 'boom';
+
+  assert.throws(
+    () => validateManifest(unknownRepoFieldManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /unknown key 'repos\[0\]\.extra_prop'/);
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => serializeManifest(unknownRepoFieldManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /unknown key 'repos\[0\]\.extra_prop'/);
+      return true;
+    }
+  );
+
+  // 3. Programmatic injection of top-level unknown field
+  const unknownTopLevelManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  (unknownTopLevelManifest as unknown as Record<string, unknown>).invalid_top = 42;
+
+  assert.throws(
+    () => validateManifest(unknownTopLevelManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /unknown key 'invalid_top'/);
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => serializeManifest(unknownTopLevelManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /unknown key 'invalid_top'/);
+      return true;
+    }
+  );
+});
+
+test('repo source paths must be canonical absolute paths per spec §5', () => {
+  // Parse rejects relative source
+  assert.throws(
+    () => parseManifest(readFixture('invalid-relative-source.yaml')),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /source 'relative-source' must be an absolute path/);
+      return true;
+    }
+  );
+
+  // Direct validateManifest call rejects relative source
+  const base = parseManifest(readFixture('spec-section-5.yaml'));
+  const relativeSourceManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  relativeSourceManifest.repos[0].source = 'relative/path';
+
+  assert.throws(
+    () => validateManifest(relativeSourceManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /source 'relative\/path' must be an absolute path/);
+      return true;
+    }
+  );
+
+  assert.throws(
+    () => serializeManifest(relativeSourceManifest),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /source 'relative\/path' must be an absolute path/);
+      return true;
+    }
+  );
+
+  // Non-existent absolute source does NOT throw when validating (e.g. relocated workspace)
+  const nonExistentSourceManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+  nonExistentSourceManifest.repos[0].source = '/non/existent/abs/path/to/repo';
+  assert.doesNotThrow(() => validateManifest(nonExistentSourceManifest));
+});
+
+test('repo paths normalization, case variants, and reserved root subtrees', () => {
+  const base = parseManifest(readFixture('spec-section-5.yaml'));
+
+  // 1. Equivalent repo paths like 'legacy-platform/.' beside 'legacy-platform'
+  const duplicateNormalized = JSON.parse(JSON.stringify(base)) as Manifest;
+  duplicateNormalized.commands = []; // remove commands to isolate repo path test
+  duplicateNormalized.repos.push({
+    ...duplicateNormalized.repos[0],
+    name: 'another-name',
+    source: '/home/user/code/different-repo',
+    path: 'legacy-platform/.',
+    branch: 'wsg/port-emr/another-name',
+  });
+
+  assert.throws(
+    () => validateManifest(duplicateNormalized),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /duplicate repo path 'legacy-platform\/\.'/);
+      return true;
+    }
+  );
+
+  // 2. Case variants on macOS / case-insensitive filesystems
+  const caseVariant = JSON.parse(JSON.stringify(base)) as Manifest;
+  caseVariant.commands = [];
+  caseVariant.repos.push({
+    ...caseVariant.repos[0],
+    name: 'another-name-2',
+    source: '/home/user/code/different-repo-2',
+    path: 'Legacy-Platform',
+    branch: 'wsg/port-emr/another-name-2',
+  });
+
+  assert.throws(
+    () => validateManifest(caseVariant),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /duplicate repo path 'Legacy-Platform'/);
+      return true;
+    }
+  );
+
+  // 3. Overlapping repo destinations (e.g. nested worktrees)
+  const overlapping = JSON.parse(JSON.stringify(base)) as Manifest;
+  overlapping.commands = [];
+  overlapping.repos.push({
+    ...overlapping.repos[0],
+    name: 'sub-repo',
+    source: '/home/user/code/sub-repo',
+    path: 'legacy-platform/nested',
+    branch: 'wsg/port-emr/sub-repo',
+  });
+
+  assert.throws(
+    () => validateManifest(overlapping),
+    (err: unknown) => {
+      assert(err instanceof UsageError);
+      assert.match(err.message, /overlapping repo paths/);
+      return true;
+    }
+  );
+
+  // 4. Reserved root subtrees (e.g. docs/repo, .wsg/repo, scripts/sub)
+  const reservedSubtrees = ['docs/repo', '.wsg/repo', 'scripts/helper', 'README.md/nested', 'Docs/capitalized'];
+  for (const reservedPath of reservedSubtrees) {
+    const reservedManifest = JSON.parse(JSON.stringify(base)) as Manifest;
+    reservedManifest.commands = [];
+    reservedManifest.repos[0].path = reservedPath;
+    assert.throws(
+      () => validateManifest(reservedManifest),
+      (err: unknown) => {
+        assert(err instanceof UsageError);
+        assert.match(err.message, /reserved root name or subtree/);
+        return true;
+      },
+      `Should reject reserved subtree ${reservedPath}`
+    );
+  }
+});
+
 test('seed git functions checkBranchName and runGit', () => {
   assert.equal(checkBranchName('main'), true);
   assert.equal(checkBranchName('wsg/port-emr/legacy-platform'), true);
