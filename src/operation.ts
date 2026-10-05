@@ -27,6 +27,7 @@ export interface Operation {
   startedAt: string;
   completedAt?: string;
   args?: Record<string, unknown>;
+  plan?: Record<string, unknown>;
   steps: Step[];
 }
 
@@ -506,8 +507,9 @@ export function acquireLock(
       const warning = `wsg: taking over stale lock from dead process (pid ${parsed.pid} on ${parsed.hostname})`;
       if (onWarning) {
         onWarning(warning);
+      } else {
+        process.stderr.write(`${warning}\n`);
       }
-      process.stderr.write(`${warning}\n`);
 
       // Atomically replace lockPath using tmp file in same directory + rename
       tfd = fs.openSync(tempLockPath, flags, 0o600);
@@ -702,4 +704,18 @@ export function markStep(
 
   writeOperation(dir, opFile);
   return opFile;
+}
+
+/**
+ * Finds a step in an operation by ID.
+ */
+export function findStep(op: Operation, stepId: string): Step | undefined {
+  return op.steps.find((s) => s.id === stepId);
+}
+
+/**
+ * Checks whether an operation is marked complete.
+ */
+export function isOperationComplete(opFile: OperationFile | null): boolean {
+  return opFile?.operation?.status === 'complete';
 }

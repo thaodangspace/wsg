@@ -841,10 +841,23 @@ test('URL doc reference and binary unread metadata', async () => {
   }
 });
 
-test('--resume placeholder exits 1 UsageError', async () => {
-  const result = await runMain(['create', 'resume test', '--resume']);
-  assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /--resume is not implemented in this version/);
+test('--resume for an absent workspace exits 1 with resume guidance', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
+  try {
+    const result = await runMain([
+      'create',
+      'resume test',
+      '--name',
+      'resume-test',
+      '--root',
+      tmpRoot,
+      '--resume',
+    ]);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /does not exist\. Cannot resume/);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 });
 
 test('runMain respects io.cwd for relative --root, --repo, and --doc', async () => {
