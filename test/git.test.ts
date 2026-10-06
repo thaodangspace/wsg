@@ -432,15 +432,34 @@ test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom 
   const repoDir = path.join(tmpRoot, 'source-repo');
   const wsRoot = path.join(tmpRoot, 'ws');
   fs.mkdirSync(wsRoot);
+  // Isolate git from a host git-lfs install (whose global filter.lfs.process
+  // takes precedence over a repo-local smudge and would shadow this test).
+  const isolatedHome = path.join(tmpRoot, 'home');
+  fs.mkdirSync(isolatedHome, { recursive: true });
+  const git = (args: string[]): string => {
+    const result = spawnSync('git', args, {
+      env: {
+        ...process.env,
+        HOME: isolatedHome,
+        XDG_CONFIG_HOME: path.join(isolatedHome, '.config'),
+        GIT_CONFIG_NOSYSTEM: '1',
+      },
+      encoding: 'utf8',
+    });
+    if (result.status !== 0) {
+      throw new Error(`git ${args.join(' ')} failed: ${result.stderr || result.stdout}`);
+    }
+    return result.stdout;
+  };
 
   const hookMarker = path.join(tmpRoot, 'hook-ran.txt');
   const filterMarker = path.join(tmpRoot, 'filter-ran.txt');
   const lfsMarker = path.join(tmpRoot, 'lfs-ran.txt');
 
   try {
-    runGit(['init', '-b', 'main', repoDir]);
-    runGit(['-C', repoDir, 'config', 'user.name', 'WSG Test']);
-    runGit(['-C', repoDir, 'config', 'user.email', 'test@example.com']);
+    git(['init', '-b', 'main', repoDir]);
+    git(['-C', repoDir, 'config', 'user.name', 'WSG Test']);
+    git(['-C', repoDir, 'config', 'user.email', 'test@example.com']);
 
     // 1. Install executable post-checkout hook in repo
     const hooksDir = path.join(repoDir, '.git', 'hooks');
@@ -459,8 +478,8 @@ test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom 
       `#!/bin/sh\necho "CUSTOM_FILTER_RAN" > "${filterMarker}"\ncat\n`,
       { mode: 0o755 }
     );
-    runGit(['-C', repoDir, 'config', 'filter.custom.smudge', customFilterScript]);
-    runGit(['-C', repoDir, 'config', 'filter.custom.required', 'false']);
+    git(['-C', repoDir, 'config', 'filter.custom.smudge', customFilterScript]);
+    git(['-C', repoDir, 'config', 'filter.custom.required', 'false']);
 
     // 3. Install executable mock LFS smudge script
     const lfsScript = path.join(tmpRoot, 'mock-lfs.sh');
@@ -469,9 +488,9 @@ test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom 
       `#!/bin/sh\necho "LFS_RAN" > "${lfsMarker}"\ncat\n`,
       { mode: 0o755 }
     );
-    runGit(['-C', repoDir, 'config', 'filter.lfs.smudge', lfsScript]);
-    runGit(['-C', repoDir, 'config', 'filter.lfs.clean', 'cat']);
-    runGit(['-C', repoDir, 'config', 'filter.lfs.required', 'true']);
+    git(['-C', repoDir, 'config', 'filter.lfs.smudge', lfsScript]);
+    git(['-C', repoDir, 'config', 'filter.lfs.clean', 'cat']);
+    git(['-C', repoDir, 'config', 'filter.lfs.required', 'true']);
 
     // Write tracked files and attributes
     fs.writeFileSync(
@@ -483,13 +502,13 @@ test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom 
     fs.writeFileSync(path.join(repoDir, 'data.bin'), 'version https://git-lfs.github.com/spec/v1\n', 'utf8');
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# Hook & Filter Test\n', 'utf8');
 
-    runGit(['-C', repoDir, 'add', '.']);
-    runGit(['-C', repoDir, 'commit', '-m', 'Add files with hook and filters']);
-    const headSha = runGit(['-C', repoDir, 'rev-parse', 'HEAD']).trim();
+    git(['-C', repoDir, 'add', '.']);
+    git(['-C', repoDir, 'commit', '-m', 'Add files with hook and filters']);
+    const headSha = git(['-C', repoDir, 'rev-parse', 'HEAD']).trim();
 
     // Verify hooks and filters would run without wsg overrides
     const testUnprotected = path.join(tmpRoot, 'unprotected-wt');
-    runGit(['-C', repoDir, 'worktree', 'add', '-b', 'unprotected', testUnprotected, headSha]);
+    git(['-C', repoDir, 'worktree', 'add', '-b', 'unprotected', testUnprotected, headSha]);
     assert.ok(fs.existsSync(hookMarker), 'Unprotected worktree add should run post-checkout hook');
     assert.ok(fs.existsSync(filterMarker), 'Unprotected worktree add should run custom filter');
     assert.ok(fs.existsSync(lfsMarker), 'Unprotected worktree add should run LFS filter');
@@ -506,6 +525,7 @@ test('worktreeAddNewBranch disables post-checkout hooks, LFS smudge, and custom 
       GIT_CONFIG_KEY_0: 'core.hooksPath',
       GIT_CONFIG_VALUE_0: hooksDir,
       GIT_HOOKS_PATH: hooksDir,
+      HOME: isolatedHome,
     };
 
     worktreeAddNewBranch(repoDir, 'wsg/ws/app', dest, headSha, { env: dangerousEnv });

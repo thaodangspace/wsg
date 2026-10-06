@@ -9,12 +9,13 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 ## Design and delivery
 
 - [MVP specification](docs/spec.md): behavior, CLI, manifest, discovery, worktrees, and context updates.
+- [User guide](docs/user-guide.md): configuration, credentials/auth limits, dirty sources, conflicts, resume, and generated-file ownership.
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Chat-first creation implemented.** Interactive chat TUI (`wsg`), non-interactive prompt mode (`wsg -p`), JSON contract (`--json`), config, slugs/paths, manifest, documents, ownership reconciliation, `--dry-run`, `--resume`, fault-injection recovery, `wsg explain`, local scouting, incremental commands (`wsg add`, `wsg refresh`), and validation-command discovery/wrappers are implemented.
+Status: **Chat-first creation and Milestone 6 reliability implemented.** Interactive chat TUI (`wsg`), non-interactive prompt mode (`wsg -p`), JSON contract (`--json`), and the Milestone 1–6 workspace features and reliability work (packaging/install smoke, CI, user documentation, and crash/recovery coverage) are implemented. The billed manual live-model trial remains pending provider credentials; see [docs/live-model-trial.md](docs/live-model-trial.md), the [user guide](docs/user-guide.md), and the [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
-> **Breaking Change / Migration Note:** `wsg create` has been removed. Running `wsg create` prints actionable migration guidance and exits 1. Use `wsg` for the interactive chat TUI or `wsg -p "<request>"` for unattended automation and agent harnesses.
+> **Breaking Change / Migration Note:** `wsg create` has been removed. Running `wsg create` prints migration guidance and exits 1. Use `wsg` for the interactive chat TUI or `wsg -p "<request>"` for unattended automation and agent harnesses.
 
 ### Quick Start
 

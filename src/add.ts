@@ -1234,6 +1234,28 @@ async function executeAddResume(
       }
     }
 
+    if (options.dryRun) {
+      // Mirror `create --resume --dry-run`: preflight only, no mutation.
+      writeStdout(`\nDry run: resume plan for workspace '${baseManifest.name}' at ${wsDir} (no files changed)\n`);
+      if (decisions.length > 0) {
+        writeStdout('Repositories:\n');
+        for (const decision of decisions) {
+          writeStdout(`  - ${decision.stepId.replace(/^worktree:/, '')}: ${decision.action}\n`);
+        }
+      }
+      const planned = recoveries.filter((r) => r.kind !== 'intact');
+      if (planned.length > 0) {
+        writeStdout('Snapshots and scripts:\n');
+        for (const rec of planned) {
+          writeStdout(`  - ${rec.relPath}: ${rec.kind === 'restore' ? 'restore' : 'preserve edit and write .wsg-new proposal'}\n`);
+        }
+      }
+      if (planned.length === 0 && decisions.every((d) => d.action === 'adopt')) {
+        writeStdout('All recorded steps are already materialized; resume would only regenerate context and publish the manifest.\n');
+      }
+      return partial ? 3 : 0;
+    }
+
     ensureDir(tmpDir);
 
     for (const decision of decisions) {
@@ -1447,6 +1469,18 @@ export async function runAdd(
 
     validateManifest(buildUpdatedManifest(manifest, plan));
     preflightAddPlan(wsDir, plan);
+
+    // Catch an external manifest edit made during planning (e.g. a slow URL
+    // fetch) before staging or creating any worktree, so the conflict is
+    // side-effect-free where possible. A second check after mutation still
+    // guards the mutation window itself.
+    const preMutationSha = sha256(fs.readFileSync(manifestPathFor(wsDir)));
+    if (preMutationSha !== baselineManifestSha) {
+      throw new ConflictError(
+        `workspace.yaml changed while the add was planning; refusing to mutate it.`,
+        ['Re-run wsg add to plan against the current manifest.']
+      );
+    }
 
     const inputIds = options.inputs.map((i) => normalizeAddInput(i, cwd));
     return applyAddLocked(

@@ -55,6 +55,7 @@ import { reconcileGenerated, type ReconcileResult } from './ownership.ts';
 import { renderAll } from './generate.ts';
 import { discoverCommands, applyWrapperModes } from './commands.ts';
 import { writeFileAtomic, ensureDir, sha256 } from './fsx.ts';
+import { writeWorkspaceFile } from './staging.ts';
 import { faultPoint } from './faults.ts';
 import {
   ExplicitScout,
@@ -552,10 +553,12 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
       scoutContext: Array.isArray(rawPlan.scoutContext)
         ? (rawPlan.scoutContext as string[])
         : [],
-      adapters:
-        Array.isArray(rawPlan.adapters) && (rawPlan.adapters as unknown[]).length > 0
-          ? (rawPlan.adapters as ManifestAdapter[])
-          : (['agents'] as ManifestAdapter[]),
+      // An explicitly recorded adapters array is authoritative even when empty
+      // (`--for none`). Only a journal that never recorded adapters falls back
+      // to the default; otherwise `--resume` could silently add adapters.
+      adapters: Array.isArray(rawPlan.adapters)
+        ? (rawPlan.adapters as ManifestAdapter[])
+        : (['agents'] as ManifestAdapter[]),
       repos: (rawRepos ?? []).map((r) => ({
         name: r.name,
         source: normalizeSource(r.source),
@@ -629,10 +632,9 @@ export function extractRecordedPlan(op: Operation, fallbackName: string): Record
     name: (args.name as string) ?? fallbackName,
     request: (args.request as string) ?? '',
     context: Array.isArray(args.context) ? (args.context as string[]) : [],
-    adapters:
-      Array.isArray(args.adapters) && (args.adapters as unknown[]).length > 0
-        ? (args.adapters as ManifestAdapter[])
-        : (['agents'] as ManifestAdapter[]),
+    adapters: Array.isArray(args.adapters)
+      ? (args.adapters as ManifestAdapter[])
+      : (['agents'] as ManifestAdapter[]),
     repos,
     docs,
     commands: [],
@@ -980,6 +982,15 @@ export async function executeResume(
   faultPoint('after-lock', io.env);
 
   try {
+    // Re-check under the lock: another resume may have published workspace.yaml
+    // between the pre-lock check and lock acquisition. A completed workspace is
+    // never overwritten, so fail closed before any mutation.
+    if (fs.existsSync(manifestPath)) {
+      throw new ConflictError(
+        `Workspace at '${wsDir}' became complete while resuming. Refusing to overwrite it.`
+      );
+    }
+
     // PREFLIGHT: inspect every worktree and snapshot step before ANY mutation.
     const worktreeDecisions: WorktreeRecoveryDecision[] = [];
     for (const r of plan.repos) {
@@ -1183,11 +1194,10 @@ export async function executeResume(
         markStep(wsDir, stepId, 'done', { detail: { recovered: 'intact' } });
       } else if (rec.kind === 'restore') {
         markStep(wsDir, stepId, 'started');
-        const stagingPath = resolveInside(tmpDir, relPath);
-        ensureDir(path.dirname(stagingPath));
-        writeFileAtomic(stagingPath, rec.content, { tmpDir });
-        ensureDir(path.dirname(rec.finalPath));
-        fs.renameSync(stagingPath, rec.finalPath);
+        // Commit through the same nonclobbering path add uses: if a user file
+        // appeared at the destination after preflight, refuse rather than
+        // silently overwriting it with the recorded bytes.
+        writeWorkspaceFile(wsDir, tmpDir, relPath, rec.content);
         markStep(wsDir, stepId, 'done', { detail: { recovered: 'restore' } });
       } else {
         // Preserve the user-edited snapshot; write a nonclobbering proposal.

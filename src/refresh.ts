@@ -602,6 +602,16 @@ export async function runRefresh(
     validateManifest(decision.updatedManifest);
     printResults(writeStdout, decision);
 
+    // Catch an external manifest edit made during planning (e.g. a slow URL
+    // fetch) before writing any snapshot, so the conflict is side-effect-free
+    // where possible. A second check after the writes still guards them.
+    if (sha256(fs.readFileSync(manifestPathFor(wsDir))) !== baselineManifestSha) {
+      throw new ConflictError(
+        `workspace.yaml changed while the refresh was planning; refusing to overwrite it.`,
+        ['Re-run wsg refresh to plan against the current manifest.']
+      );
+    }
+
     const tmpDir = resolveInside(wsDir, path.posix.join('.wsg', 'tmp', crypto.randomUUID()));
     ensureDir(tmpDir);
 
@@ -615,8 +625,23 @@ export async function runRefresh(
     }
 
     // Always regenerate context/adapters/README from the saved manifest, even
-    // when there are no documents.
-    const generatedFiles = renderAll(decision.updatedManifest);
+    // when there are no documents. Recompute the opaque/unread set from the
+    // on-disk snapshots so a binary snapshot with a text extension keeps its
+    // `(unread)` marker and Unresolved Documents entry across a refresh (the
+    // manifest does not persist that per-document hint).
+    const unreadDocs = new Set<string>();
+    for (const doc of decision.updatedManifest.docs) {
+      if (doc.mode !== 'snapshot' || !doc.path) continue;
+      try {
+        const finalPath = resolveInside(wsDir, doc.path);
+        if (fs.existsSync(finalPath) && !isTextBuffer(fs.readFileSync(finalPath))) {
+          unreadDocs.add(doc.path);
+        }
+      } catch {
+        // Unreadable snapshot: fall back to the renderer's extension check.
+      }
+    }
+    const generatedFiles = renderAll(decision.updatedManifest, { unreadDocs });
     const journal = readOperation(wsDir);
     const reconcileResult = reconcileGenerated(wsDir, generatedFiles, journal?.owned ?? {});
     applyWrapperModes(wsDir, generatedFiles, reconcileResult.owned);
