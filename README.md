@@ -43,6 +43,22 @@ wsg refresh docs/mapping-notes.md
 
 ## Local Scouting (Milestone 3)
 
+To use your Pi Codex subscription for autonomous scouting instead of an OpenAI
+API key, run `pi` and select OpenAI Codex under `/login`, then configure
+`~/.config/wsg/config.yaml` (or the file named by `WSG_CONFIG`):
+
+```yaml
+scout:
+  provider: openai-codex
+  model: gpt-5.3-codex-spark
+```
+
+Keep `pi` on PATH. WSG calls Pi's public `auth print-bearer-token` command,
+which safely refreshes credentials when needed; WSG never reads or writes Pi's
+`auth.json` and never stores the bearer token in the workspace. The default
+provider remains `openai` (using `OPENAI_API_KEY`). Explicit `--repo` without
+`--code-root` needs neither login nor API key.
+
 `create` runs one bounded, read-only scout conversation when it is called
 without `--repo`, or whenever `--code-root` is supplied. It enumerates Git
 repositories under the code roots (default `~/code`), reads

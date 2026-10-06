@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Type } from 'typebox';
 import { UsageError, ConflictError } from './errors.ts';
+import { piCodexCredentials } from './pi-codex-auth.ts';
 import { canonicalize, resolveInside } from './paths.ts';
 import { VENDOR_DIR_NAMES, type DiscoveredRepo } from './discovery.ts';
 import { isSecretFilename } from './documents.ts';
@@ -21,6 +22,7 @@ const PI_SQLITE: string = '@earendil-works/pi-durable/storage/sqlite/node';
 const PI_AI_MODELS: string = '@earendil-works/pi-ai/models';
 const PI_AI_FAUX: string = '@earendil-works/pi-ai/providers/faux';
 const PI_AI_OPENAI: string = '@earendil-works/pi-ai/providers/openai';
+const PI_AI_CODEX: string = '@earendil-works/pi-ai/providers/openai-codex';
 const CHORD_CONTEXT: string = '@earendil-works/chord/context';
 
 export const SCOUT_DB_FILENAME = 'runtime.sqlite';
@@ -604,9 +606,18 @@ export class PiScout implements Scout {
       models = aiModels.createModels();
       models.setProvider(openaiMod.openaiProvider());
       modelId = this.config.model ?? 'gpt-4o';
+    } else if (providerName === 'openai-codex') {
+      const aiModels = await import(PI_AI_MODELS);
+      const codexMod = await import(PI_AI_CODEX);
+      models = aiModels.createModels({ credentials: await piCodexCredentials() });
+      models.setProvider(codexMod.openaiCodexProvider());
+      modelId = this.config.model ?? 'gpt-5.3-codex-spark';
+      if (!models.getModel('openai-codex', modelId)) {
+        throw new UsageError(`Unknown Codex scout model '${modelId}'. Configure scout.model with an available openai-codex model.`);
+      }
     } else {
       throw new UsageError(
-        `Unsupported scout provider '${providerName}'. Configure scout.provider as 'openai' (or use the faux provider in tests).`
+        `Unsupported scout provider '${providerName}'. Configure scout.provider as 'openai' or 'openai-codex' (or use the faux provider in tests).`
       );
     }
 
