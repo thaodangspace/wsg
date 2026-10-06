@@ -9,10 +9,11 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 ## Design and delivery
 
 - [MVP specification](docs/spec.md): behavior, CLI, manifest, discovery, worktrees, and context updates.
+- [User guide](docs/user-guide.md): configuration, credentials/auth limits, dirty sources, conflicts, resume, and generated-file ownership.
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Milestones 1–5 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, the Milestone 3 local scout harness, the Milestone 4 incremental commands (`wsg add`, `wsg refresh`), and the Milestone 5 validation-command discovery and wrappers are implemented. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Milestones 1–5 implemented; Milestone 6 implemented except the manual live-model trial.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, the Milestone 3 local scout harness, the Milestone 4 incremental commands (`wsg add`, `wsg refresh`), and the Milestone 5 validation-command discovery and wrappers, plus the Milestone 6 reliability work (packaging/install smoke, CI, full user documentation, and crash/recovery coverage), are implemented. The billed manual live-model trial remains pending provider credentials and has produced no result; see [docs/live-model-trial.md](docs/live-model-trial.md). See the [user guide](docs/user-guide.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
 
 ```bash
 # Explicit inputs (no model or credentials required):
