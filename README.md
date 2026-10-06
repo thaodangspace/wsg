@@ -12,26 +12,40 @@ WSG scouts and assembles the workspace. The coding harness of your choice does t
 - [Implementation plan](docs/implementation-plan.md): milestones, acceptance checks, and the first usable vertical slice.
 - [M1–M2 delivery spec](docs/specs/01_spec_wsg_workspace_assembler.md) and [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md): scoped decisions and phase-by-phase execution for the first usable release.
 
-Status: **Milestones 1–5 implemented.** Config, slugs/paths, manifest, documents, ownership reconciliation, `wsg create` (including `--dry-run`), `--resume`, fault-injection recovery, `wsg explain`, the Milestone 3 local scout harness, the Milestone 4 incremental commands (`wsg add`, `wsg refresh`), and the Milestone 5 validation-command discovery and wrappers are implemented. See [phase plan](docs/specs/01_impl_wsg_workspace_assembler.md).
+Status: **Chat-first creation implemented.** Interactive chat TUI (`wsg`), non-interactive prompt mode (`wsg -p`), JSON contract (`--json`), config, slugs/paths, manifest, documents, ownership reconciliation, `--dry-run`, `--resume`, fault-injection recovery, `wsg explain`, local scouting, incremental commands (`wsg add`, `wsg refresh`), and validation-command discovery/wrappers are implemented.
+
+> **Breaking Change / Migration Note:** `wsg create` has been removed. Running `wsg create` prints actionable migration guidance and exits 1. Use `wsg` for the interactive chat TUI or `wsg -p "<request>"` for unattended automation and agent harnesses.
+
+### Quick Start
 
 ```bash
-# Explicit inputs (no model or credentials required):
-wsg create "port EMR mono to modular for new system" --name port-emr \
+# 1. Interactive Chat TUI (recommended for humans):
+wsg
+# Enter a rough task description, answer any follow-up questions, review
+# the proposed plan, and confirm creation.
+
+# 2. Non-interactive Prompt Mode (recommended for automation & coding agents):
+wsg -p "port EMR mono to modular for new system" --name port-emr \
   --repo ~/code/legacy-platform --repo ~/code/new-platform
-cd ~/wsg/port-emr
-wsg explain      # read-only: saved repos, docs, exclusions, gaps, commands
-codex # or claude / pi
 
-# Autonomous discovery (no --repo): one read-only Pi Durable scout conversation
+# 3. Agent Harness with JSON Contract:
+wsg -p "port EMR mono to modular for new system" --name port-emr --json
+
+# 4. Autonomous discovery (no --repo): one read-only Pi Durable scout conversation
 # enumerates code roots, gathers evidence, and selects the smallest useful set.
-wsg create "port EMR mono to modular for new system" --name port-emr --code-root ~/code
+wsg -p "port EMR mono to modular for new system" --name port-emr --code-root ~/code
 
-# Combined: explicit --repo inputs are always included (outside the roots and
-# without evidence), while --code-root also scouted for dependencies.
-wsg create "port EMR mono to modular for new system" --name port-emr \
+# 5. Combined: explicit --repo inputs are always included, while --code-root
+# is scouted for additional dependencies.
+wsg -p "port EMR mono to modular for new system" --name port-emr \
   --repo ~/code/new-platform --code-root ~/code
 
-# Incremental updates (Milestone 4):
+# 6. Inside the workspace:
+cd ~/wsg/port-emr
+wsg explain      # read-only: inspect saved repos, docs, exclusions, gaps, commands
+codex            # or claude / pi / cursor
+
+# 7. Incremental updates (Milestone 4):
 wsg add ~/code/emr-importer
 wsg add ~/docs/mapping-notes.md
 wsg add https://internal-wiki.example/emr
@@ -39,6 +53,86 @@ wsg add ./reproduce-timeout.sh --as script
 wsg refresh
 wsg refresh docs/mapping-notes.md
 ```
+
+## CLI Usage and Workflows
+
+### Interactive Chat TUI (`wsg`)
+
+Running `wsg` without arguments (when attached to an interactive terminal) launches the chat-first terminal UI. It guides you through creating a workspace:
+
+1. **Prompt Entry:** Describe the feature or task in plain language.
+2. **Clarification Loop:** If your request is ambiguous or missing key repositories/context, WSG asks bounded, specific questions rather than guessing.
+3. **Plan Inspection:** Review the planned workspace destination, repositories, branches, documents, adapters, and discovered test scripts.
+4. **Explicit Approval:** WSG mutates nothing until you review and explicitly approve the plan. Declining exits cleanly without touching any repository or directory.
+
+### Non-Interactive Prompt Mode (`wsg -p <request>`)
+
+Designed for automated scripts, CI, and external coding agents (such as Pi, Claude Code, or Codex).
+
+- **Never reads stdin or requires a TTY.**
+- **Auto-assembles when clear:** If the request and evidence unambiguously identify the target and dependencies, WSG validates the plan and assembles the workspace immediately.
+- **Fail-closed on ambiguity:** Ambiguous requests or missing information return exit code 4 (`needs_input`) with concrete questions and perform zero filesystem mutation.
+- **Dry-run planning:** Pass `--dry-run` to validate inputs and generate a plan summary without writing files or creating worktrees (exit 0).
+
+### JSON Output Contract (`--json`)
+
+Adding `--json` to `wsg -p` reserves standard output for exactly one versioned JSON document:
+
+```bash
+wsg -p "port EMR architecture" --name port-emr --json
+```
+
+All human diagnostics, logs, and stage progress events are routed to `stderr`, guaranteeing stdout remains directly parseable by JSON tools (`jq`, agent harnesses).
+
+#### Output Schema (Version 1)
+
+- **`created`** (exit 0, or 3 if proposal files were generated):
+  ```json
+  { "version": 1, "status": "created", "name": "port-emr", "wsDir": "/Users/user/wsg/port-emr", "resumed": false }
+  ```
+- **`planned`** (exit 0 with `--dry-run`):
+  ```json
+  { "version": 1, "status": "planned", "name": "port-emr", "wsDir": "/Users/user/wsg/port-emr", "resumed": false, "plan": { ... } }
+  ```
+- **`needs_input`** (exit 4):
+  ```json
+  {
+    "version": 1,
+    "status": "needs_input",
+    "reason": "Target repository is ambiguous",
+    "questions": [
+      {
+        "id": "clarify_target_repo",
+        "question": "Which repository should be the target?",
+        "candidates": ["service-a", "service-b"]
+      }
+    ]
+  }
+  ```
+  An agent harness receiving exit 4 inspects `questions`, collects clarification from the user or context, and retries with a consolidated prompt.
+- **`failed`** (exit 1 or 2):
+  ```json
+  {
+    "version": 1,
+    "status": "failed",
+    "error": {
+      "code": "usage_error",
+      "message": "...",
+      "hints": ["..."],
+      "exitCode": 1
+    }
+  }
+  ```
+
+### Process Exit Codes
+
+| Code | Meaning | Description |
+|---|---|---|
+| `0` | Success | Workspace created, or plan validated (`--dry-run`). |
+| `1` | Usage / Failure | Invalid options, missing arguments, or internal/runtime error. |
+| `2` | Conflict | Workspace already exists, Git branch collision, or active writer lock. |
+| `3` | Partial | Completed with proposals (`.wsg-new`) preserving user-edited files. |
+| `4` | Needs Input | Actionable ambiguity or missing details; retry with clarified request. |
 
 
 ## Local Scouting (Milestone 3)
@@ -59,7 +153,7 @@ which safely refreshes credentials when needed; WSG never reads or writes Pi's
 provider remains `openai` (using `OPENAI_API_KEY`). Explicit `--repo` without
 `--code-root` needs neither login nor API key.
 
-`create` runs one bounded, read-only scout conversation when it is called
+Scout execution runs one bounded, read-only scout conversation when called
 without `--repo`, or whenever `--code-root` is supplied. It enumerates Git
 repositories under the code roots (default `~/code`), reads
 READMEs/manifests/agent instructions, runs bounded `rg` searches, and resolves
@@ -200,7 +294,7 @@ sh scripts/test-new-platform.sh   # works from any directory; propagates exit st
   the recorded commit). Other command sources are added only with fixtures. A
   missing `test` script — or a documented command with no matching script — is
   reported as a gap and **no verification wrapper is invented**.
-- **Never executed:** `create`, `add`, `refresh`, and `--resume` never run tests,
+- **Never executed:** Workspace creation, `add`, `refresh`, and `--resume` never run tests,
   copied scripts, installs, or project bootstrap. Commands are labelled
   "discovered, not verified".
 - **Safe wrappers:** wrappers resolve the repository relative to their own
@@ -208,7 +302,7 @@ sh scripts/test-new-platform.sh   # works from any directory; propagates exit st
   `exec` the fixed argv so the child exit status is propagated. Wrapper names and
   destinations avoid existing wrappers, attached scripts, and untracked files,
   and user edits to generated wrappers are preserved with a `.wsg-new` proposal.
-- **Summaries and context:** `create`, `add`, and `refresh` print repository
+- **Summaries and context:** Creation, `add`, and `refresh` print repository
   roles, discovered commands, unresolved documents, and gaps (including missing
   tests); `docs/context.md` carries the same information. `AGENTS.md` and
   `CLAUDE.md` both point at `docs/context.md` and remind the agent that
@@ -261,17 +355,21 @@ WSG enforces strict filesystem safety and concurrency boundaries during workspac
 - **Reclamation Guard (`.wsg/reclaim.lock`)**: Stale lock reclamation is serialized using an exclusive guard to prevent multiple concurrent reclaimers from racing and unlinking newly acquired locks.
 - **Exceptional Recovery Limitation**: If a process crashes or is forcefully terminated while holding `.wsg/reclaim.lock`, WSG fails closed with exit code 2 and actionable manual recovery guidance rather than automatically overwriting the guard (which would reintroduce reclaimer races). Once the user verifies no other process is active and manually removes `.wsg/reclaim.lock`, subsequent runs automatically resume normal stale takeover of the main lock.
 
-## Resuming an Interrupted Create
+## Resuming an Interrupted Operation
 
-If `wsg create` is interrupted (Ctrl-C, crash, or any exit before `workspace.yaml` is published), rerun the same command with `--resume`:
+If workspace creation is interrupted (Ctrl-C, crash, or any exit before `workspace.yaml` is published), rerun the same command with `--resume`:
 
 ```bash
-wsg create "port EMR mono to modular" --name port-emr --repo ~/code/a --repo ~/code/b --resume
+wsg -p "port EMR mono to modular" --name port-emr --repo ~/code/a --repo ~/code/b --resume
+```
+Or resume an existing interrupted workspace directly by name:
+```bash
+wsg --resume --name port-emr
 ```
 
 `--resume`:
 
-- Requires an existing workspace directory for the same `--name` with an incomplete `create` operation and no `workspace.yaml`. An absent directory exits 1; a completed workspace exits 2 and is never overwritten.
+- Requires an existing workspace directory for the same `--name` with an incomplete operation and no `workspace.yaml`. An absent directory exits 1; a completed workspace exits 2 and is never overwritten.
 - Compares the supplied `--name`, request, `--repo` set, `--doc` set, `--context`, and `--for` against the recorded plan. Any mismatch exits 2 with a diff (added/missing repositories or documents).
 - Uses the recorded base commits, document hashes, unread metadata, and context, so it never rebuilds the plan from source state that changed after the crash. A missing snapshot is restored only from its recorded hash; if the source changed it is reported as a conflict rather than silently rebuilt.
 - Never overwrites a user-edited snapshot: the edit is left intact, the recorded bytes are written to a nonclobbering `<path>.wsg-new` proposal (a preexisting proposal is preserved and a numbered sibling is used), and the run exits 3. If the snapshot was edited *and* its source changed, the recorded bytes cannot be reproduced and the resume fails closed with exit 2 before further mutation.

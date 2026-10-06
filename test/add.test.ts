@@ -71,7 +71,7 @@ test('add attaches a fourth repo without touching existing worktrees or branches
 
   try {
     const created = await runCliInProcess([
-      'create', 'base task', '--name', 'base', '--root', root,
+      '-p', 'base task', '--name', 'base', '--root', root,
       '--repo', repo1.dir, '--repo', repo2.dir, '--repo', repo3.dir,
     ]);
     assert.equal(created.exitCode, 0, created.stderr);
@@ -118,7 +118,7 @@ test('re-adding the same repo is a no-op and does not rewrite the manifest', asy
 
   try {
     const created = await runCliInProcess([
-      'create', 'noop task', '--name', 'base', '--root', root, '--repo', repo.dir,
+      '-p', 'noop task', '--name', 'base', '--root', root, '--repo', repo.dir,
     ]);
     assert.equal(created.exitCode, 0, created.stderr);
 
@@ -147,7 +147,7 @@ test('add resolves caller-relative paths against the current directory', async (
   fs.writeFileSync(docPath, '# Relative Notes\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'relative task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'relative task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     // Run from the document directory so `./notes.md` resolves there.
     const added = await runCliInProcess(
@@ -178,7 +178,7 @@ test('add resolves caller-relative repo paths and handles spaces in names', asyn
 
   try {
     const baseRepo = createTestRepo({ prefix: 'wsg-add-spaced-base-' });
-    await runCliInProcess(['create', 'spaces task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+    await runCliInProcess(['-p', 'spaces task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
 
     const added = await runCliInProcess(
       ['add', 'my repo', '--workspace', wsDir],
@@ -210,7 +210,7 @@ test('add deterministically avoids document and script filename collisions', asy
   fs.writeFileSync(scriptB, '#!/bin/sh\necho B\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'collide task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'collide task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     const first = await runCliInProcess(['add', path.join(docDirA, 'notes.md'), '--workspace', wsDir]);
     assert.equal(first.exitCode, 0, first.stderr);
@@ -257,7 +257,7 @@ test('add --as script copies the script and never executes it', async () => {
   fs.writeFileSync(scriptPath, `#!/bin/sh\ntouch "${marker}"\n`, 'utf8');
 
   try {
-    await runCliInProcess(['create', 'script task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'script task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     const added = await runCliInProcess(['add', scriptPath, '--as', 'script', '--workspace', wsDir]);
     assert.equal(added.exitCode, 0, added.stderr);
 
@@ -288,7 +288,7 @@ test('add snapshots accessible public text and falls back to references', async 
   server.serve('/missing', 'nope', { 'content-type': 'text/plain' }, 404);
 
   try {
-    await runCliInProcess(['create', 'url task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'url task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     const snap = await runCliInProcess(['add', `${server.baseUrl}/guide.md`, '--workspace', wsDir]);
     assert.equal(snap.exitCode, 0, snap.stderr);
@@ -329,7 +329,7 @@ test('add rejects a conflicting branch before any mutation', async () => {
   const wsDir = path.join(root, 'base');
 
   try {
-    await runCliInProcess(['create', 'preflight task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+    await runCliInProcess(['-p', 'preflight task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
 
     const entryName = path.basename(fs.realpathSync(newRepo.dir));
     const branch = `wsg/base/${entryName}`;
@@ -354,7 +354,7 @@ test('add refuses to run while another process holds the writer lock', async () 
   const wsDir = path.join(root, 'base');
 
   try {
-    await runCliInProcess(['create', 'lock task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'lock task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     // Hold the lock in this process, then attempt an add in a subprocess.
     const { acquireLock, releaseLock } = await import('../src/operation.ts');
@@ -381,7 +381,7 @@ test('interrupted add resumes without duplicating the worktree', async () => {
   const wsDir = path.join(root, 'base');
 
   try {
-    const created = runCli(['create', 'resume task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+    const created = runCli(['-p', 'resume task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
     assert.equal(created.status, 0, created.stderr);
 
     const interrupted = runCli(
@@ -423,7 +423,7 @@ test('add appends explicit attachments and leaves repos untouched', async () => 
   fs.writeFileSync(path.join(docDir, 'b.md'), 'B\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'append task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'append task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     const wtBefore = worktreeList(repo.dir);
     await runCliInProcess(['add', path.join(docDir, 'a.md'), '--workspace', wsDir]);
     await runCliInProcess(['add', path.join(docDir, 'b.md'), '--workspace', wsDir]);
@@ -451,7 +451,7 @@ test('re-adding the same document is a no-op and canonical sources dedupe by rea
   fs.symlinkSync(docPath, aliasPath);
 
   try {
-    await runCliInProcess(['create', 'dedupe task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'dedupe task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     const first = await runCliInProcess(['add', docPath, '--workspace', wsDir]);
     assert.equal(first.exitCode, 0, first.stderr);
@@ -486,7 +486,7 @@ test('add uses deterministic suffixes for reserved names like context.md', async
   fs.writeFileSync(path.join(docDir, 'context.md'), '# Supplied context notes\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'reserved task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'reserved task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     const added = await runCliInProcess(['add', path.join(docDir, 'context.md'), '--workspace', wsDir]);
     assert.equal(added.exitCode, 0, added.stderr);
 
@@ -511,7 +511,7 @@ test('interrupted add of a document resumes without losing the snapshot', async 
   fs.writeFileSync(docPath, '# Persisted\n', 'utf8');
 
   try {
-    const created = runCli(['create', 'resdoc task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    const created = runCli(['-p', 'resdoc task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     assert.equal(created.status, 0, created.stderr);
 
     const interrupted = runCli(
@@ -544,7 +544,7 @@ test('add preserves a manifest change made after the lock is acquired', async ()
   const wsDir = path.join(root, 'base');
 
   try {
-    await runCliInProcess(['create', 'race task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'race task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     await runAdd({
       inputs: [extra.dir],
@@ -578,7 +578,7 @@ test('add never overwrites untracked user files at destination paths', async () 
   fs.writeFileSync(scriptPath, '#!/bin/sh\necho source\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'userfile task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'userfile task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     // Untracked user files that are NOT part of the manifest.
     const userDoc = path.join(wsDir, 'docs', 'notes.md');
@@ -627,7 +627,7 @@ test('add refuses a branch that appeared after lock acquisition and does no Git 
   const wsDir = path.join(root, 'base');
 
   try {
-    await runCliInProcess(['create', 'branch race', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+    await runCliInProcess(['-p', 'branch race', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
     const entryName = path.basename(fs.realpathSync(newRepo.dir));
     const expectedBranch = `wsg/base/${entryName}`;
     const worktreesBefore = worktreeList(newRepo.dir);
@@ -677,7 +677,7 @@ test('resume recovers staged document bytes after the source is removed', async 
   fs.writeFileSync(docPath, '# Persisted staged\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'staged task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
+    await runCliInProcess(['-p', 'staged task', '--name', 'base', '--root', root, '--repo', baseRepo.dir]);
 
     const interrupted = runCli(
       ['add', newRepo.dir, docPath, '--workspace', wsDir],
@@ -719,7 +719,7 @@ test('resume adopts an intact script snapshot without its original source', asyn
   fs.writeFileSync(scriptPath, '#!/bin/sh\necho intact\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'intact script', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'intact script', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     const interrupted = runCli(
       ['add', scriptPath, '--as', 'script', '--workspace', wsDir],
@@ -754,7 +754,7 @@ test('resume rejects the same relative spelling resolved from a different cwd', 
   fs.writeFileSync(path.join(dirB, 'notes.md'), 'B\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'cwd task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'cwd task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     const interrupted = runCli(
       ['add', './notes.md', '--workspace', wsDir],
@@ -788,7 +788,7 @@ test('add avoids overwriting a symlink at a destination path', async () => {
   fs.writeFileSync(docPath, '# extra source\n', 'utf8');
 
   try {
-    await runCliInProcess(['create', 'symlink task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCliInProcess(['-p', 'symlink task', '--name', 'base', '--root', root, '--repo', repo.dir]);
 
     const target = path.join(wsDir, 'docs', '.keep');
     fs.writeFileSync(target, 'keep\n', 'utf8');

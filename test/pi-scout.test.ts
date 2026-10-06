@@ -11,6 +11,7 @@ import {
   SCOUT_DB_FILENAME,
   SCOUT_CHECKPOINT_FILENAME,
   SCOUT_BUDGET_FILENAME,
+  SCOUT_OBSERVED_FILENAME,
 } from '../src/pi-scout.ts';
 import { UsageError, ConflictError } from '../src/errors.ts';
 import { ObservedEvidenceStore } from '../src/observed.ts';
@@ -88,6 +89,37 @@ test('PiScout runs one real Pi Durable conversation and persists a checkpoint', 
   }
 });
 
+test('submit_selection rejects a bad quote and accepts a corrected citation', { skip }, async () => {
+  const { codeRoot, repo } = setupRepo();
+  const stateDir = path.join(tmp('wsg-pi-correction-'), 'scout');
+  try {
+    const discovery = enumerateRepos([codeRoot]);
+    const bad = {
+      ...selectionPayload,
+      repos: selectionPayload.repos.map((entry) => ({
+        ...entry,
+        evidence: entry.evidence.map((item) => ({ ...item, quote: 'fictional Widget quote' })),
+      })),
+    };
+    const scout = new PiScout({
+      discovered: discovery.repos,
+      provider: 'faux',
+      fauxScript: [
+        { tool: 'read_file', args: { repo: 'widget-repo', path: 'src/Widget.ts' } },
+        { tool: 'submit_selection', args: bad },
+        { tool: 'submit_selection', args: selectionPayload },
+      ],
+    });
+    const result = await scout.scout({ request: 'port widget', codeRoots: [codeRoot], stateDir });
+    assert.equal(result.kind, 'selection');
+    assert.deepEqual(result.kind === 'selection' && result.repos[0].evidence?.[0]?.quote, 'export class Widget');
+  } finally {
+    repo.cleanup();
+    fs.rmSync(codeRoot, { recursive: true, force: true });
+    fs.rmSync(path.dirname(stateDir), { recursive: true, force: true });
+  }
+});
+
 test('rg_search returns matching files through the real harness tool', { skip }, async () => {
   const { codeRoot, repo } = setupRepo();
   fs.writeFileSync(path.join(repo.dir, 'secret.pem'), 'Widget private material\n');
@@ -101,7 +133,7 @@ test('rg_search returns matching files through the real harness tool', { skip },
       observations,
       fauxScript: [
         { tool: 'rg_search', args: { query: 'Widget', repo: 'widget-repo' } },
-        { tool: 'submit_selection', args: selectionPayload },
+        { tool: 'submit_selection', args: { ...selectionPayload, repos: selectionPayload.repos.map((repo) => ({ ...repo, evidence: repo.evidence.map((item) => ({ ...item, lines: [1, 1] })) })) } },
       ],
     });
 
@@ -204,6 +236,8 @@ test('PiScout refuses to replay a cached selection for a changed request', { ski
   const stateDir = path.join(tmp('wsg-pi-identity-'), 'scout');
   try {
     const discovery = enumerateRepos([codeRoot]);
+    const observed = new ObservedEvidenceStore(path.join(stateDir, SCOUT_OBSERVED_FILENAME));
+    observed.observe(fs.realpathSync(repo.dir), 'src/Widget.ts', 1, ['export class Widget {', '  size = 1;', '}']);
     const first = new PiScout({
       discovered: discovery.repos,
       provider: 'faux',
@@ -238,6 +272,8 @@ test('PiScout reuses a completed checkpoint on resume without reopening the harn
   const stateDir = path.join(tmp('wsg-pi-cache-'), 'scout');
   try {
     const discovery = enumerateRepos([codeRoot]);
+    const observed = new ObservedEvidenceStore(path.join(stateDir, SCOUT_OBSERVED_FILENAME));
+    observed.observe(fs.realpathSync(repo.dir), 'src/Widget.ts', 1, ['export class Widget {', '  size = 1;', '}']);
     const first = new PiScout({
       discovered: discovery.repos,
       provider: 'faux',

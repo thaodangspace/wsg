@@ -4,7 +4,9 @@ tags: [wsg, typescript, node, cli, git, git-worktree, yaml, typebox, sqlite, pi-
 weight: 01
 ---
 
-Spec: `01_spec_wsg_workspace_assembler.md` (FR1–FR15, D1–D7). Canonical: `/Users/dt/code/wsg/docs/spec.md`, `/Users/dt/code/wsg/docs/implementation-plan.md`. Repo is docs-only; every path is new unless marked "modify".
+> **Historical plan:** Retained for milestone history. The public CLI entry points are `wsg` (interactive chat TUI) and `wsg -p <request>` (non-interactive prompt mode). Legacy `wsg create` has been removed.
+>
+> Spec: `01_spec_wsg_workspace_assembler.md` (FR1–FR15, D1–D7). Canonical: `/Users/dt/code/wsg/docs/spec.md`, `/Users/dt/code/wsg/docs/implementation-plan.md`. Repo is docs-only; every path is new unless marked "modify".
 
 ## Shared conventions (fixed for all phases)
 

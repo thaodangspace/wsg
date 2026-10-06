@@ -239,6 +239,7 @@ test('resuming scouting with a changed task conflicts instead of replaying the o
       discovered: discovery.repos,
       provider: 'faux',
       fauxScript: [
+        { tool: 'read_file', args: { repo: fixture.names.legacy, path: 'src/emr/MedicalRecord.ts' } },
         {
           tool: 'submit_selection',
           args: {

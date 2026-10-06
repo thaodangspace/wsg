@@ -1,5 +1,7 @@
 # WSG implementation plan
 
+> **Historical plan:** Retained for milestone history. As of the chat-first creation release, the public CLI entry points are `wsg` (interactive chat TUI) and `wsg -p <request>` (non-interactive prompt mode). Legacy `wsg create` has been removed.
+
 Status: planned work. This plan implements [the MVP specification](spec.md); no implementation milestone is complete yet.
 
 ## Delivery approach

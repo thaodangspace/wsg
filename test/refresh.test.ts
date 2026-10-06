@@ -51,7 +51,7 @@ async function setupWorkspace(docContent: string, extra: { adapters?: string } =
   fs.writeFileSync(docPath, docContent, 'utf8');
 
   const result = await runCli([
-    'create', 'refresh task', '--name', 'base', '--root', root,
+    '-p', 'refresh task', '--name', 'base', '--root', root,
     '--repo', repo.dir, '--doc', docPath, '--for', extra.adapters ?? 'agents',
   ]);
   assert.equal(result.exitCode, 0, result.stderr);
@@ -172,7 +172,7 @@ test('refresh retains the last snapshot and returns partial on a failed fetch', 
   server.serve('/doc.md', '# Remote v1\n', { 'content-type': 'text/markdown' });
 
   try {
-    await runCli(['create', 'fetch task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'fetch task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     const added = await runCli(['add', `${server.baseUrl}/doc.md`, '--workspace', wsDir], { cwd: wsDir });
     assert.equal(added.exitCode, 0, added.stderr);
 
@@ -207,7 +207,7 @@ test('refresh upgrades a readable reference to a snapshot', async () => {
   server.serve('/wiki', 'Reference body\n', { 'content-type': 'text/plain' });
 
   try {
-    await runCli(['create', 'upgrade task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'upgrade task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     const added = await runCli(
       ['add', `${server.baseUrl}/wiki`, '--as', 'reference', '--workspace', wsDir],
       { cwd: wsDir }
@@ -243,7 +243,7 @@ test('refresh with a selector updates only the selected document', async () => {
 
   try {
     await runCli([
-      'create', 'select task', '--name', 'base', '--root', root,
+      '-p', 'select task', '--name', 'base', '--root', root,
       '--repo', repo.dir, '--doc', aPath, '--doc', bPath,
     ]);
     fs.writeFileSync(aPath, 'A2\n', 'utf8');
@@ -275,7 +275,7 @@ test('refresh never rescouts, prunes, or changes repository revisions', async ()
 
   try {
     await runCli([
-      'create', 'repos task', '--name', 'base', '--root', root,
+      '-p', 'repos task', '--name', 'base', '--root', root,
       '--repo', repo1.dir, '--repo', repo2.dir, '--doc', path.join(docDir, 'notes.md'),
     ]);
     const before = readManifest(wsDir);
@@ -326,7 +326,7 @@ test('refresh reports a failed reference fetch as a partial result', async () =>
   server.serve('/page', 'body\n', { 'content-type': 'text/plain' });
 
   try {
-    await runCli(['create', 'reffail task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'reffail task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     const url = `${server.baseUrl}/page`;
     const added = await runCli(['add', url, '--as', 'reference', '--workspace', wsDir], { cwd: wsDir });
     assert.equal(added.exitCode, 0, added.stderr);
@@ -373,7 +373,7 @@ test('refresh refuses to publish over a manifest changed during the fetch', asyn
   server.serve('/doc', 'body\n', { 'content-type': 'text/plain' });
 
   try {
-    await runCli(['create', 'race task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'race task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     await runCli(['add', `${server.baseUrl}/doc`, '--as', 'reference', '--workspace', wsDir], { cwd: wsDir });
 
     await assert.rejects(
@@ -414,7 +414,7 @@ test('refresh never overwrites an untracked user file when upgrading a reference
   server.serve('/wiki', 'Reference body\n', { 'content-type': 'text/plain' });
 
   try {
-    await runCli(['create', 'upgrade collision', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'upgrade collision', '--name', 'base', '--root', root, '--repo', repo.dir]);
     await runCli(['add', `${server.baseUrl}/wiki`, '--as', 'reference', '--workspace', wsDir], { cwd: wsDir });
 
     const userFile = path.join(wsDir, 'docs', 'wiki.txt');
@@ -445,7 +445,7 @@ test('refresh times out a stalled body, retains the snapshot, and releases the l
   server.serve('/doc.md', 'remote v1\n', { 'content-type': 'text/markdown' });
 
   try {
-    await runCli(['create', 'stall task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'stall task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     await runCli(['add', `${server.baseUrl}/doc.md`, '--workspace', wsDir], { cwd: wsDir });
 
     const before = readManifest(wsDir);
@@ -483,7 +483,7 @@ test('refresh regenerates context and adapters for a workspace with no documents
   const repoName = path.basename(fs.realpathSync(repo.dir));
 
   try {
-    await runCli(['create', 'nodoc task', '--name', 'base', '--root', root, '--repo', repo.dir]);
+    await runCli(['-p', 'nodoc task', '--name', 'base', '--root', root, '--repo', repo.dir]);
     assert.equal(readManifest(wsDir).docs.length, 0);
 
     // Unedited: regeneration is a clean no-op success.

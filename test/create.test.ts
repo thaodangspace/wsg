@@ -52,7 +52,7 @@ test('Happy path: 2 repos, 1 doc, --context, --for agents,claude', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'port EMR architecture',
       '--name',
       'port-emr',
@@ -175,7 +175,7 @@ test('Dirty source: stderr warning, source branch/content unchanged', async () =
     const commitBefore = repo.headCommit;
 
     const result = await runMain([
-      'create',
+      '-p',
       'task with dirty source',
       '--name',
       'dirty-ws',
@@ -220,7 +220,7 @@ test('Duplicate spelling of same source -> one entry', async () => {
     const relSpelling = path.join(parentDir, '.', baseName);
 
     const result = await runMain(
-      ['create', 'dupe test', '--name', 'dupe-ws', '--root', tmpRoot, '--repo', absPath, '--repo', relSpelling],
+      ['-p', 'dupe test', '--name', 'dupe-ws', '--root', tmpRoot, '--repo', absPath, '--repo', relSpelling],
       { cwd: parentDir }
     );
 
@@ -262,7 +262,7 @@ test('Two app repos -> app, app-<6hex>, mapping printed before mutation', async 
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'two app repos test',
       '--name',
       'two-apps',
@@ -307,7 +307,7 @@ test('--dry-run: prints plan, <root>/<name> absent, no wsg/ branches', async () 
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'dry run request',
       '--name',
       'dry-ws',
@@ -351,7 +351,7 @@ test('Preflight exit 1, nothing created: non-repo', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail',
@@ -378,7 +378,7 @@ test('Preflight exit 1, nothing created: subdir of repo (PD1)', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail',
@@ -404,7 +404,7 @@ test('Preflight exit 1, nothing created: bare repo', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail',
@@ -429,7 +429,7 @@ test('Preflight exit 1, nothing created: unborn repo', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail',
@@ -454,7 +454,7 @@ test('Preflight exit 1, nothing created: missing doc', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail',
@@ -487,7 +487,7 @@ test('Preflight exit 1, nothing created: secret doc (filename and content)', asy
   try {
     // Secret filename
     const res1 = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail1',
@@ -504,7 +504,7 @@ test('Preflight exit 1, nothing created: secret doc (filename and content)', asy
 
     // Secret content
     const res2 = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail2',
@@ -530,7 +530,7 @@ test('Preflight exit 1, nothing created: invalid --name', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'invalid/name',
@@ -556,7 +556,7 @@ test('Preflight exit 1, nothing created: --for bogus and --for none,agents', asy
   try {
     // --for bogus
     const res1 = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail1',
@@ -573,7 +573,7 @@ test('Preflight exit 1, nothing created: --for bogus and --for none,agents', asy
 
     // --for none,agents
     const res2 = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-fail2',
@@ -603,7 +603,7 @@ test('Conflict exit 2, no mutation: existing branch (guidance printed, not run)'
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-ws',
@@ -636,7 +636,7 @@ test('Conflict exit 2, no mutation: complete workspace exists', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-ws',
@@ -667,7 +667,7 @@ test('Conflict exit 2, no mutation: incomplete without --resume (suggests it)', 
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-ws',
@@ -708,7 +708,7 @@ test('Conflict exit 2, no mutation: live lock', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'task',
       '--name',
       'test-ws',
@@ -736,7 +736,7 @@ test('Submodule/LFS fixture -> discovery.gaps in manifest and context', async ()
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'gaps test',
       '--name',
       'gaps-ws',
@@ -773,11 +773,11 @@ test('--code-root without --repo is routed to autonomous discovery', async () =>
   const codeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-empty-code-'));
   try {
     const result = await runMain(
-      ['create', 'code root routing', '--name', 'route-ws', '--root', tmpRoot, '--code-root', codeRoot],
+      ['-p', 'code root routing', '--name', 'route-ws', '--root', tmpRoot, '--code-root', codeRoot],
       { env: { ...process.env, WSG_CONFIG: path.join(tmpRoot, 'no-config.yaml') } }
     );
-    // No repositories under the empty root: a bounded, actionable discovery error.
-    assert.equal(result.exitCode, 1);
+    // No repositories under the empty root: a bounded, actionable discovery needs_input (exit 4).
+    assert.equal(result.exitCode, 4);
     assert.match(result.stderr, /No git repositories found under configured code roots/);
     assert.equal(fs.existsSync(path.join(tmpRoot, 'route-ws')), false);
   } finally {
@@ -795,7 +795,7 @@ test('URL doc reference and binary unread metadata', async () => {
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'url reference and binary test',
       '--name',
       'docs-ws',
@@ -837,7 +837,7 @@ test('--resume for an absent workspace exits 1 with resume guidance', async () =
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'wsg-root-'));
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'resume test',
       '--name',
       'resume-test',
@@ -864,7 +864,7 @@ test('runMain respects io.cwd for relative --root, --repo, and --doc', async () 
   try {
     const result = await runMain(
       [
-        'create',
+        '-p',
         'relative paths test',
         '--name',
         'rel-ws',
@@ -901,7 +901,7 @@ test('Empty destination directory is rejected with ConflictError and preserved',
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'empty dest test',
       '--name',
       'empty-dest-ws',
@@ -932,7 +932,7 @@ test('Symlink destination to external directory is rejected with ConflictError a
 
   try {
     const result = await runMain([
-      'create',
+      '-p',
       'symlink dest test',
       '--name',
       'symlink-dest-ws',
@@ -963,7 +963,7 @@ test('Two concurrent creates targeting same destination: one wins, one conflicts
   try {
     const [res1, res2] = await Promise.all([
       runMain([
-        'create',
+        '-p',
         'race request 1',
         '--name',
         'race-ws',
@@ -973,7 +973,7 @@ test('Two concurrent creates targeting same destination: one wins, one conflicts
         repo1.dir,
       ]),
       runMain([
-        'create',
+        '-p',
         'race request 2',
         '--name',
         'race-ws',

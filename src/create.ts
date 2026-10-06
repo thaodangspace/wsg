@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { parseArgs } from 'node:util';
 import { UsageError, ConflictError, PartialError, WsgError } from './errors.ts';
 import {
   assertGitVersion,
@@ -64,6 +63,15 @@ import {
   type ScoutResult,
 } from './scout.ts';
 import type { CliIO } from './cli.ts';
+import type {
+  ActionableQuestion,
+  AssemblyOptions,
+  EventSink,
+  NeedsInput,
+  PrepareResult,
+  ReadyCreate,
+  ResolvedWorkspace,
+} from './workflow.ts';
 import { enumerateRepos, type DiscoveredRepo } from './discovery.ts';
 import { retrieveEvidence, readBoundedFile } from './retrieve.ts';
 import { ObservedEvidenceStore } from './observed.ts';
@@ -81,22 +89,6 @@ import {
   SCOUT_CHECKPOINT_FILENAME,
   SCOUT_DB_FILENAME,
 } from './pi-scout.ts';
-
-export const CREATE_HELP_TEXT = `Usage: wsg create <request> [options]
-
-Options:
-  --name <name>                  Workspace directory name
-  --root <dir>                   Output root directory (default: ~/wsg)
-  --repo <path>                  Add a repository (repeatable; always included)
-  --doc <path-or-url>            Add a document or URL (repeatable)
-  --context <text>               Add task context line (repeatable)
-  --code-root <dir>              Code discovery root (repeatable)
-  --for <adapters>               Adapters: agents, claude, none (default: agents)
-  --dry-run                      Print plan without creating files
-  --resume                       Resume an interrupted create or scout operation
-  --allow-dirty-evidence         Allow selections whose evidence relies on uncommitted files
-  -h, --help                     Show help
-`;
 
 export interface CreateOptions {
   request: string;
@@ -688,10 +680,16 @@ export function scanInterruptedWorkspaces(root: string): string[] {
 
 /**
  * Resumes an interrupted workspace create operation from the recorded plan.
+ *
+ * Exported so the shared coordinator can wrap it with progress events. When
+ * `onResolved` is supplied it receives the final workspace name and directory
+ * once path adoption is complete, before any mutation.
  */
-async function executeResume(
+export async function executeResume(
   options: CreateOptions,
-  io: CliIO = {}
+  io: CliIO = {},
+  events?: EventSink,
+  onResolved?: (info: ResolvedWorkspace) => void
 ): Promise<number> {
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
@@ -756,6 +754,8 @@ async function executeResume(
     }
   }
 
+  onResolved?.({ wsName: wsName as string, wsDir });
+
   if (!wsDirExists) {
     // Resume an interrupted autonomous scout before the workspace directory
     // exists. Only do this when a durable scout state directory was recorded.
@@ -776,7 +776,8 @@ async function executeResume(
           cwd,
         },
         options,
-        io
+        io,
+        events
       );
     }
 
@@ -1126,7 +1127,21 @@ async function executeResume(
     writeOperation(wsDir, opFile);
 
     // MUTATION PHASE: Worktree steps
+    events?.({
+      stage: 'assembly',
+      status: 'started',
+      message: `resuming assembly for ${wsName}`,
+      name: wsName as string,
+      wsDir,
+    });
     for (const d of worktreeDecisions) {
+      events?.({
+        stage: 'assembly',
+        status: 'progress',
+        message: `recovering worktree ${d.stepId.replace(/^worktree:/, '')}`,
+        name: wsName as string,
+        wsDir,
+      });
       if (d.action === 'adopt') {
         markStep(wsDir, d.stepId, 'done', {
           detail: {
@@ -1216,6 +1231,13 @@ async function executeResume(
       // ignore tmp cleanup failure
     }
 
+    events?.({
+      stage: 'assembly',
+      status: 'completed',
+      message: `resumed ${wsName}`,
+      name: wsName as string,
+      wsDir,
+    });
     writeStdout(`\nWorkspace resumed at ${wsDir}\n`);
     if (
       reconcileResult.partial ||
@@ -1258,8 +1280,9 @@ interface AutonomousContext {
  */
 async function runAssembly(
   assembly: CreateAssembly,
-  options: CreateOptions,
-  io: CliIO = {}
+  options: AssemblyOptions,
+  io: CliIO = {},
+  events?: EventSink
 ): Promise<number> {
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
@@ -1458,6 +1481,14 @@ async function runAssembly(
     return 0;
   }
 
+  events?.({
+    stage: 'assembly',
+    status: 'started',
+    message: `assembling workspace ${wsName}`,
+    name: wsName,
+    wsDir,
+  });
+
   // (e) Begin mutation: exclusively reserve directory, initWsgDir, lock, journal running
   const parentDir = path.dirname(wsDir);
   fs.mkdirSync(parentDir, { recursive: true });
@@ -1611,6 +1642,13 @@ async function runAssembly(
       }
 
       const stepId = `worktree:${r.name}`;
+      events?.({
+        stage: 'assembly',
+        status: 'progress',
+        message: `creating worktree ${r.name}`,
+        name: wsName,
+        wsDir,
+      });
       markStep(wsDir, stepId, 'started', {
         detail: {
           source: r.source,
@@ -1633,6 +1671,13 @@ async function runAssembly(
     for (const d of plannedDocs) {
       if (d.mode === 'snapshot' && d.path) {
         const stepId = `snapshot:${d.path}`;
+        events?.({
+          stage: 'assembly',
+          status: 'progress',
+          message: `writing snapshot ${d.path}`,
+          name: wsName,
+          wsDir,
+        });
         markStep(wsDir, stepId, 'started');
 
         if (options._beforeSnapshotWrite) {
@@ -1668,6 +1713,13 @@ async function runAssembly(
     }
 
     // (h) renderAll -> reconcileGenerated
+    events?.({
+      stage: 'assembly',
+      status: 'progress',
+      message: 'generating workspace context',
+      name: wsName,
+      wsDir,
+    });
     markStep(wsDir, 'generate', 'started');
     const unreadDocs = new Set<string>();
     for (const d of plannedDocs) {
@@ -1684,6 +1736,13 @@ async function runAssembly(
     faultPoint('after-generate', io.env);
 
     // (i) Publish workspace.yaml atomically, complete journal, clean tmp, release lock
+    events?.({
+      stage: 'assembly',
+      status: 'progress',
+      message: 'publishing workspace.yaml',
+      name: wsName,
+      wsDir,
+    });
     markStep(wsDir, 'publish-manifest', 'started');
     const manifestYaml = serializeManifest(draftManifest);
     const manifestPath = path.join(wsDir, 'workspace.yaml');
@@ -1704,6 +1763,13 @@ async function runAssembly(
     }
 
     // (j) Summary; exit 3 if proposals
+    events?.({
+      stage: 'assembly',
+      status: 'completed',
+      message: `assembled ${wsName}`,
+      name: wsName,
+      wsDir,
+    });
     writeStdout(`\nWorkspace created at ${wsDir}\n`);
     if (reconcileResult.partial || reconcileResult.proposals.length > 0) {
       writeStdout(`Note: Some generated files required reconciliation (.wsg-new proposals written).\n`);
@@ -1724,79 +1790,99 @@ async function runAssembly(
 }
 
 /**
- * Executes workspace creation end-to-end.
+ * Converts a typed `needs_input` planning outcome into the legacy error
+ * classification used by `wsg create`, preserving exit codes and hint text
+ * until the public entry point migrates to typed outcomes (Phase 3).
  */
-async function executeCreate(
+function toLegacyCreateError(prepared: NeedsInput): WsgError {
+  if (prepared.legacy.classification === 'conflict') {
+    return new ConflictError(prepared.reason, prepared.legacy.hints);
+  }
+  return new UsageError(prepared.reason);
+}
+
+function toQuestions(texts: string[]): ActionableQuestion[] {
+  return texts.map((question, index) => ({ id: `q${index + 1}`, question }));
+}
+
+/** Actionable missing input that legacy `create` reported as a usage error. */
+function needsInputUsage(reason: string, questions?: string[]): NeedsInput {
+  return {
+    kind: 'needs_input',
+    reason,
+    questions: toQuestions(questions && questions.length > 0 ? questions : [reason]),
+    legacy: { classification: 'usage', hints: [] },
+  };
+}
+
+/** Actionable ambiguity that legacy `create` reported as a conflict. */
+function needsInputConflict(reason: string, hints: string[], candidates?: string[]): NeedsInput {
+  const questions = toQuestions(hints.length > 0 ? hints : [reason]);
+  if (candidates && candidates.length > 0 && questions.length > 0) {
+    questions[0].candidates = [...candidates];
+  }
+  return {
+    kind: 'needs_input',
+    reason,
+    questions,
+    legacy: { classification: 'conflict', hints },
+  };
+}
+
+export interface ExplicitCreateContext {
+  request: string;
+  wsName: string;
+  wsDir: string;
+  adapters: ManifestAdapter[];
+  cwd: string;
+}
+
+/**
+ * Planning phase for explicit-input create. Runs the scout seam, inspects the
+ * selected repositories and documents, and discovers validation commands. No
+ * worktree, branch, or manifest mutation occurs; the validated `CreateAssembly`
+ * is returned for a later `assemblePrepared` call.
+ */
+async function prepareExplicitCreate(
+  ctx: ExplicitCreateContext,
   options: CreateOptions,
-  io: CliIO = {}
-): Promise<number> {
-  const cwd = getCwd(io);
-
-  // (a) Preflight validations before any mutation
-
-  // 1. Git version
-  assertGitVersion('2.38.0');
-
-  // 3. Request validation
-  if (!options.request || typeof options.request !== 'string' || options.request.trim().length === 0) {
-    throw new UsageError('Workspace request must not be empty');
-  }
-  const request = options.request.trim();
-
-  // 4. Slug / Name derivation and validation
-  let wsName: string;
-  if (options.name !== undefined) {
-    assertValidSlug(options.name, 'Workspace name');
-    wsName = options.name;
-  } else {
-    wsName = deriveSlug(request);
-    assertValidSlug(wsName, 'Workspace name');
-  }
-
-  // 5. Settings / Config / Adapters resolution
-  // loadConfig enforces adapter validation (e.g. --for bogus or --for none,agents -> UsageError exit 1)
-  const settings = loadConfig(io.env, {
-    root: options.root,
-    for: options.for,
-    code_root: options.codeRoots,
-  });
-  const expandedRoot = expandHome(settings.workspace_root);
-  const resolvedRoot = path.isAbsolute(expandedRoot)
-    ? expandedRoot
-    : path.resolve(cwd, expandedRoot);
-  const wsDir = path.resolve(resolvedRoot, wsName);
-  const adapters = settings.adapters as ManifestAdapter[];
-
-  // Routing (repo spec §6): without --code-root, explicit --repo inputs keep
-  // the offline, model-free path. With --code-root, discovery runs as well:
-  // explicit repositories are included separately and never require evidence,
-  // while auto-discovered candidates are capped and evidence-validated.
-  const explicitRepos = options.repos ?? [];
-  const cliCodeRoots = options.codeRoots ?? [];
-  if (explicitRepos.length === 0 || cliCodeRoots.length > 0) {
-    return await executeAutonomousCreate(
-      { request, wsName, wsDir, resolvedRoot, adapters, cwd },
-      options,
-      io
-    );
-  }
+  events?: EventSink
+): Promise<PrepareResult> {
+  const cwd = ctx.cwd;
 
   // 6. Scout seam invocation (defaults to ExplicitScout)
+  events?.({
+    stage: 'scout',
+    status: 'started',
+    message: `resolving ${options.repos?.length ?? 0} explicit repositories`,
+    name: ctx.wsName,
+    repos: options.repos?.length ?? 0,
+  });
   const scout = options.scout ?? new ExplicitScout();
   const scoutResult = await scout.scout({
-    request,
+    request: ctx.request,
     repos: options.repos,
     docs: options.docs,
     context: options.context,
   });
+  events?.({
+    stage: 'scout',
+    status: 'completed',
+    message: `scout returned ${scoutResult.kind}`,
+    name: ctx.wsName,
+  });
 
   if (scoutResult.kind === 'none') {
-    throw new UsageError(scoutResult.reason);
+    return needsInputUsage(scoutResult.reason);
   }
   if (scoutResult.kind === 'ambiguous') {
-    throw new ConflictError(
+    return needsInputConflict(
       scoutResult.reason,
-      scoutResult.guidance ? [scoutResult.guidance] : []
+      [
+        ...scoutResult.candidates.map((c) => `Candidate: ${c}`),
+        ...(scoutResult.guidance ? [scoutResult.guidance] : []),
+      ],
+      scoutResult.candidates
     );
   }
 
@@ -1838,14 +1924,14 @@ async function executeCreate(
 
   const repos: AssemblyRepo[] = uniqueRepos.map((r) => {
     const entryName = entryNames.get(r.source)!;
-    const branch = `wsg/${wsName}/${entryName}`;
+    const branch = `wsg/${ctx.wsName}/${entryName}`;
     if (!checkBranchName(branch)) {
       throw new UsageError(`Invalid branch name '${branch}'`);
     }
     return {
       name: entryName,
       source: r.source,
-      dest: path.join(wsDir, entryName),
+      dest: path.join(ctx.wsDir, entryName),
       branch,
       base_commit: r.info.headCommit,
       dirty: r.info.dirty,
@@ -1896,12 +1982,12 @@ async function executeCreate(
   const plannedDocs = planDocs(inspectedDocs, { addedBy: 'user' });
 
   const assembly: CreateAssembly = {
-    wsName,
-    wsDir,
-    request,
+    wsName: ctx.wsName,
+    wsDir: ctx.wsDir,
+    request: ctx.request,
     context: options.context ?? [],
     scoutContext: scoutResult.context ?? [],
-    adapters,
+    adapters: ctx.adapters,
     repos,
     docs: plannedDocs,
     commands: commandDiscovery.commands,
@@ -1909,7 +1995,137 @@ async function executeCreate(
     excluded: (scoutResult.excluded ?? []).map((e) => ({ source: e.source, reason: e.reason })),
   };
 
-  return await runAssembly(assembly, options, io);
+  return { kind: 'ready', assembly };
+}
+
+/**
+ * Planning entry point for a fresh workspace create. Validates the request,
+ * derives the workspace name, resolves configuration, and routes to explicit or
+ * autonomous planning. Returns a typed result and never publishes a workspace.
+ *
+ * Allowed planning side effect: the durable scout state directory
+ * (`<workspace-root>/.wsg-scout/<name>/`) may be created or updated. No
+ * workspace directory, Git worktree/branch, or `workspace.yaml` is created.
+ */
+export async function prepareCreate(
+  options: CreateOptions,
+  io: CliIO = {},
+  events?: EventSink
+): Promise<PrepareResult> {
+  const cwd = getCwd(io);
+
+  // (a) Preflight validations before any mutation
+
+  // 1. Git version
+  assertGitVersion('2.38.0');
+
+  // 3. Request validation
+  if (!options.request || typeof options.request !== 'string' || options.request.trim().length === 0) {
+    throw new UsageError('Workspace request must not be empty');
+  }
+  const request = options.request.trim();
+
+  // 4. Slug / Name derivation and validation
+  let wsName: string;
+  if (options.name !== undefined) {
+    assertValidSlug(options.name, 'Workspace name');
+    wsName = options.name;
+  } else {
+    wsName = deriveSlug(request);
+    assertValidSlug(wsName, 'Workspace name');
+  }
+
+  // 5. Settings / Config / Adapters resolution
+  // loadConfig enforces adapter validation (e.g. --for bogus or --for none,agents -> UsageError exit 1)
+  const settings = loadConfig(io.env, {
+    root: options.root,
+    for: options.for,
+    code_root: options.codeRoots,
+  });
+  const expandedRoot = expandHome(settings.workspace_root);
+  const resolvedRoot = path.isAbsolute(expandedRoot)
+    ? expandedRoot
+    : path.resolve(cwd, expandedRoot);
+  const wsDir = path.resolve(resolvedRoot, wsName);
+  const adapters = settings.adapters as ManifestAdapter[];
+
+  // Routing (repo spec §6): without --code-root, explicit --repo inputs keep
+  // the offline, model-free path. With --code-root, discovery runs as well:
+  // explicit repositories are included separately and never require evidence,
+  // while auto-discovered candidates are capped and evidence-validated.
+  const explicitRepos = options.repos ?? [];
+  const cliCodeRoots = options.codeRoots ?? [];
+  if (explicitRepos.length === 0 || cliCodeRoots.length > 0) {
+    return await prepareAutonomousCreate(
+      { request, wsName, wsDir, resolvedRoot, adapters, cwd },
+      options,
+      io,
+      events
+    );
+  }
+
+  return await prepareExplicitCreate(
+    { request, wsName, wsDir, adapters, cwd },
+    options,
+    events
+  );
+}
+
+/**
+ * Assembly entry point. Runs the deterministic materialization of a `ready`
+ * planning result and, for autonomous create, copies the durable scout runtime
+ * state into the finished workspace. This is the first point at which a
+ * worktree, branch, or `workspace.yaml` may be created.
+ */
+export async function assemblePrepared(
+  prepared: ReadyCreate,
+  options: AssemblyOptions,
+  io: CliIO = {},
+  events?: EventSink
+): Promise<number> {
+  const code = await runAssembly(prepared.assembly, options, io, events);
+
+  // Preserve the real scout transcript, checkpoint, identity and budget in the
+  // workspace runtime storage once the workspace exists (best-effort; these are
+  // disposable for using the workspace).
+  const stateDir = prepared.scoutStateDir;
+  const wsDir = prepared.assembly.wsDir;
+  if (stateDir && !options.dryRun && fs.existsSync(path.join(wsDir, '.wsg'))) {
+    try {
+      const copies: Array<[string, string]> = [
+        [path.join(stateDir, SCOUT_DB_FILENAME), 'runtime.sqlite'],
+        [path.join(stateDir, SCOUT_CHECKPOINT_FILENAME), 'scout.json'],
+        [path.join(stateDir, SCOUT_META_FILENAME), 'scout-meta.json'],
+        [path.join(stateDir, SCOUT_BUDGET_FILENAME), 'scout-budget.json'],
+        [path.join(stateDir, SCOUT_OBSERVED_FILENAME), 'scout-observed.json'],
+      ];
+      for (const [from, to] of copies) {
+        if (fs.existsSync(from)) {
+          fs.copyFileSync(from, path.join(wsDir, '.wsg', to));
+        }
+      }
+    } catch {
+      // runtime storage is a convenience, not a requirement for the workspace
+    }
+  }
+
+  return code;
+}
+
+/**
+ * Executes workspace creation end-to-end for the `create` command by composing
+ * the planning and assembly boundary and translating `needs_input` back into
+ * the legacy error classification.
+ */
+async function executeCreate(
+  options: CreateOptions,
+  io: CliIO = {}
+): Promise<number> {
+  const prepared = await prepareCreate(options, io);
+  if (prepared.kind === 'needs_input') {
+    throw toLegacyCreateError(prepared);
+  }
+  return await assemblePrepared(prepared, options, io);
 }
 
 /**
@@ -1955,23 +2171,25 @@ export function buildScoutDocumentContext(
 }
 
 /**
- * Autonomous create: bounded repository enumeration, retrieval, one Pi Durable
- * scout conversation with read-only tools, evidence validation, ambiguity
- * handling, and the same deterministic materialization as explicit create.
+ * Autonomous planning: bounded repository enumeration, retrieval, one Pi
+ * Durable scout conversation with read-only tools, evidence validation, and
+ * ambiguity handling. It returns a validated assembly without materializing a
+ * workspace.
  *
  * Explicit `--repo` inputs are always included (even outside the code roots and
  * without evidence) and are never counted against the auto-discovered cap.
  *
  * The scout conversation is checkpointed under
- * `<workspace-root>/.wsg-scout/<name>/` and copied into `.wsg/` after a
- * successful assembly so an interrupted scout can resume without re-executing
- * committed tool calls.
+ * `<workspace-root>/.wsg-scout/<name>/` (an allowed planning side effect) and
+ * copied into `.wsg/` after a successful assembly so an interrupted scout can
+ * resume without re-executing committed tool calls.
  */
-async function executeAutonomousCreate(
+async function prepareAutonomousCreate(
   ctx: AutonomousContext,
   options: CreateOptions,
-  io: CliIO = {}
-): Promise<number> {
+  io: CliIO = {},
+  events?: EventSink
+): Promise<PrepareResult> {
   const stderr = io.stderr ?? process.stderr;
   const cwd = ctx.cwd;
   const settings = loadConfig(io.env, {
@@ -1981,7 +2199,20 @@ async function executeAutonomousCreate(
   });
   const codeRoots = settings.code_roots;
 
+  events?.({
+    stage: 'discovery',
+    status: 'started',
+    message: `discovering repositories under ${codeRoots.join(', ') || '(no code roots)'}`,
+    name: ctx.wsName,
+  });
   const discovery = enumerateRepos(codeRoots);
+  events?.({
+    stage: 'discovery',
+    status: 'completed',
+    message: `discovered ${discovery.repos.length} repositories`,
+    name: ctx.wsName,
+    repos: discovery.repos.length,
+  });
   const stateDir = options.scoutStateDir ?? scoutStateDirFor(ctx.resolvedRoot, ctx.wsName);
 
   // Explicit repositories are mandatory, may live outside the code roots, and
@@ -2011,10 +2242,24 @@ async function executeAutonomousCreate(
     }
   }
 
+  events?.({
+    stage: 'retrieval',
+    status: 'started',
+    message: `retrieving evidence from ${discovery.repos.length} repositories`,
+    name: ctx.wsName,
+    repos: discovery.repos.length,
+  });
   const retrieval = await retrieveEvidence(ctx.request, options.context ?? [], discovery.repos, {
     suppliedDocs,
     codeRoots,
     rgPath: options.rgPath,
+  });
+  events?.({
+    stage: 'retrieval',
+    status: 'completed',
+    message: `retrieved evidence for ${retrieval.repos.size} repositories`,
+    name: ctx.wsName,
+    repos: retrieval.repos.size,
   });
 
   // The read model includes discovered repos plus explicit repos so the
@@ -2075,16 +2320,28 @@ async function executeAutonomousCreate(
     maxDiscoveredRepos: settings.max_discovered_repos,
     resume: options.resume,
     env: io.env,
+    onProgress: (message) =>
+      events?.({ stage: 'scout', status: 'progress', message, name: ctx.wsName }),
   };
 
-  let scoutResult: ScoutResult;
   if (discovery.repos.length === 0 && explicitCanonical.size === 0) {
     const reasons = [...discovery.gaps, ...retrieval.gaps];
-    throw new UsageError(
+    return needsInputUsage(
       `No git repositories found under configured code roots (${codeRoots.join(', ')})` +
         (reasons.length > 0 ? `:\n  ${reasons.join('\n  ')}` : '')
     );
-  } else if (options.scout) {
+  }
+
+  events?.({
+    stage: 'scout',
+    status: 'started',
+    message: `scouting ${discovery.repos.length} repositories`,
+    name: ctx.wsName,
+    repos: discovery.repos.length,
+  });
+
+  let scoutResult: ScoutResult;
+  if (options.scout) {
     scoutResult = await options.scout.scout(scoutOptions);
   } else if (discovery.repos.length > 0) {
     const scout = new PiScout({
@@ -2108,27 +2365,55 @@ async function executeAutonomousCreate(
     scoutResult = { kind: 'selection', repos: [], docs: [], excluded: [], gaps: [] };
   }
 
+  events?.({
+    stage: 'scout',
+    status: 'completed',
+    message: `scout returned ${scoutResult.kind}`,
+    name: ctx.wsName,
+  });
+
   if (scoutResult.kind === 'none') {
-    throw new UsageError(scoutResult.reason);
+    return needsInputUsage(scoutResult.reason);
   }
   if (scoutResult.kind === 'ambiguous') {
-    throw new ConflictError(scoutResult.reason, [
-      ...scoutResult.candidates.map((c) => `Candidate: ${c}`),
-      ...(scoutResult.guidance ? [scoutResult.guidance] : []),
-    ]);
+    return needsInputConflict(
+      scoutResult.reason,
+      [
+        ...scoutResult.candidates.map((c) => `Candidate: ${c}`),
+        ...(scoutResult.guidance ? [scoutResult.guidance] : []),
+      ],
+      scoutResult.candidates
+    );
   }
 
   // Validate every discovered citation against the real, actually-observed
   // repository contents. Fictional/unseen evidence and unreachable repositories
   // fail before any materialization; explicit inputs need no evidence.
+  events?.({
+    stage: 'validation',
+    status: 'started',
+    message: 'validating selected repository evidence',
+    name: ctx.wsName,
+  });
   const validated = validateScoutSelection(scoutResult, allowed, { observed });
+  events?.({
+    stage: 'validation',
+    status: 'completed',
+    message: `validated ${validated.repos.length} repositories`,
+    name: ctx.wsName,
+    repos: validated.repos.length,
+  });
 
   const ambiguity = findTargetAmbiguity(validated);
   if (ambiguity) {
-    throw new ConflictError(ambiguity.reason, [
-      ...ambiguity.candidates.map((c) => `Candidate: ${c}`),
-      ambiguity.guidance,
-    ]);
+    return needsInputConflict(
+      ambiguity.reason,
+      [
+        ...ambiguity.candidates.map((c) => `Candidate: ${c}`),
+        ambiguity.guidance,
+      ],
+      ambiguity.candidates
+    );
   }
 
   const validatedBySource = new Map(validated.repos.map((r) => [r.source, r]));
@@ -2184,7 +2469,7 @@ async function executeAutonomousCreate(
   }
 
   if (chosen.length === 0) {
-    throw new UsageError(
+    return needsInputUsage(
       'Scout did not select any repository. No workspace was created; refine the request or supply --repo <path>.'
     );
   }
@@ -2303,113 +2588,39 @@ async function executeAutonomousCreate(
     excluded: validated.excluded,
   };
 
-  const code = await runAssembly(assembly, options, io);
+  return { kind: 'ready', assembly, scoutStateDir: stateDir };
+}
 
-  // Preserve the real scout transcript, checkpoint, identity and budget in the
-  // workspace runtime storage once the workspace exists (best-effort; these are
-  // disposable for using the workspace).
-  if (!options.dryRun && fs.existsSync(path.join(ctx.wsDir, '.wsg'))) {
-    try {
-      const copies: Array<[string, string]> = [
-        [path.join(stateDir, SCOUT_DB_FILENAME), 'runtime.sqlite'],
-        [path.join(stateDir, SCOUT_CHECKPOINT_FILENAME), 'scout.json'],
-        [path.join(stateDir, SCOUT_META_FILENAME), 'scout-meta.json'],
-        [path.join(stateDir, SCOUT_BUDGET_FILENAME), 'scout-budget.json'],
-        [path.join(stateDir, SCOUT_OBSERVED_FILENAME), 'scout-observed.json'],
-      ];
-      for (const [from, to] of copies) {
-        if (fs.existsSync(from)) {
-          fs.copyFileSync(from, path.join(ctx.wsDir, '.wsg', to));
-        }
-      }
-    } catch {
-      // runtime storage is a convenience, not a requirement for the workspace
-    }
+/**
+ * Composes autonomous planning and assembly. Used by `executeResume` for the
+ * interrupted-scout recovery branch. The typed `needs_input` outcome is
+ * translated back into the legacy error classification.
+ */
+async function executeAutonomousCreate(
+  ctx: AutonomousContext,
+  options: CreateOptions,
+  io: CliIO = {},
+  events?: EventSink
+): Promise<number> {
+  const prepared = await prepareAutonomousCreate(ctx, options, io, events);
+  if (prepared.kind === 'needs_input') {
+    throw toLegacyCreateError(prepared);
   }
-
-  return code;
+  return await assemblePrepared(prepared, options, io, events);
 }
 
 
 
 /**
- * Public entry point for `wsg create`. Accepts either CreateOptions or string[] args.
+ * Programmatic creation engine. Accepts CreateOptions.
  */
 export async function runCreate(
-  optionsOrArgs: CreateOptions | string[],
+  options: CreateOptions,
   io: CliIO = {}
 ): Promise<number> {
-  if (Array.isArray(optionsOrArgs)) {
-    const { values, positionals } = parseArgs({
-      args: optionsOrArgs,
-      options: {
-        name: { type: 'string' },
-        root: { type: 'string' },
-        repo: { type: 'string', multiple: true },
-        doc: { type: 'string', multiple: true },
-        context: { type: 'string', multiple: true },
-        'code-root': { type: 'string', multiple: true },
-        for: { type: 'string' },
-        'dry-run': { type: 'boolean' },
-        resume: { type: 'boolean' },
-        'allow-dirty-evidence': { type: 'boolean' },
-        help: { type: 'boolean', short: 'h' },
-      },
-      allowPositionals: true,
-      strict: true,
-    });
-
-    if (values.help) {
-      (io.stdout ?? process.stdout).write(CREATE_HELP_TEXT);
-      return 0;
-    }
-
-    const request = positionals.join(' ');
-
-    if (values.resume) {
-      return await executeResume(
-        {
-          request,
-          name: values.name,
-          root: values.root,
-          repos: values.repo,
-          docs: values.doc,
-          context: values.context,
-          codeRoots: values['code-root'],
-          for: values.for,
-          dryRun: values['dry-run'],
-          resume: values.resume,
-          allowDirtyEvidence: values['allow-dirty-evidence'],
-        },
-        io
-      );
-    }
-
-    if (positionals.length === 0) {
-      throw new UsageError('create requires a request description: wsg create <request> [options]');
-    }
-
-    return await executeCreate(
-      {
-        request,
-        name: values.name,
-        root: values.root,
-        repos: values.repo,
-        docs: values.doc,
-        context: values.context,
-        codeRoots: values['code-root'],
-        for: values.for,
-        dryRun: values['dry-run'],
-        resume: values.resume,
-        allowDirtyEvidence: values['allow-dirty-evidence'],
-      },
-      io
-    );
+  if (options.resume) {
+    return await executeResume(options, io);
   }
 
-  if (optionsOrArgs.resume) {
-    return await executeResume(optionsOrArgs, io);
-  }
-
-  return await executeCreate(optionsOrArgs, io);
+  return await executeCreate(options, io);
 }

@@ -22,7 +22,7 @@
  * - the whole ref may not end with `.` and may not contain `..`.
  *
  * `test/git.test.ts` cross-checks this against the real Git for a broad corpus,
- * which is what keeps `wsg create`'s pre-flight and `--resume` safety intact.
+ * which is what keeps workspace creation pre-flight and `--resume` safety intact.
  *
  * Intentional deviation: `--branch` also expands the "previous branch"
  * shorthand `@{-N}` and reports success, but that is not a literal branch name

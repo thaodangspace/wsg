@@ -104,7 +104,7 @@ test('M2 e2e: complete workspace lifecycle with sources untouched and storage-in
   try {
     const created = runCli(
       [
-        'create',
+        '-p',
         'port EMR mono to modular',
         '--name',
         'e2e',
@@ -186,7 +186,7 @@ test('M2 e2e: complete workspace lifecycle with sources untouched and storage-in
     // --- A second create from the same sources gets distinct branches.
     const second = runCli(
       [
-        'create',
+        '-p',
         'port EMR mono to modular',
         '--name',
         'e2e2',
@@ -258,7 +258,7 @@ test('M2 e2e: create executes no project npm/node/sh command', () => {
 
   try {
     const result = runCli(
-      ['create', 'shim task', '--name', 'shim', '--root', root, '--repo', repo.dir],
+      ['-p', 'shim task', '--name', 'shim', '--root', root, '--repo', repo.dir],
       {
         removeOpenAI: true,
         env: { PATH: `${shimDir}:${process.env.PATH ?? ''}` },

@@ -132,7 +132,7 @@ test('WSG_FAULT=after-worktree:1: resume adopts started worktree and completes',
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -162,7 +162,7 @@ test('WSG_FAULT=after-worktree:1: resume adopts started worktree and completes',
     );
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -218,7 +218,7 @@ test('resume uses worktreeAddExisting for genuinely owned branch-only state', ()
     ]);
 
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -271,7 +271,7 @@ test('resume conflict: branch at a different commit leaves git untouched', () =>
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -321,7 +321,7 @@ test('resume conflict: destination registered on a different branch', () => {
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -364,7 +364,7 @@ test('resume conflict: destination is a plain directory', () => {
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -407,7 +407,7 @@ test('resume conflict: branch at base but branchExistedBefore is true', () => {
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -437,7 +437,7 @@ test('WSG_FAULT=after-generate: resume preserves edits, writes .wsg-new, publish
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -459,7 +459,7 @@ test('WSG_FAULT=after-generate: resume preserves edits, writes .wsg-new, publish
     fs.writeFileSync(contextPath, edited, 'utf8');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -491,7 +491,7 @@ test('--resume rejects a complete workspace', () => {
 
   try {
     const created = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -503,7 +503,7 @@ test('--resume rejects a complete workspace', () => {
     assert.equal(created.status, 0, created.stderr);
 
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -528,13 +528,13 @@ test('--resume rejects a different --repo set with a diff', () => {
 
   try {
     const first = runCli(
-      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo1.dir],
+      ['-p', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo1.dir],
       { env: { WSG_FAULT: 'after-worktree:1' } }
     );
     assert.equal(first.status, 70, first.stderr);
 
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -562,13 +562,13 @@ test('--resume rejects a different --name against a single interrupted workspace
   try {
     // No --name: directory derives from the request ("task").
     const first = runCli(
-      ['create', 'task', '--root', tmpRoot, '--repo', repo.dir],
+      ['-p', 'task', '--root', tmpRoot, '--repo', repo.dir],
       { env: { WSG_FAULT: 'after-worktree:1' } }
     );
     assert.equal(first.status, 70, first.stderr);
 
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'other',
@@ -600,7 +600,7 @@ test('resume recovers a pending snapshot from its recorded hash', () => {
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -620,7 +620,7 @@ test('resume recovers a pending snapshot from its recorded hash', () => {
     assert.ok(!fs.existsSync(snapshotPath), 'snapshot must be pending after fault');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -658,7 +658,7 @@ test('resume refuses to rebuild a snapshot from changed source state', () => {
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -677,7 +677,7 @@ test('resume refuses to rebuild a snapshot from changed source state', () => {
     fs.writeFileSync(docPath, '# Guide\nChanged after crash.\n', 'utf8');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -716,7 +716,7 @@ test('resume rejects a recorded destination outside the workspace with zero git 
 
   try {
     const first = runCli(
-      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      ['-p', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
       { env: { WSG_FAULT: 'after-lock' } }
     );
     assert.equal(first.status, 70, first.stderr);
@@ -732,7 +732,7 @@ test('resume rejects a recorded destination outside the workspace with zero git 
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -765,7 +765,7 @@ test('resume rejects a symlinked recorded destination with zero git mutation', (
 
   try {
     const first = runCli(
-      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      ['-p', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
       { env: { WSG_FAULT: 'after-lock' } }
     );
     assert.equal(first.status, 70, first.stderr);
@@ -782,7 +782,7 @@ test('resume rejects a symlinked recorded destination with zero git mutation', (
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -811,7 +811,7 @@ test('resume rejects a traversal operation id without writing outside .wsg/tmp',
 
   try {
     const first = runCli(
-      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      ['-p', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
       { env: { WSG_FAULT: 'after-lock' } }
     );
     assert.equal(first.status, 70, first.stderr);
@@ -823,7 +823,7 @@ test('resume rejects a traversal operation id without writing outside .wsg/tmp',
 
     const before = worktreeList(repo.dir).length;
     const result = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -866,7 +866,7 @@ test('resume rejects an outside .wsg/tmp staging symlink with zero git mutation'
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -890,7 +890,7 @@ test('resume rejects an outside .wsg/tmp staging symlink with zero git mutation'
     const beforeSha = sha256(fs.readFileSync(marker));
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -934,7 +934,7 @@ test('resume rejects an outside .wsg/tmp/<id> staging symlink with zero git muta
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -962,7 +962,7 @@ test('resume rejects an outside .wsg/tmp/<id> staging symlink with zero git muta
     const beforeSha = sha256(fs.readFileSync(marker));
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -1004,7 +1004,7 @@ test('resume preserves an edited snapshot and writes a .wsg-new proposal', () =>
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -1026,7 +1026,7 @@ test('resume preserves an edited snapshot and writes a .wsg-new proposal', () =>
     fs.writeFileSync(snapshotPath, edited, 'utf8');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -1067,7 +1067,7 @@ test('resume preserves a preexisting snapshot proposal and numbers the new one',
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -1089,7 +1089,7 @@ test('resume preserves a preexisting snapshot proposal and numbers the new one',
     fs.writeFileSync(preexistingProposal, 'PREEXISTING PROPOSAL\n', 'utf8');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -1129,7 +1129,7 @@ test('resume fails closed when an edited snapshot source also changed', () => {
   try {
     const first = runCli(
       [
-        'create',
+        '-p',
         'task',
         '--name',
         'ws',
@@ -1151,7 +1151,7 @@ test('resume fails closed when an edited snapshot source also changed', () => {
     fs.writeFileSync(docPath, '# Guide\nChanged source.\n', 'utf8');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',
@@ -1186,7 +1186,7 @@ test('WSG_FAULT=after-lock leaves a stale lock that resume takes over with a war
 
   try {
     const first = runCli(
-      ['create', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
+      ['-p', 'task', '--name', 'ws', '--root', tmpRoot, '--repo', repo.dir],
       { env: { WSG_FAULT: 'after-lock' } }
     );
     assert.equal(first.status, 70, first.stderr);
@@ -1195,7 +1195,7 @@ test('WSG_FAULT=after-lock leaves a stale lock that resume takes over with a war
     assert.ok(fs.existsSync(lockPath), 'stale lock must remain after crash');
 
     const resumed = runCli([
-      'create',
+      '-p',
       'task',
       '--name',
       'ws',

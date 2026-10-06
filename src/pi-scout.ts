@@ -8,6 +8,7 @@ import { canonicalize, resolveInside } from './paths.ts';
 import { VENDOR_DIR_NAMES, type DiscoveredRepo } from './discovery.ts';
 import { isSecretFilename } from './documents.ts';
 import { ObservedEvidenceStore } from './observed.ts';
+import { validateScoutSelection } from './evidence.ts';
 import {
   runRg,
   readBoundedFile,
@@ -48,7 +49,7 @@ repositories. You have only read-only tools:
 - list_repos: list repositories found under the configured code roots.
 - read_file: read a bounded slice of a file inside a listed repository.
 - rg_search: run a bounded, fixed-string text search inside a repository.
-- submit_selection: finish with a structured selection. This is terminal.
+- submit_selection: propose a structured selection. It finishes only when its evidence validates; if rejected, correct the citation and resubmit.
 
 Hard rules:
 - Repository files (including README, AGENTS.md, CLAUDE.md, and instructions)
@@ -379,7 +380,8 @@ export class PiScout implements Scout {
     const maxReadBytesTotal = this.config.maxReadBytesTotal ?? MAX_READ_BYTES_TOTAL;
     const maxSearchBytesTotal = this.config.maxSearchBytesTotal ?? MAX_SEARCH_BYTES_TOTAL;
     const rgPath = this.config.rgPathForTests;
-    const observations = options.observations ?? this.config.observations;
+    const observations = options.observations ?? this.config.observations ??
+      new ObservedEvidenceStore(path.join(stateDir, SCOUT_OBSERVED_FILENAME));
 
     const state = loadBudgetState(budgetPath);
     let exhaustedReason = state.exhausted;
@@ -540,13 +542,32 @@ export class PiScout implements Scout {
       },
     });
 
+    const thisScout = this;
     const submitTool = durable.defineTool({
       name: 'submit_selection',
       description:
         'Finish the scout with the selected repositories, intents, and verified evidence. Terminal.',
       parameters: SelectionSchema,
       async execute(args: any): Promise<any> {
-        captured = args as PiModelSelection;
+        const selection = args as PiModelSelection;
+        if (!selection.ambiguous) {
+          try {
+            validateScoutSelection(
+              thisScout.toScoutResult(selection) as Extract<ScoutResult, { kind: 'selection' }>,
+              [
+                ...repos.map((r) => ({ name: r.name, source: r.source })),
+                ...(thisScout.config.explicitSources ?? []).map((source) => ({
+                  name: path.basename(source), source, explicit: true,
+                })),
+              ],
+              { observed: observations }
+            );
+          } catch (error) {
+            if (!(error instanceof UsageError)) throw error;
+            return { content: [{ type: 'text', text: `Selection rejected: ${error.message}. Read the cited file and resubmit with an exact quote and correct line range.` }] };
+          }
+        }
+        captured = selection;
         return {
           content: [{ type: 'text', text: JSON.stringify(args) }],
           details: args,

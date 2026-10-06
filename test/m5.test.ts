@@ -97,7 +97,7 @@ test('M5: create discovers an npm test command and the wrapper runs from any cwd
     // Creation must discover commands from the recorded revision without ever
     // executing npm/node/sh.
     const created = runCli(
-      ['create', 'demo task', '--name', 'demo', '--root', root, '--repo', spacedSource, '--for', 'agents,claude'],
+      ['-p', 'demo task', '--name', 'demo', '--root', root, '--repo', spacedSource, '--for', 'agents,claude'],
       { env: { PATH: `${shimDir}:${process.env.PATH ?? ''}` } }
     );
     assert.equal(created.status, 0, created.stderr);
@@ -155,7 +155,7 @@ test('M5: a repository without a test reports the gap and gets no invented verif
   const wsDir = path.join(root, 'no-test');
 
   try {
-    const created = runCli(['create', 'migration task', '--name', 'no-test', '--root', root, '--repo', repo.dir]);
+    const created = runCli(['-p', 'migration task', '--name', 'no-test', '--root', root, '--repo', repo.dir]);
     assert.equal(created.status, 0, created.stderr);
 
     const manifest = readManifest(wsDir);
@@ -215,7 +215,7 @@ test('M5: create, add, and refresh never execute tests, documented scripts, or i
     const recordEnv = { PATH: `${shimDir}:${process.env.PATH ?? ''}` };
 
     const created = runCli(
-      ['create', 'record task', '--name', 'record', '--root', root, '--repo', repoA.dir],
+      ['-p', 'record task', '--name', 'record', '--root', root, '--repo', repoA.dir],
       { env: recordEnv }
     );
     assert.equal(created.status, 0, created.stderr);
@@ -266,7 +266,7 @@ test('M5: commands come from the recorded commit, not dirty source package.json 
       'utf8'
     );
 
-    const created = runCli(['create', 'dirty task', '--name', 'dirty', '--root', root, '--repo', repo.dir]);
+    const created = runCli(['-p', 'dirty task', '--name', 'dirty', '--root', root, '--repo', repo.dir]);
     assert.equal(created.status, 0, created.stderr);
 
     const manifest = readManifest(path.join(root, 'dirty'));
@@ -298,7 +298,7 @@ test('M5: both selected adapters expose the same context after add and refresh',
 
   try {
     const created = await runCliInProcess(
-      ['create', 'adapter task', '--name', 'adapters', '--root', root, '--repo', repoA.dir, '--for', 'agents,claude']
+      ['-p', 'adapter task', '--name', 'adapters', '--root', root, '--repo', repoA.dir, '--for', 'agents,claude']
     );
     assert.equal(created.exitCode, 0, created.stderr);
 
@@ -362,7 +362,7 @@ test('M5: wrapper names avoid untracked user scripts instead of clobbering them'
 
   try {
     const created = await runCliInProcess(
-      ['create', 'collide task', '--name', 'collide', '--root', root, '--repo', base.dir]
+      ['-p', 'collide task', '--name', 'collide', '--root', root, '--repo', base.dir]
     );
     assert.equal(created.exitCode, 0, created.stderr);
 
@@ -401,7 +401,7 @@ test('M5: a documented validation script gets a wrapper that runs from any cwd a
 
   try {
     const created = runCli(
-      ['create', 'doc task', '--name', 'doc-script', '--root', root, '--repo', repo.dir]
+      ['-p', 'doc task', '--name', 'doc-script', '--root', root, '--repo', repo.dir]
     );
     assert.equal(created.status, 0, created.stderr);
 
@@ -439,7 +439,7 @@ test('M5: a documented validation path that does not exist reports a gap and no 
 
   try {
     const created = runCli(
-      ['create', 'missing task', '--name', 'doc-missing', '--root', root, '--repo', repo.dir]
+      ['-p', 'missing task', '--name', 'doc-missing', '--root', root, '--repo', repo.dir]
     );
     assert.equal(created.status, 0, created.stderr);
 
@@ -476,7 +476,7 @@ test('M5: an empty npm test value reports the gap and gets no wrapper', () => {
 
   try {
     const created = runCli(
-      ['create', 'empty task', '--name', 'empty-test', '--root', root, '--repo', repo.dir]
+      ['-p', 'empty task', '--name', 'empty-test', '--root', root, '--repo', repo.dir]
     );
     assert.equal(created.status, 0, created.stderr);
 
@@ -508,7 +508,7 @@ test('M5: resume preserves a user-edited wrapper and writes a .wsg-new proposal'
   });
   const root = mkTmp('wsg-m5-resume-root-');
   const wsDir = path.join(root, 'resume-ws');
-  const args = ['create', 'resume task', '--name', 'resume-ws', '--root', root, '--repo', repo.dir];
+  const args = ['-p', 'resume task', '--name', 'resume-ws', '--root', root, '--repo', repo.dir];
 
   try {
     const crashed = runCli(args, { env: { WSG_FAULT: 'after-generate:1' } });
@@ -566,7 +566,7 @@ test('M5: explicitly attached scripts keep provenance and are never executed', a
   fs.writeFileSync(scriptPath, scriptBody, 'utf8');
 
   try {
-    await runCliInProcess(['create', 'script task', '--name', 'scripts-ws', '--root', root, '--repo', base.dir]);
+    await runCliInProcess(['-p', 'script task', '--name', 'scripts-ws', '--root', root, '--repo', base.dir]);
     const added = await runCliInProcess(['add', scriptPath, '--as', 'script', '--workspace', wsDir]);
     assert.equal(added.exitCode, 0, added.stderr);
 

@@ -4,6 +4,8 @@ tags: [wsg, typescript, node, cli, git, git-worktree, yaml, typebox, sqlite, nod
 weight: 01
 ---
 
+> **Historical specification:** Retained for design context. The public CLI entry points are `wsg` (interactive chat TUI) and `wsg -p <request>` (non-interactive prompt mode). Legacy `wsg create` has been removed.
+>
 > Canonical product contract: `/Users/dt/code/wsg/docs/spec.md` (repo spec). Roadmap: `/Users/dt/code/wsg/docs/implementation-plan.md`.
 > This document scopes **Milestones 1 and 2** of that plan for this delivery, records review findings and decisions, and pins the technical approach. Where this document resolves a gap, the repo spec is patched to match (see "Repo spec patches").
 

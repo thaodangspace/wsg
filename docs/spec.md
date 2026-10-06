@@ -1,5 +1,7 @@
 # WSG MVP specification
 
+> **Historical specification:** Retained for design context and domain requirements. As of the chat-first creation release, the public CLI entry points are `wsg` (interactive chat TUI) and `wsg -p <request>` (non-interactive prompt mode). Legacy `wsg create` has been removed.
+
 Status: proposed implementation contract. No CLI is implemented yet.
 
 ## 1. Product goal
